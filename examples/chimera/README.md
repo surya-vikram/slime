@@ -2,15 +2,29 @@
 
 This integration keeps the Slime image's dependency stack intact:
 
-- `/root/Megatron-LM` remains Slime's patched MCore checkout.
+The current compatibility patch is validated against
+`slimerl/slime@sha256:f7f8ee9acde9645a6e88f0c703597e69a58d2892abff56071630c88f23d5068f`.
+If the remote container uses a different Megatron source revision, the
+launcher fails before training instead of applying an uncertain patch.
+
+- `/root/Megatron-LM` remains Slime's patched MCore checkout. The launcher
+  applies only the YaRN TE CUDA-graph fix from Chimera commit `ef2ed0b9e` to
+  that checkout and refuses to run if the expected source does not match.
 - Transformers remains the version installed in the image. Only the external
   `transformers.models.chimera` package is added to its model search path.
 - Megatron-Bridge is not imported by the Slime job.
 
-The actor uses pure data parallelism across two GPUs: TP, PP, CP, EP, and ETP
-are all one. Rollout inference is one Slime router backed by two independent
-SGLang TP=1 replicas. Do not set `--sglang-dp-size`; SGLang's similarly named
-DP-attention mode is not model-replica data parallelism.
+The Megatron actor uses EP=2 so its experts are sharded across the two H200s;
+TP, PP, CP, and ETP remain one. MCore still infers a dense-parameter DP group
+of two, while expert-DP is one. Rollout inference is one Slime router backed
+by two independent SGLang TP=1 replicas, giving rollout replica DP=2. Do not
+set `--sglang-dp-size`; SGLang's similarly named DP-attention mode is not
+model-replica data parallelism.
+
+Megatron captures its attention modules with Transformer Engine CUDA graphs,
+matching the established Chimera training recipe. The runtime patch ensures
+YaRN contributes a real rotary tensor during capture instead of silently
+falling through to `None`.
 
 ## Checkpoints and data
 
@@ -33,15 +47,17 @@ hf download --repo-type dataset zhuzilin/aime-2024 \
 
 ## Launch
 
-Set the host paths when they differ from the defaults and run the pinned Slime
-container:
+Run directly inside the existing Slime container. Do not start a nested Docker
+container. Set the paths visible inside that container:
 
 ```bash
-export MCORE_CHECKPOINT_HOST=/path/to/chimera_sft_torch_dist
-export HF_CHECKPOINT_HOST=/path/to/chimera_sft_hf
-export PROMPT_DATA_HOST=/path/to/dapo-math-17k.jsonl
-export AIME_DATA_HOST=/path/to/aime-2024.jsonl
-bash examples/chimera/run_container.sh
+export CHIMERA_TRANSFORMERS_ROOT=/workspace/repos/transformers
+export HF_CHECKPOINT=/datasets/megadata/hf_models/chimera-10b
+export MCORE_CHECKPOINT=/datasets/megadata/checkpoints/chimera-sft
+export PROMPT_DATA=/datasets/megadata/rl/dapo-math-17k.jsonl
+export AIME_DATA=/datasets/megadata/rl/aime-2024.jsonl
+export SAVE_DIR=/datasets/megadata/runs/chimera-dapo
+bash examples/chimera/run_dapo_2xh200.sh
 ```
 
 `RUN_MODE=smoke` is the default and requests one short DAPO/GRPO update with
@@ -49,3 +65,29 @@ Slime's alignment checks enabled. Set `RUN_MODE=train` for the longer defaults.
 Batch sizes, response lengths, learning rate, SGLang memory fraction, and save
 location remain overridable through the environment variables used by
 `run_dapo_2xh200.sh`.
+
+## 2xH200 export and forward verification
+
+Use a fresh `SAVE_DIR` and `RUN_MODE=verify` before training. This uses LR=0
+and performs four checks against the matching HF/MCore checkpoint pair:
+
+1. SGLang's weight checker requires every initial MCore-to-SGLang tensor to be
+   transferred exactly.
+2. Slime's CI alignment compares the Megatron and rollout forward log
+   probabilities.
+3. The established Chimera `architecture_contract.py compare-hf` command
+   requires the Slime-exported HF checkpoint to preserve every key, shape,
+   dtype, tensor value, and SHA256 digest.
+4. The source and exported HF checkpoints must produce bitwise-identical
+   logits for the same fixed input.
+
+```bash
+export RUN_MODE=verify
+export CHIMERA_MEGATRON_ROOT=/workspace/repos/Megatron-LM
+export SAVE_DIR=/datasets/megadata/runs/chimera-export-verification
+bash examples/chimera/run_dapo_2xh200.sh
+```
+
+Reports are written to `$SAVE_DIR/export-verification/tensor-preservation.json`
+and `forward-logits.json`. The normal GRPO learning rate is used only by smoke
+and train modes; verify mode always forces it to zero.

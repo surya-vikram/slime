@@ -31,10 +31,22 @@ fi
 
 mkdir -p "$SAVE_DIR"
 
+export MEGATRON_ROOT=${MEGATRON_ROOT:-/root/Megatron-LM}
+CUDA_GRAPH_PATCH="$SCRIPT_DIR/patches/megatron-yarn-te-cuda-graph.patch"
+if git -C "$MEGATRON_ROOT" apply --unidiff-zero --reverse --check "$CUDA_GRAPH_PATCH" >/dev/null 2>&1; then
+    echo "Megatron YaRN TE CUDA-graph fix is already applied."
+elif git -C "$MEGATRON_ROOT" apply --unidiff-zero --check "$CUDA_GRAPH_PATCH"; then
+    git -C "$MEGATRON_ROOT" apply --unidiff-zero "$CUDA_GRAPH_PATCH"
+    echo "Applied the Chimera YaRN TE CUDA-graph fix to $MEGATRON_ROOT."
+else
+    echo "The YaRN TE CUDA-graph patch does not match $MEGATRON_ROOT; refusing to run." >&2
+    exit 1
+fi
+
 # Keep the image's Transformers and patched Megatron first-class. The runtime
 # directory contributes only sitecustomize.py, which registers Chimera from the
 # external model directory without replacing the installed Transformers tree.
-export PYTHONPATH="$SCRIPT_DIR/runtime:$REPO_ROOT:/root/Megatron-LM"
+export PYTHONPATH="$SCRIPT_DIR/runtime:$REPO_ROOT:$MEGATRON_ROOT"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVSHMEM_DISABLE_NCCL=1
@@ -43,7 +55,7 @@ python3 "$SCRIPT_DIR/preflight.py"
 
 RUN_MODE=${RUN_MODE:-smoke}
 case "$RUN_MODE" in
-    smoke)
+    smoke | verify)
         NUM_ROLLOUT=${NUM_ROLLOUT:-1}
         ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-2}
         N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-4}
@@ -53,6 +65,21 @@ case "$RUN_MODE" in
         N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-1}
         EVAL_INTERVAL=${EVAL_INTERVAL:-1}
         SAVE_INTERVAL=${SAVE_INTERVAL:-1}
+        if [[ "$RUN_MODE" == verify ]]; then
+            : "${CHIMERA_MEGATRON_ROOT:?Set CHIMERA_MEGATRON_ROOT to the established Chimera Megatron-LM checkout}"
+            LR=0
+            VERIFY_EXPORT_DIR=${VERIFY_EXPORT_DIR:-$SAVE_DIR/export-verification}
+            CONTRACT="$CHIMERA_MEGATRON_ROOT/examples/chimera/architecture_contract.py"
+            if [[ -e "$SAVE_DIR/latest_checkpointed_iteration.txt" ]]; then
+                echo "RUN_MODE=verify requires a fresh SAVE_DIR so LR=0 can prove exact preservation." >&2
+                exit 1
+            fi
+            if [[ ! -f "$CONTRACT" ]]; then
+                echo "Chimera architecture contract not found: $CONTRACT" >&2
+                exit 1
+            fi
+            mkdir -p "$VERIFY_EXPORT_DIR"
+        fi
         ;;
     train)
         NUM_ROLLOUT=${NUM_ROLLOUT:-3000}
@@ -66,7 +93,7 @@ case "$RUN_MODE" in
         SAVE_INTERVAL=${SAVE_INTERVAL:-20}
         ;;
     *)
-        echo "RUN_MODE must be smoke or train, got: $RUN_MODE" >&2
+        echo "RUN_MODE must be smoke, verify, or train, got: $RUN_MODE" >&2
         exit 1
         ;;
 esac
@@ -85,6 +112,9 @@ CKPT_ARGS=(
     --save "$SAVE_DIR"
     --save-interval "$SAVE_INTERVAL"
 )
+if [[ "$RUN_MODE" == verify ]]; then
+    CKPT_ARGS+=(--save-hf "$VERIFY_EXPORT_DIR/hf_rollout_{rollout_id}")
+fi
 
 ROLLOUT_ARGS=(
     --prompt-data "$PROMPT_DATA"
@@ -127,13 +157,18 @@ PERF_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
-    --expert-model-parallel-size 1
+    # Experts are sharded across both H200s; dense parameters retain MCore's
+    # inferred DP group while expert-DP is one.
+    --expert-model-parallel-size 2
     --expert-tensor-parallel-size 1
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
+    --cuda-graph-impl transformer_engine
+    --cuda-graph-scope attn
+    --cuda-graph-warmup-steps 1
 )
 
 OPTIMIZER_ARGS=(
@@ -169,8 +204,11 @@ MISC_ARGS=(
     --colocate
 )
 
-if [[ "$RUN_MODE" == smoke ]]; then
+if [[ "$RUN_MODE" == smoke || "$RUN_MODE" == verify ]]; then
     MISC_ARGS+=(--ci-test --ci-train-rollout-logprob-abs-diff-threshold 0.1)
+fi
+if [[ "$RUN_MODE" == verify ]]; then
+    MISC_ARGS+=(--check-weight-update-equal)
 fi
 
 ray stop --force >/dev/null 2>&1 || true
@@ -195,6 +233,7 @@ print(
                 for key in (
                     "CHIMERA_TRANSFORMERS_ROOT",
                     "CUDA_DEVICE_MAX_CONNECTIONS",
+                    "MEGATRON_ROOT",
                     "NVSHMEM_DISABLE_NCCL",
                     "PYTHONPATH",
                     "PYTHONUNBUFFERED",
@@ -219,3 +258,17 @@ ray job submit \
     "${OPTIMIZER_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
     "${MISC_ARGS[@]}"
+
+if [[ "$RUN_MODE" == verify ]]; then
+    EXPORTED_HF="$VERIFY_EXPORT_DIR/hf_rollout_0"
+    if [[ ! -d "$EXPORTED_HF" ]]; then
+        echo "Slime HF export not found: $EXPORTED_HF" >&2
+        exit 1
+    fi
+    python3 "$CONTRACT" compare-hf \
+        "$HF_CHECKPOINT" "$EXPORTED_HF" \
+        --report "$VERIFY_EXPORT_DIR/tensor-preservation.json"
+    python3 "$SCRIPT_DIR/compare_hf_logits.py" \
+        "$HF_CHECKPOINT" "$EXPORTED_HF" \
+        --report "$VERIFY_EXPORT_DIR/forward-logits.json"
+fi
