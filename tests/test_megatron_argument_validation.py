@@ -127,6 +127,16 @@ def test_hf_validate_checks_moe_intermediate_size(monkeypatch):
 
 
 @pytest.mark.unit
+def test_hf_validate_treats_zero_shared_expert_size_as_disabled(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_qwen3_6_args(moe_shared_expert_intermediate_size=None)
+    hf_config = make_qwen3_6_hf_config()
+    hf_config.text_config.shared_expert_intermediate_size = 0
+
+    module._hf_validate_args(args, hf_config)
+
+
+@pytest.mark.unit
 def test_hf_validate_checks_dense_intermediate_size_when_moe_has_dense_layers(monkeypatch):
     module = load_arguments_module(monkeypatch)
 

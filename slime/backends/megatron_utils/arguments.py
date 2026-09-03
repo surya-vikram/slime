@@ -121,7 +121,11 @@ def _hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
-        ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
+        (
+            "shared_expert_intermediate_size",
+            "moe_shared_expert_intermediate_size",
+            lambda hf_value, mcore_value: (None if hf_value == 0 else hf_value) == mcore_value,
+        ),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rms_norm_eps", "layernorm_epsilon", equal),

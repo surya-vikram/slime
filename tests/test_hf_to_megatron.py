@@ -200,6 +200,53 @@ def test_qwen2_moe_parameter_updates_use_the_moe_exporter():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("model_name", ["chimera", "chimeraconfig", "ChimeraConfig"])
+def test_chimera_parameter_updates_use_the_qwen3_moe_exporter(model_name):
+    parameter = torch.arange(96).reshape(12, 8)
+
+    converted = _convert_to_hf_core(
+        _EXPORT_ARGS,
+        model_name,
+        "module.module.decoder.layers.2.mlp.experts.linear_fc1.weight3",
+        parameter,
+    )
+
+    assert [name for name, _ in converted] == [
+        "model.layers.2.mlp.experts.3.gate_proj.weight",
+        "model.layers.2.mlp.experts.3.up_proj.weight",
+    ]
+    assert torch.equal(converted[0][1], parameter[:6])
+    assert torch.equal(converted[1][1], parameter[6:])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mcore_name", "hf_name"),
+    [
+        (
+            "module.module.decoder.layers.2.self_attention.q_layernorm.weight",
+            "model.layers.2.self_attn.q_norm.weight",
+        ),
+        (
+            "module.module.decoder.layers.2.self_attention.k_layernorm.weight",
+            "model.layers.2.self_attn.k_norm.weight",
+        ),
+        ("module.module.decoder.layers.2.mlp.router.weight", "model.layers.2.mlp.gate.weight"),
+        (
+            "module.module.decoder.layers.2.mlp.router.expert_bias",
+            "model.layers.2.mlp.gate.e_score_correction_bias",
+        ),
+    ],
+)
+def test_chimera_special_parameters_keep_the_existing_live_sync_mapping(mcore_name, hf_name):
+    parameter = torch.randn(8)
+
+    converted = _convert_to_hf_core(_EXPORT_ARGS, "chimeraconfig", mcore_name, parameter)
+
+    assert converted == [(hf_name, parameter)]
+
+
+@pytest.mark.unit
 def test_qwen_and_llama_share_the_basic_qkv_mapping():
     q = torch.arange(16).view(4, 4)
     k = torch.arange(8).view(2, 4) + 100
