@@ -1,5 +1,5 @@
-# Chimera 10B architecture. YaRN metadata is read from the HF checkpoint by
-# slime_plugins.models.chimera.model_provider.
+# Final Chimera 10B YaRN-on-RoPE architecture. YaRN metadata is read from the
+# HF checkpoint by slime_plugins.models.chimera.model_provider.
 
 NLAYERS=25
 FIRST_K_DENSE_REPLACE=2

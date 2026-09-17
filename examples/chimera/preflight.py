@@ -44,6 +44,39 @@ def _validate_yarn_cuda_graph_patch() -> None:
         raise RuntimeError("YaRN rotary input was not preserved and cached for TE CUDA graphs")
 
 
+def _validate_architecture(config) -> None:
+    expected = {
+        "vocab_size": 50176,
+        "hidden_size": 2048,
+        "intermediate_size": 8192,
+        "moe_intermediate_size": 2048,
+        "num_hidden_layers": 25,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "first_k_dense_replace": 2,
+        "last_k_dense_replace": 0,
+        "n_routed_experts": 32,
+        "num_experts_per_tok": 4,
+        "n_shared_experts": 0,
+        "shared_expert_intermediate_size": 0,
+        "position_embedding_type": "yarn",
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10_000_000.0,
+        "scoring_func": "sigmoid",
+        "routed_scaling_factor": 2.5,
+        "router_load_balancing_type": "none",
+        "router_bias_update_rate": 0.0,
+    }
+    mismatches = {
+        name: {"expected": expected_value, "actual": getattr(config, name, None)}
+        for name, expected_value in expected.items()
+        if getattr(config, name, None) != expected_value
+    }
+    if mismatches:
+        raise RuntimeError(f"Checkpoint does not match the final Chimera architecture: {mismatches}")
+
+
 def main() -> None:
     provenance = register_transformers()
     transformers_root = Path(os.environ["CHIMERA_TRANSFORMERS_ROOT"]).resolve()
@@ -55,8 +88,7 @@ def main() -> None:
     config = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
     if type(config).__name__ != "ChimeraConfig":
         raise RuntimeError(f"Expected ChimeraConfig, got {type(config).__name__}")
-    if config.rms_norm_eps != 1e-5:
-        raise RuntimeError(f"Chimera checkpoint must use rms_norm_eps=1e-5, got {config.rms_norm_eps}")
+    _validate_architecture(config)
     if AutoModel._model_mapping[type(config)].__name__ != "ChimeraModel":
         raise RuntimeError("ChimeraModel is not registered with AutoModel")
     if AutoModelForCausalLM._model_mapping[type(config)].__name__ != "ChimeraForCausalLM":
@@ -81,6 +113,7 @@ def main() -> None:
                 **provenance,
                 "megatron": str(megatron_path),
                 "model_type": config.model_type,
+                "architecture": "final-yarn-on-rope",
                 "rms_norm_eps": config.rms_norm_eps,
                 "yarn_cuda_graph_input": "validated",
                 "max_position_embeddings": config.max_position_embeddings,
