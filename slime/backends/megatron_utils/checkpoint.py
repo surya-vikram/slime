@@ -102,6 +102,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
+        from .checkpoint_compat import register_checkpoint_metadata_compat
+
+        register_checkpoint_metadata_compat()
         return _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
