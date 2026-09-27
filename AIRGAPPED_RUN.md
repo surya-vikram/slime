@@ -35,7 +35,45 @@ flowchart TD
 
 ---
 
-## 2. Host Filesystem Directory Structure
+## 2. Required Docker Images on Host
+
+Before executing the scripts on an airgapped system, ensure the following Docker images are already loaded in the host's Docker daemon (`docker images`):
+
+| Image Name | Size | Role / Service | Invoking Script | Sandboxing / Access |
+| :--- | :--- | :--- | :--- | :--- |
+| `suryavikram6/slime:pinned` | ~25 GB | Slime MixRL Training & Dry-Run Preflight | `03_run_preflight_dryrun.sh`<br>`04_run_training.sh`<br>`05_resume_training.sh` | Runs on GPUs 0,1,2,3 with `--ipc=host --ulimit memlock=-1`. Contains pinned Megatron-LM, SGLang, and Te/CUDA-graph patches. |
+| `suryavikram6/chimera-eval:0.1.1` | ~6.5 GB | Reward Microservice & Code Sandbox Worker | `02_host_reward_service.sh`<br>*(also dynamically invoked by `graders.py`)* | Runs daemon on port 18020 with 64 workers. Also used as the isolated runner image for APPS code execution (`docker run --network none --read-only`). |
+| `vllm/vllm-openai:muse-glimmer` *(optional)* | ~15 GB | Glimmer Judge Server (vLLM) | `01_host_judge.sh` *(only if `USE_DOCKER=1`)* | Runs vLLM OpenAI-compatible server on GPUs 4,5 at port 8025 with `--reasoning-parser muse_glimmer`. (Not needed if running vLLM bare-metal). |
+
+### Verification Command on Airgapped Host:
+```bash
+docker images --format "table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}" | grep -E "slime|chimera-eval|vllm"
+```
+
+Expected output:
+```
+suryavikram6/slime:pinned          <image-id>   ~25GB
+suryavikram6/chimera-eval:0.1.1    <image-id>   ~6.5GB
+vllm/vllm-openai:muse-glimmer      <image-id>   ~15GB  # (if using Docker for judge)
+```
+
+> [!NOTE]
+> If transporting images to the airgapped node via tarballs:
+> ```bash
+> # On connected workstation:
+> docker save suryavikram6/slime:pinned -o slime-pinned.tar
+> docker save suryavikram6/chimera-eval:0.1.1 -o chimera-eval-0.1.1.tar
+> docker save vllm/vllm-openai:muse-glimmer -o vllm-glimmer.tar
+>
+> # On airgapped host:
+> docker load -i slime-pinned.tar
+> docker load -i chimera-eval-0.1.1.tar
+> docker load -i vllm-glimmer.tar
+> ```
+
+---
+
+## 3. Host Filesystem Directory Structure
 
 The entire post-training setup resides under `/nvme_zone3/home/ekamai1/chimera/mixrl`:
 
@@ -76,7 +114,7 @@ The entire post-training setup resides under `/nvme_zone3/home/ekamai1/chimera/m
 
 ---
 
-## 3. Prebaked Execution Scripts
+## 4. Prebaked Execution Scripts
 
 All executable scripts are located in [`scripts/airgapped/`](scripts/airgapped/) and have all paths hardcoded to `/nvme_zone3/home/ekamai1/chimera/mixrl`.
 
@@ -195,7 +233,7 @@ This reloads model weights, Adam optimizer states, route sampler cursors, and th
 
 ---
 
-## 4. Step 1 Monitoring & Health Checklist
+## 5. Step 1 Monitoring & Health Checklist
 
 During rollout 1 and optimizer step 1, verify the following telemetry in the terminal and `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/`:
 
@@ -212,7 +250,7 @@ During rollout 1 and optimizer step 1, verify the following telemetry in the ter
 
 ---
 
-## 5. Monitoring & Telemetry Artifacts
+## 6. Monitoring & Telemetry Artifacts
 
 While training is active, artifacts and metrics are written to `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/`:
 
@@ -227,7 +265,7 @@ While training is active, artifacts and metrics are written to `/nvme_zone3/home
 
 ---
 
-## 6. Troubleshooting & Common Pitfalls
+## 7. Troubleshooting & Common Pitfalls
 
 | Symptom | Cause | Solution |
 | :--- | :--- | :--- |
