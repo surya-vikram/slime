@@ -27,13 +27,15 @@ export CHIMERA_MODEL_SIZE=full
 # ------------------------------------------------------------------------------
 # 2. Filesystem Mounts (Explicit Paths - No Auto-Discovery)
 # ------------------------------------------------------------------------------
-# Default paths assume standard container volume mounts under /data or custom paths:
+if [[ ! -d "${DATA_ROOT:-/data}" && -d "/nvme_zone3/home/ekamai1/chimera/mixrl" ]]; then
+    export DATA_ROOT="/nvme_zone3/home/ekamai1/chimera/mixrl"
+fi
 export DATA_ROOT=${DATA_ROOT:-/data}
 export HF_CHECKPOINT=${HF_CHECKPOINT:-$DATA_ROOT/models/chimera-muon-nemotron-105k-yarn32k-iter3478/hf}
 export MCORE_CHECKPOINT=${MCORE_CHECKPOINT:-$DATA_ROOT/models/chimera-muon-nemotron-105k-yarn32k-iter3478/mcore}
 export MIXRL_DATA_DIR=${MIXRL_DATA_DIR:-$DATA_ROOT/datasets/chimera-eval-data}
 export MIXRL_CODE_AUDIT_DIR=${MIXRL_CODE_AUDIT_DIR:-$MIXRL_DATA_DIR/audits/apps}
-export CHIMERA_TRANSFORMERS_ROOT=${CHIMERA_TRANSFORMERS_ROOT:-/workspace/transformers}
+export CHIMERA_TRANSFORMERS_ROOT=${CHIMERA_TRANSFORMERS_ROOT:-$([[ -d /workspace/transformers ]] && echo /workspace/transformers || echo "$DATA_ROOT/repos/transformers")}
 export RUNS_ROOT=${RUNS_ROOT:-$DATA_ROOT/runs}
 export RUN_NAME=${RUN_NAME:-chimera-mixrl-4gpus-512x8-$(date +%Y%m%d-%H%M%S)}
 

@@ -1,6 +1,10 @@
 # Chimera 10B Adam MixRL: Airgapped / Production Run Guide
 
-This guide provides the complete, production-verified instructions for launching Chimera 10B Adam MixRL on an **airgapped / no-internet** multi-GPU machine using local volume mounts, the local vLLM judge server, and the unified entrypoint script [`run_mixrl.sh`](run_mixrl.sh).
+This guide provides the complete, turn-key instructions for launching Chimera 10B Adam MixRL on an **airgapped / no-internet** multi-GPU machine. All paths, scripts, and container mounts are prebaked for the production filesystem root:
+
+```
+/nvme_zone3/home/ekamai1/chimera/mixrl
+```
 
 ---
 
@@ -11,7 +15,7 @@ In an airgapped environment, no external internet access or Hugging Face Hub cal
 ```mermaid
 flowchart TD
     subgraph S1["Step 1: Judge Server (2xH200)"]
-        J["vLLM OpenAI-Compatible Server\nhttp://127.0.0.1:8025/v1\n(Served Model: mixrl-judge)"]
+        J["vLLM Glimmer Server (GPUs 4,5)\nhttp://127.0.0.1:8025/v1\nModel: mixrl-judge (Muse-Glimmer-30B)"]
     end
 
     subgraph S2["Step 2: Reward Microservice"]
@@ -19,7 +23,7 @@ flowchart TD
     end
 
     subgraph S3["Step 3: MixRL Training (4xH200)"]
-        ML["Slime Training Cluster (run_mixrl.sh)\n- 4 Policy GPUs (Actor + SGLang Rollout)\n- 512 Prompts x 8 Responses (4,096 samples/step)\n- YaRN 32K context cap (16,384 sequence limit)\n- Adam Optimizer (LR 1e-6, WD 0)"]
+        ML["Slime Training Cluster (GPUs 0,1,2,3)\n- 4 Policy GPUs (Actor + SGLang Rollout)\n- 512 Prompts x 8 Responses (4,096 samples/step)\n- YaRN 32K context cap (16,384 sequence limit)\n- Adam Optimizer (LR 1e-6, WD 0)"]
     end
 
     ML -->|"1. Preflight check: GET /health & /admission"| RS
@@ -31,16 +35,18 @@ flowchart TD
 
 ---
 
-## 2. Host Filesystem Directory Structure (`/data`)
+## 2. Host Filesystem Directory Structure
 
-Before launching containers, ensure the host directory tree under `/data` is structured as follows:
+The entire post-training setup resides under `/nvme_zone3/home/ekamai1/chimera/mixrl`:
 
 ```
-/data/
+/nvme_zone3/home/ekamai1/chimera/mixrl/
 ├── models/
-│   └── chimera-muon-nemotron-105k-yarn32k-iter3478/
-│       ├── hf/                             # config.json, 5 safetensors shards, tokenizer
-│       └── mcore/                          # iter_0003478/, run_config.yaml, latest_checkpointed_iteration.txt
+│   ├── chimera-muon-nemotron-105k-yarn32k-iter3478/
+│   │   ├── hf/                             # config.json, 5 safetensors shards, tokenizer
+│   │   └── mcore/                          # iter_0003478/, run_config.yaml, latest_checkpointed_iteration.txt
+│   ├── Muse-Glimmer-30B/                   # Glimmer judge weights (served on 2xH200)
+│   └── Muse-Glimmer-30B-assistant/         # (Optional) DFlash speculative drafter weights
 ├── datasets/
 │   └── chimera-eval-data/
 │       ├── manifest.json                   # Frozen dataset inventory
@@ -50,196 +56,182 @@ Before launching containers, ensure the host directory tree under `/data` is str
 │       └── audits/
 │           └── apps/                       # summary.json + 1,376 audited APPS JSON records (197 quarantined)
 ├── repos/
-│   ├── slime/                              # Clean checkout on branch 'chimera' (run_mixrl.sh)
+│   ├── slime/                              # Slime checkout on branch 'chimera' (scripts/airgapped/, run_mixrl.sh)
 │   ├── transformers/                       # Pinned Chimera Transformers package
 │   └── chimera-eval/                       # Evaluator repo (eval_stack.reward_service)
 ├── cache/
-│   └── scorer_cache/                       # Persistent scoring cache
-└── runs/                                   # Training output (checkpoints, tensorboard, logs)
+│   ├── scorer_cache/                       # Persistent scoring cache
+│   └── vllm_cache/                         # vLLM model cache
+├── runs/                                   # Training output (checkpoints, tensorboard, logs)
+└── scripts/airgapped/                      # Prebaked turn-key launch scripts
+    ├── 01_host_judge.sh                    # Host Glimmer judge via vLLM on GPUs 4,5
+    ├── 02_host_reward_service.sh           # Host reward microservice daemon on port 18020
+    ├── 03_run_preflight_dryrun.sh          # Zero-FLOP dry-run preflight in Slime container
+    ├── 04_run_training.sh                  # Launch 4xH200 MixRL training on GPUs 0,1,2,3
+    └── 05_resume_training.sh               # Resume interrupted training from checkpoint
 ```
 
 > [!IMPORTANT]
-> Ensure `/data/datasets/chimera-eval-data/audits/apps` is a **real directory** containing `summary.json` and the 1,376 audit JSON files (not a broken host symlink), so it resolves cleanly within container volume mounts.
+> Ensure `/nvme_zone3/home/ekamai1/chimera/mixrl/datasets/chimera-eval-data/audits/apps` is a **real, self-contained directory** containing `summary.json` and the 1,376 audit JSON files (not an external symlink), so it resolves cleanly within container volume mounts.
 
 ---
 
-## 3. Step-by-Step Launch Procedure
+## 3. Prebaked Execution Scripts
 
-### Step 1: Verify the Local Judge Server
-The judge model is assumed to already be running on 2×H200 GPUs at port `8025`:
+All executable scripts are located in [`scripts/airgapped/`](scripts/airgapped/) and have all paths hardcoded to `/nvme_zone3/home/ekamai1/chimera/mixrl`.
+
+### Step 1: Host the Glimmer Judge via vLLM (2×H200)
+Run the judge server script:
 
 ```bash
-# Verify judge readiness and model identity:
+cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
+bash scripts/airgapped/01_host_judge.sh
+```
+
+#### What `01_host_judge.sh` Does:
+* Allocates **2 dedicated GPUs** (`CUDA_VISIBLE_DEVICES=4,5`) with `--tensor-parallel-size 2`.
+* Binds to `127.0.0.1:8025` serving under the registered name `--served-model-name mixrl-judge`.
+* Configures Glimmer reasoning parser: `--reasoning-parser muse_glimmer`.
+* Enables continuous batching concurrency matching the reward service: `--max-num-seqs 64`, `--max-num-batched-tokens 8192`, `--max-model-len 32768`.
+* Automatically detects and enables **DFlash speculative decoding** if `Muse-Glimmer-30B-assistant` is present, boosting judge throughput up to ~2,500 tokens/sec.
+* To run inside the official vLLM Glimmer Docker image instead of bare-metal, pass `USE_DOCKER=1`:
+  ```bash
+  USE_DOCKER=1 bash scripts/airgapped/01_host_judge.sh
+  ```
+
+#### Verify Judge Readiness:
+```bash
 curl -s http://127.0.0.1:8025/v1/models | jq .
+# Expected: {"object": "list", "data": [{"id": "mixrl-judge", ...}]}
 ```
-*(Ensure `"id": "mixrl-judge"` is listed in the models array).*
 
 ---
 
-### Step 2: Start the Reward Microservice Daemon (`chimera-eval`)
-The reward microservice bridges Slime rollouts with deterministic evaluation graders and the local vLLM judge. To eliminate scoring bottlenecks across the 4,096-sample batch ($512 \times 8$), run it with **64 worker processes** and **64 judge concurrency slots**:
+### Step 2: Start the Reward Microservice Daemon
+Once the judge is live on port `8025`, start the reward microservice:
 
 ```bash
-docker run -d --name chimera-reward-service \
-  --net=host \
-  --ipc=host \
-  --restart=unless-stopped \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /data/repos/chimera-eval:/opt/chimera-eval \
-  -v /data/datasets/chimera-eval-data:/data/datasets/chimera-eval-data \
-  -v /data/cache/scorer_cache:/data/cache/scorer_cache \
-  -w /opt/chimera-eval \
-  --entrypoint python3 \
-  -e JUDGE_URL=http://127.0.0.1:8025/v1 \
-  -e JUDGE_NAME=mixrl-judge \
-  -e JUDGE_CONTEXT=16384 \
-  -e JUDGE_MAX_TOKENS=1024 \
-  -e JUDGE_MAX_RETRY_TOKENS=2048 \
-  -e JUDGE_CONCURRENCY=64 \
-  -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' \
-  suryavikram6/chimera-eval:0.1.1 \
-  -m eval_stack.reward_service \
-    --data-dir /data/datasets/chimera-eval-data \
-    --cache-dir /data/cache/scorer_cache \
-    --host 127.0.0.1 \
-    --port 18020 \
-    --workers 64 \
-    --judge-revision "mixrl-judge"
+cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
+bash scripts/airgapped/02_host_reward_service.sh
 ```
 
-#### Why Each Flag is Required:
-* `--entrypoint python3` & `-w /opt/chimera-eval`: Overrides the default CLI entrypoint (`run_eval.sh`), ensuring Python invokes `eval_stack.reward_service` directly without argument errors.
-* `-v /data/repos/chimera-eval:/opt/chimera-eval`: Mounts the repository containing `reward_service.py`.
-* `-v /var/run/docker.sock:/var/run/docker.sock`: Allows `chimera-eval` to spin up isolated container sandboxes to execute untrusted model-generated Python code for the `apps` domain safely.
-* `--workers 64`: Runs 64 parallel OS worker processes so that 4,096 samples are scored in parallel without queue lag.
-* `JUDGE_CONCURRENCY=64`: Dispatches up to 64 concurrent async streams to the 2×H200 judge server.
-* `--net=host`: Enables direct localhost socket communication with zero network NAT overhead.
+#### What `02_host_reward_service.sh` Does:
+* Verifies `http://127.0.0.1:8025/v1/models` responds and contains `mixrl-judge`.
+* Launches `chimera-reward-service` daemon container (`suryavikram6/chimera-eval:0.1.1`) on `--net=host`.
+* Overrides default entrypoint with `--entrypoint python3 -w /opt/chimera-eval` to execute `eval_stack.reward_service` directly.
+* Binds `/var/run/docker.sock` for secure Docker-in-Docker APPS code execution sandboxing.
+* Runs **64 parallel worker processes** (`--workers 64`) and maintains **64 concurrent judge streams** (`JUDGE_CONCURRENCY=64`), eliminating scoring bottlenecks for the 4,096-sample rollout.
+* Polls `/health` until HTTP 200 is confirmed.
 
-#### Verify Reward Service Readiness:
+#### Verify Reward Service:
 ```bash
 # Health check:
 curl -s http://127.0.0.1:18020/health
-# Expected: {"protocol_id": "...", "status": "ready"}
+# Expected output: {"protocol_id": "...", "status": "ready"}
 
 # Admission check:
 curl -s http://127.0.0.1:18020/admission | head -c 200
-# Expected: {"protocol_id": "...", "excluded_rows": {...}}
+# Expected output: {"protocol_id": "...", "excluded_rows": {...}}
 ```
 
 ---
 
-### Step 3: Launch the Slime Training Container
-Launch the pinned Slime Docker container with 4 dedicated policy GPUs (devices 0, 1, 2, 3), host networking, unbounded memlock, and mounted volumes:
+### Step 3: Run Zero-FLOP Dry-Run Verification
+Before allocating GPU memory for training, run the zero-FLOP dry-run preflight:
 
 ```bash
-docker run -it --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  --net=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  -v /data/models/chimera-muon-nemotron-105k-yarn32k-iter3478:/data/models/chimera-muon-nemotron-105k-yarn32k-iter3478:ro \
-  -v /data/datasets/chimera-eval-data:/data/datasets/chimera-eval-data:ro \
-  -v /data/repos/transformers:/workspace/transformers:ro \
-  -v /data/repos/slime:/workspace/slime \
-  -v /data/runs:/data/runs \
-  -w /workspace/slime \
-  suryavikram6/slime:pinned \
-  bash
+cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
+bash scripts/airgapped/03_run_preflight_dryrun.sh
 ```
+
+#### What `03_run_preflight_dryrun.sh` Does:
+* Starts the `suryavikram6/slime:pinned` container with mounted paths.
+* Verifies SHA256 checksums of all 20 GB model shards.
+* Confirms YaRN 32K context parameters and the 16,384 sequence limit.
+* Validates that all 16 domain training quotas sum to exactly 512 ($512 \times 8 = 4,096$ samples).
+* Connects to `http://127.0.0.1:18020/health` and verifies the 197 APPS code exclusions are quarantined.
+* Verifies Megatron YaRN TE CUDA-graph patch and SGLang routing capture patch are applied.
+* Completes in ~15–20 seconds with **0 VRAM consumed** and exits with code 0:
+  ```
+  Megatron actor: dense-DP=4, expert-DP=4, TP=PP=CP=ETP=1, EP=1, distributed optimizer
+  SGLang rollout: 4 independent TP=1 engines, mode=sync colocate=1
+  mixrl batch: 512 prompts x 8 responses = 4096 samples
+  Dry run only: command/manifests written; no Ray services or training started.
+  ```
 
 ---
 
-### Step 4: Execute Zero-FLOP Dry Run Verification
-Inside the Slime container, **always perform a zero-FLOP dry-run first**:
+### Step 4: Launch Full Production Training (4×H200)
+Once the dry-run passes, launch full training:
 
 ```bash
-cd /workspace/slime
-DRY_RUN=1 bash run_mixrl.sh
+cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
+bash scripts/airgapped/04_run_training.sh
 ```
 
-This verification step completes in ~15–20 seconds and verifies:
-1. **Airgapped Invariants:** `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
-2. **Checkpoint SHA256 Hashes:** Validates all 20 GB of safetensors and MCore shards.
-3. **YaRN RoPE Configuration:** Confirms factor 4.0, max position 32,768, and sequence cap 16,384.
-4. **Multi-Domain Quotas:** Verifies all 16 training domains sum to 512 ($512 \times 8 = 4,096$ samples, divisible by 4 GPUs).
-5. **Reward Service Connection:** Performs handshake with `127.0.0.1:18020/health` and queries admission quotas.
-6. **Automatic Upstream Patches:** Confirms Megatron YaRN TE CUDA-graph patch and SGLang routing capture patch are applied.
-7. **Expected Output:**
-   ```
-   Megatron actor: dense-DP=4, expert-DP=4, TP=PP=CP=ETP=1, EP=1, distributed optimizer
-   SGLang rollout: 4 independent TP=1 engines, mode=sync colocate=1
-   mixrl batch: 512 prompts x 8 responses = 4096 samples
-   Dry run only: command/manifests written; no Ray services or training started.
-   ```
+#### What `04_run_training.sh` Does:
+* Launches the `suryavikram6/slime:pinned` container with dedicated access to **GPUs 0, 1, 2, 3** (`--gpus '"device=0,1,2,3"'`).
+* Runs `bash run_mixrl.sh` with the Adam optimizer baseline:
+  * LR: `1e-6`, Weight Decay: `0.0`, Clip Grad: `1.0`.
+  * Batch: 512 prompts $\times$ 8 responses = 4,096 samples/step.
+  * Matched FP32 LM-head projection (`CHIMERA_FP32_LM_HEAD=1`).
+  * Route replay (`CHIMERA_ROUTING_REPLAY=1`).
+  * Concurrency: `MIXRL_REWARD_CONCURRENCY=64`, `MIXRL_RESPONSE_CONCURRENCY=64`.
+* All trailing CLI arguments (e.g. `NUM_ROLLOUT=200`) are passed directly through to the training script.
 
 ---
 
-### Step 5: Launch Production Training
-Once the dry-run passes with exit code 0, launch actual training:
+### Step 5: Resuming Interrupted Training
+If training is stopped or interrupted, resume seamlessly from the latest saved checkpoint:
 
 ```bash
-bash run_mixrl.sh
+cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
+bash scripts/airgapped/05_resume_training.sh <RUN_NAME>
+
+# Example:
+bash scripts/airgapped/05_resume_training.sh chimera-mixrl-4gpus-512x8-20260927-140000
 ```
+This reloads model weights, Adam optimizer states, route sampler cursors, and the frozen horizon scheduler without skipping or duplicating data.
 
 ---
 
 ## 4. Step 1 Monitoring & Health Checklist
 
-During rollout 1 and optimizer step 1, verify the following telemetry in the terminal and `$RUNS_ROOT/$RUN_NAME/`:
+During rollout 1 and optimizer step 1, verify the following telemetry in the terminal and `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/`:
 
 1. **Frozen Router Invariants:**
-   Verify that `router.weight` and `router.bias` maintain `param.grad is None` and zero mutation before and after the optimizer step (< 1ms execution time).
+   Verify terminal log confirms `router.weight` and `router.bias` maintain `param.grad is None` and zero mutation before and after the optimizer step (< 1ms execution time).
 2. **Scoring Concurrency:**
-   All 4,096 samples should complete scoring in **< 10 seconds** across the 64 workers (deterministic domains finish in < 0.5s; judge domains pipeline in ~4–6s).
-3. **Importance Weight Distribution:**
-   Check logged pre-clip importance ratio quantiles (P10, P50, P90, P99). The fraction clipped at `[0.2, 5.0]` should remain < 5%.
-4. **VRAM Headroom:**
-   Check `$RUNS_ROOT/$RUN_NAME/logs/gpu_metrics.csv` to confirm peak memory stabilizes around **~82 GiB / 141 GiB** on each H200 GPU.
-5. **In-Run Validation:**
-   Quick evaluation runs automatically on `rl_val` (128 prompts $\times$ 4 responses = 512 samples, binary pass@4) every 10 rollout boundaries.
+   All 4,096 samples finish scoring in **< 10 seconds** across the 64 workers (deterministic domains complete in < 0.5s; judge domains pipeline in ~4–6s).
+3. **Importance Weight Bounds:**
+   Check logged pre-clip importance ratio quantiles (P10, P50, P90, P99); fraction clipped at `[0.2, 5.0]` is < 5%.
+4. **Peak VRAM Headroom:**
+   Check `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/logs/gpu_metrics.csv` to confirm peak memory stabilizes around **~82 GiB / 141 GiB** on each of the 4 training H200 GPUs.
+5. **Periodic Validation:**
+   In-run evaluation automatically evaluates 128 prompts from `rl_val` (pass@4) every 10 rollout boundaries.
 
 ---
 
-## 5. Execution Modes & Configuration Overrides
+## 5. Monitoring & Telemetry Artifacts
 
-You can customize variables at the top of [`run_mixrl.sh`](run_mixrl.sh) or provide inline environment variable overrides:
-
-### A. Resuming an Interrupted Run
-To resume exact optimizer, scheduler, and route sampling state from a previous checkpoint:
-```bash
-RESUME=1 RUN_NAME=my-previous-run-name bash run_mixrl.sh
-```
-
-### B. Custom Rollout Length or Evaluation Cadence
-```bash
-NUM_ROLLOUT=200 \
-EVAL_INTERVAL=20 \
-bash run_mixrl.sh
-```
-
----
-
-## 6. Monitoring & Telemetry Artifacts
-
-While training is active, artifacts and metrics are written to `/data/runs/$RUN_NAME/`:
+While training is active, artifacts and metrics are written to `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/`:
 
 * **TensorBoard:**
   ```bash
-  tensorboard --logdir /data/runs/$RUN_NAME/tensorboard --port 6006
+  tensorboard --logdir /nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/tensorboard --port 6006
   ```
 * **Hardware Telemetry:**
-  `/data/runs/$RUN_NAME/logs/gpu_metrics.csv` records GPU utilization, memory usage, and power draw every 5 seconds.
+  `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/logs/gpu_metrics.csv` records GPU utilization, memory usage, and power draw every 5 seconds.
 * **Evaluation Summaries:**
-  Every `EVAL_INTERVAL` boundaries, quick evaluation evaluates 128 prompts from `rl_val` (pass@4). Results and domain breakdowns are saved in `/data/runs/$RUN_NAME/rollouts/`.
+  Every `EVAL_INTERVAL` boundaries (default 10), quick evaluation evaluates 128 prompts from `rl_val` (pass@4). Results and domain breakdowns are saved in `/nvme_zone3/home/ekamai1/chimera/mixrl/runs/$RUN_NAME/rollouts/`.
 
 ---
 
-## 7. Troubleshooting & Common Pitfalls
+## 6. Troubleshooting & Common Pitfalls
 
 | Symptom | Cause | Solution |
 | :--- | :--- | :--- |
-| `cli.py: error: argument command: invalid choice: 'python3'` | `chimera-eval` image has default CLI entrypoint | Include `--entrypoint python3 -w /opt/chimera-eval` in `docker run`. |
-| `FileNotFoundError: .../audits/apps/summary.json` | Dataset mount lacks the APPS audit directory or uses an unmounted host symlink | Ensure `/data/datasets/chimera-eval-data/audits/apps/` is a real, self-contained directory containing `summary.json` and 1,376 JSON files. |
-| `Configured judge model is not served` | vLLM served model name does not match `JUDGE_NAME` | Ensure vLLM serves `--served-model-name mixrl-judge` and verify via `curl http://127.0.0.1:8025/v1/models`. |
-| `Cannot connect to reward service at: http://127.0.0.1:18020` | Reward container not running or port collision | Verify `docker ps`, check `docker logs chimera-reward-service`, and confirm `curl http://127.0.0.1:18020/health` returns HTTP 200. |
+| `cli.py: error: argument command: invalid choice: 'python3'` | `chimera-eval` image has default CLI entrypoint | `02_host_reward_service.sh` automatically overrides this with `--entrypoint python3 -w /opt/chimera-eval`. |
+| `FileNotFoundError: .../audits/apps/summary.json` | Dataset mount lacks the APPS audit directory or uses an unmounted host symlink | Ensure `/nvme_zone3/home/ekamai1/chimera/mixrl/datasets/chimera-eval-data/audits/apps/` is a real, self-contained directory containing `summary.json` and 1,376 JSON files. |
+| `Configured judge model is not served` | vLLM served model name does not match `JUDGE_NAME` | Ensure `01_host_judge.sh` serves `--served-model-name mixrl-judge` and verify via `curl http://127.0.0.1:8025/v1/models`. |
+| `Cannot connect to reward service at: http://127.0.0.1:18020` | Reward container not running or port collision | Run `bash scripts/airgapped/02_host_reward_service.sh` and verify with `curl http://127.0.0.1:18020/health`. |
