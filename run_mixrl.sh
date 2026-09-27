@@ -58,6 +58,11 @@ export MIXRL_QUOTAS=${MIXRL_QUOTAS:-$DEFAULT_512_QUOTAS}
 DEFAULT_16K_CAPS='{"gsm8k_train":8192,"nemotron_math":8192,"mcqa":4096,"openqa":4096,"science":8192,"hotpot_train":4096,"cascade_chat":8192,"cascade_lists":8192,"cascade_plans":8192,"nvidia_multichallenge":4096,"nvidia_multichallenge_advanced":4096,"nemotron_if":4096,"structured_train":8192,"reasoning_gym":8192,"calendar":8192,"apps":8192}'
 export MIXRL_CAPS=${MIXRL_CAPS:-$DEFAULT_16K_CAPS}
 
+# High-Throughput Concurrency (Prevents reward scoring bottleneck on 4,096 samples):
+export MIXRL_REWARD_CONCURRENCY=${MIXRL_REWARD_CONCURRENCY:-64}     # Concurrent requests to reward service
+export MIXRL_RESPONSE_CONCURRENCY=${MIXRL_RESPONSE_CONCURRENCY:-64} # Concurrent generation requests
+export MIXRL_INFLIGHT_GROUPS=${MIXRL_INFLIGHT_GROUPS:-16}           # In-flight prompt groups in rollout
+
 # ------------------------------------------------------------------------------
 # 5. Optimization & Context Geometry
 # ------------------------------------------------------------------------------

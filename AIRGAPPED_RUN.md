@@ -11,11 +11,11 @@ In an airgapped environment, no external internet access or Hugging Face Hub cal
 ```mermaid
 flowchart TD
     subgraph Step1["Step 1: Judge Server (2xH200)"]
-        J["vLLM OpenAI-Compatible Server\nhttp://127.0.0.1:8025/v1\n(Served Model: mixrl-judge-4b)"]
+        J["vLLM OpenAI-Compatible Server\nhttp://127.0.0.1:8025/v1\n(Served Model: mixrl-judge)"]
     end
 
     subgraph Step2["Step 2: Reward Microservice"]
-        RS["chimera-eval\neval_stack.reward_service\nhttp://127.0.0.1:18020\n(Workers: 8)"]
+        RS["chimera-eval\neval_stack.reward_service\nhttp://127.0.0.1:18020\n(Workers: 64)"]
     end
 
     subgraph Step3["Step 3: MixRL Training (4xH200)"]
@@ -49,18 +49,18 @@ Before starting, ensure the following local filesystem directories are prepared 
 ## 3. Step-by-Step Launch Procedure
 
 ### Step 1: Verify the Local Judge Server
-The judge model is assumed to already be running on 2×H200 GPUs at port `8025`:
+The judge model is running on 2×H200 GPUs at port `8025`:
 
 ```bash
 # Verify judge readiness:
 curl -s http://127.0.0.1:8025/v1/models | jq .
 ```
-*(Ensure `mixrl-judge-4b` is listed in the response).*
+*(Ensure `mixrl-judge` is listed in the response).*
 
 ---
 
 ### Step 2: Start the Reward Microservice Container (`chimera-eval`)
-The reward microservice bridges Slime rollouts with deterministic evaluation graders and the local vLLM judge. Run it as a daemon container using host networking:
+The reward microservice bridges Slime rollouts with deterministic evaluation graders and the local vLLM judge. To prevent any scoring bottleneck across the 4,096-sample batch ($512 \times 8$), configure **64 worker threads** and **64 judge concurrency slots**:
 
 ```bash
 docker run -d --name chimera-reward-service \
@@ -71,11 +71,11 @@ docker run -d --name chimera-reward-service \
   -v /data/datasets:/data/datasets \
   -v /data/cache/scorer_cache:/data/cache/scorer_cache \
   -e JUDGE_URL=http://127.0.0.1:8025/v1 \
-  -e JUDGE_NAME=mixrl-judge-4b \
+  -e JUDGE_NAME=mixrl-judge \
   -e JUDGE_CONTEXT=16384 \
   -e JUDGE_MAX_TOKENS=1024 \
   -e JUDGE_MAX_RETRY_TOKENS=2048 \
-  -e JUDGE_CONCURRENCY=8 \
+  -e JUDGE_CONCURRENCY=64 \
   -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' \
   suryavikram6/chimera-eval:0.1.1 \
   python3 -m eval_stack.reward_service \
@@ -83,8 +83,8 @@ docker run -d --name chimera-reward-service \
     --cache-dir /data/cache/scorer_cache \
     --host 127.0.0.1 \
     --port 18020 \
-    --workers 8 \
-    --judge-revision "mixrl-judge-4b"
+    --workers 64 \
+    --judge-revision "mixrl-judge"
 ```
 
 **Verify Reward Service Readiness:**
