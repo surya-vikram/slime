@@ -37,7 +37,7 @@ if [[ "$USE_DOCKER" == 1 ]]; then
     echo "Launching vLLM in Docker container (mixrl-judge-server)..."
     docker rm -f mixrl-judge-server 2>/dev/null || true
     docker run -d --name mixrl-judge-server \
-      --gpus "\"device=$JUDGE_GPUS\"" \
+      --gpus "device=$JUDGE_GPUS" \
       --ipc=host \
       --net=host \
       --restart=unless-stopped \

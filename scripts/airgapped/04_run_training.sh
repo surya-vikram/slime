@@ -15,7 +15,7 @@ echo "Batch: 512 prompts x 8 responses = 4,096 samples/step"
 mkdir -p "$BASE_DIR/runs"
 
 docker run -it --rm \
-  --gpus "\"device=$TRAINING_GPUS\"" \
+  --gpus "device=$TRAINING_GPUS" \
   --ipc=host \
   --net=host \
   --ulimit memlock=-1 \
