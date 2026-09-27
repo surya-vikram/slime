@@ -9,7 +9,7 @@ SCORER_PORT="${SCORER_PORT:-18020}"
 JUDGE_URL="${JUDGE_URL:-http://127.0.0.1:8025/v1}"
 JUDGE_NAME="${JUDGE_NAME:-mixrl-judge}"
 WORKERS="${WORKERS:-64}"
-JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-64}"
+JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-128}"
 
 echo "=== Starting Reward Microservice (chimera-reward-service) ==="
 echo "Target Judge: $JUDGE_URL (model: $JUDGE_NAME)"
