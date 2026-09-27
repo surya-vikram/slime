@@ -200,7 +200,16 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    schedule_rollouts = args.num_rollout
+    if os.environ.get('CHIMERA_MIXRL_CONFIG'):
+        from slime_plugins.chimera_mixrl.runtime import config as mixrl_config
+        schedule_rollouts = mixrl_config()['optimizer_schedule_rollouts']
+        if schedule_rollouts != args.num_rollout and (
+            args.lr_decay_style != 'constant' or args.weight_decay_incr_style != 'constant'
+            or args.lr_warmup_iters or args.lr_warmup_fraction
+        ):
+            raise ValueError('MixRL horizon extension requires constant LR/WD and no warmup')
+    args.train_iters = schedule_rollouts * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -685,6 +694,14 @@ def train_one_step(
         assert update_successful
         opt_param_scheduler.step(increment=step_global_batch_size)
 
+    # Check after the last update as well: a before-only check cannot catch
+    # router/bias mutation in the final optimizer step. Other plugins retain
+    # their existing before-hook semantics.
+    if args.custom_megatron_before_train_step_hook_path == "slime_plugins.chimera_mixrl.routing.before_train_step":
+        from slime_plugins.chimera_mixrl.routing import after_train_step
+
+        after_train_step(args, rollout_id, step_id, model)
+
     # release grad
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
@@ -754,13 +771,17 @@ def train(
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
+        no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            no_sync_func = no_sync_func[0]
+        # train() is called for every RL rollout. Its own DDP hook persists in
+        # the model config; accept that same hook on subsequent calls, while
+        # continuing to reject an unrelated custom synchronization function.
+        assert config.no_sync_func is None or config.no_sync_func == no_sync_func, (
+            "When overlap_grad_reduce is True, config.no_sync_func must be None or the current DDP hook; "
             "a custom no_sync_func is not supported when overlapping grad-reduce"
         )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
-        if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0]
+        config.no_sync_func = no_sync_func
         if args.align_grad_reduce:
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
@@ -884,6 +905,9 @@ def train(
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
+            if f"train/{role_tag}effective_response_fraction" in log_dict:
+                from slime_plugins.chimera_mixrl.objective import active_diagnostics
+                log_dict.update(active_diagnostics(log_dict, f"train/{role_tag}"))
             if args.enable_mtp_training:
                 for _i in range(mtp_losses.shape[0]):
                     log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
@@ -958,18 +982,33 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
+    portable_args = nullcontext()
+    chimera_save = args.custom_megatron_before_train_step_hook_path == "slime_plugins.chimera_mixrl.routing.before_train_step"
+    if chimera_save:
+        from slime_plugins.chimera_mixrl.checkpoint_metadata import initialize_lazy_optimizer_state, portable_save_args
+
+        if not args.no_save_optim:
+            initialize_lazy_optimizer_state(optimizer)
+        portable_args = portable_save_args(args)
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
+    with portable_args:
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
+    if chimera_save:
+        if torch.distributed.get_rank() == 0:
+            from slime_plugins.chimera_mixrl.checkpoint_metadata import write_metadata
+            from slime_plugins.chimera_mixrl.runtime import config
+
+            write_metadata(config(), args.save, iteration)
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 

@@ -8,6 +8,7 @@ by Slime; it deliberately does not replace either dependency in the image.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,11 @@ def register_transformers(transformers_root: str | os.PathLike[str] | None = Non
     HARDCODED_CONFIG_FOR_MODELS.setdefault("chimera", "ChimeraConfig")
 
     from transformers.models.chimera import ChimeraConfig, ChimeraForCausalLM, ChimeraModel
+
+    # Importing a model can replace the package's lazy-module object (e.g. when
+    # installed integration libraries reload Transformers). Publish on the live
+    # package, not the stale object captured before that import.
+    transformers = sys.modules['transformers']
 
     AutoConfig.register("chimera", ChimeraConfig, exist_ok=True)
     AutoModel.register(ChimeraConfig, ChimeraModel, exist_ok=True)
@@ -155,7 +161,11 @@ def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     mcore_config = core_transformer_config_from_args(args)
     apply_yarn_settings(args, mcore_config, hf_config)
-    return gpt_builder(args, pre_process, post_process, vp_stage=vp_stage, config=mcore_config)
+    model = gpt_builder(args, pre_process, post_process, vp_stage=vp_stage, config=mcore_config)
+    if os.environ.get('CHIMERA_FP32_LM_HEAD', '0') == '1':
+        from .chimera_precision import install_fp32_head
+        install_fp32_head(model)
+    return model
 
 
 __all__ = [

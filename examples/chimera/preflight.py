@@ -8,12 +8,13 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-import megatron
+import megatron.core
 import torch
 import transformers
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from slime_plugins.models.chimera import get_yarn_settings, register_transformers
+from slime_plugins.models.chimera_geometry import expected_geometry
 
 
 class _PreflightRotaryEmbedding:
@@ -65,9 +66,9 @@ def _validate_architecture(config) -> None:
         "rope_theta": 10_000_000.0,
         "scoring_func": "sigmoid",
         "routed_scaling_factor": 2.5,
-        "router_load_balancing_type": "none",
         "router_bias_update_rate": 0.0,
     }
+    expected.update(expected_geometry(os.environ.get('CHIMERA_MODEL_SIZE', 'full')))
     mismatches = {
         name: {"expected": expected_value, "actual": getattr(config, name, None)}
         for name, expected_value in expected.items()
@@ -75,6 +76,10 @@ def _validate_architecture(config) -> None:
     }
     if mismatches:
         raise RuntimeError(f"Checkpoint does not match the final Chimera architecture: {mismatches}")
+    if config.router_load_balancing_type not in ('none', 'quantile_balancing'):
+        raise RuntimeError('Unsupported source router balancing metadata')
+    # Training disables balancing and freezes routers independently of the
+    # historical pretraining label. Inference only uses the saved correction bias.
 
 
 def main() -> None:
@@ -95,7 +100,9 @@ def main() -> None:
         raise RuntimeError("ChimeraForCausalLM is not registered with AutoModelForCausalLM")
 
     yarn = get_yarn_settings(config)
-    megatron_path = Path(next(iter(megatron.__path__))).resolve()
+    # Namespace __path__ may start with an editable-install finder sentinel.
+    # Verify the real imported core module rather than treating that as a path.
+    megatron_path = Path(megatron.core.__file__).resolve().parent.parent
     expected_megatron = Path(os.environ.get("MEGATRON_ROOT", "/root/Megatron-LM")).resolve()
     if not megatron_path.is_relative_to(expected_megatron):
         raise RuntimeError(f"Expected the Slime image's Megatron checkout, got {megatron_path}")

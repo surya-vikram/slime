@@ -1,4 +1,8 @@
-# Chimera 10B DAPO/GSM8K runbook
+# Chimera container and operational runbook
+
+The canonical Chimera MixRL training contract and its qualification status are
+in [MIXRL_RUNBOOK.md](MIXRL_RUNBOOK.md). This file documents the pinned image,
+mounts, checkpoint layout, and the separate GSM8K/DAPO control recipe.
 
 This recipe uses one colocated 8xH200 node. Megatron uses pure DP=8 with its
 distributed optimizer (`TP=PP=CP=EP=ETP=1`). Slime runs eight independent
@@ -43,7 +47,7 @@ Edit the small configuration block at the top of `examples/chimera/train.sh`,
 or set the equivalent environment variables, then run:
 
 ```bash
-RUN_NAME=gsm8k-dapo-001 \
+RECIPE=gsm8k RUN_NAME=gsm8k-dapo-001 \
 HF_CHECKPOINT=/datasets/megadata/models/chimera-10b-hf \
 MCORE_CHECKPOINT=/datasets/megadata/models/chimera-10b-mcore \
 bash examples/chimera/train.sh

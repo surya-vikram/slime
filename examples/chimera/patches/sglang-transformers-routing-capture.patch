@@ -1,0 +1,12 @@
+diff --git a/python/sglang/srt/models/transformers.py b/python/sglang/srt/models/transformers.py
+--- a/python/sglang/srt/models/transformers.py
++++ b/python/sglang/srt/models/transformers.py
+@@ -479,3 +479,8 @@
+ ) -> torch.Tensor:
+     self = _TRANSFORMERS_MOE_LAYERS[layer_name]
++    # Chimera: preserve the rollout expert path, including under CUDA graphs.
++    import os
++    if os.environ.get("CHIMERA_ROUTING_REPLAY") == "1":
++        from slime_plugins.chimera_mixrl.sglang_capture import capture
++        capture(layer_name, topk_ids)
+     # Record expert distribution for EPLB

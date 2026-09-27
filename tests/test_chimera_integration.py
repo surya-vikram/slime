@@ -76,13 +76,15 @@ def test_production_launcher_has_dp8_dapo_contract():
 
     required = (
         "EXPECTED_GPUS=8",
-        "--actor-num-gpus-per-node 8",
-        "--rollout-num-gpus 8",
+        'POLICY_GPUS=${POLICY_GPUS:-8}',
+        '--actor-num-gpus-per-node "$POLICY_GPUS"',
+        '--rollout-num-gpus "$ROLLOUT_GPUS"',
         "--rollout-num-gpus-per-engine 1",
         "--tensor-model-parallel-size 1",
         "--pipeline-model-parallel-size 1",
         "--context-parallel-size 1",
-        "--expert-model-parallel-size 1",
+        'EXPERT_MODEL_PARALLEL_SIZE=${EXPERT_MODEL_PARALLEL_SIZE:-1}',
+        '--expert-model-parallel-size "$EXPERT_MODEL_PARALLEL_SIZE"',
         "--expert-tensor-parallel-size 1",
         "--use-distributed-optimizer",
         "check_reward_nonzero_std",

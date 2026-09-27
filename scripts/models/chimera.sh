@@ -3,6 +3,28 @@
 
 NLAYERS=25
 FIRST_K_DENSE_REPLACE=2
+CHIMERA_HIDDEN=2048
+CHIMERA_FFN=8192
+CHIMERA_HEADS=16
+CHIMERA_HEAD_DIM=256
+CHIMERA_EXPERTS=32
+CHIMERA_TOPK=4
+CHIMERA_EXPERT_FFN=2048
+case "${CHIMERA_MODEL_SIZE:-full}" in
+    full) ;;
+    tiny)
+        # Exactly Megatron-LM/examples/chimera/tiny_chimera.sh geometry.
+        NLAYERS=8
+        CHIMERA_HIDDEN=512
+        CHIMERA_FFN=2048
+        CHIMERA_HEADS=8
+        CHIMERA_HEAD_DIM=64
+        CHIMERA_EXPERTS=8
+        CHIMERA_TOPK=2
+        CHIMERA_EXPERT_FFN=256
+        ;;
+    *) echo 'Invalid CHIMERA_MODEL_SIZE' >&2; return 1 ;;
+esac
 
 arr=()
 for ((i = 0; i < NLAYERS; i++)); do
@@ -18,12 +40,12 @@ MODEL_ARGS=(
     --disable-bias-linear
     --qk-layernorm
     --group-query-attention
-    --num-attention-heads 16
+    --num-attention-heads "$CHIMERA_HEADS"
     --num-query-groups 2
-    --kv-channels 256
-    --num-layers 25
-    --hidden-size 2048
-    --ffn-hidden-size 8192
+    --kv-channels "$CHIMERA_HEAD_DIM"
+    --num-layers "$NLAYERS"
+    --hidden-size "$CHIMERA_HIDDEN"
+    --ffn-hidden-size "$CHIMERA_FFN"
 
     --normalization RMSNorm
     # The image parser accepts RoPE here; the custom provider replaces it
@@ -38,10 +60,10 @@ MODEL_ARGS=(
     --no-masked-softmax-fusion
     --vocab-size 50176
 
-    --num-experts 32
+    --num-experts "$CHIMERA_EXPERTS"
     --moe-layer-freq "$MOE_LAYER_FREQ"
-    --moe-ffn-hidden-size 2048
-    --moe-router-topk 4
+    --moe-ffn-hidden-size "$CHIMERA_EXPERT_FFN"
+    --moe-router-topk "$CHIMERA_TOPK"
     --moe-router-score-function sigmoid
     --moe-router-enable-expert-bias
     --moe-router-load-balancing-type none

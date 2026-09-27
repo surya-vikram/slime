@@ -175,20 +175,27 @@ class RolloutManager:
             evaluation=False,
         )
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        if metrics and metrics.get('mixrl/skip_optimizer'):
+            return {'skip_optimizer': True}
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data)
 
-    def eval(self, rollout_id):
+    def eval(self, rollout_id, final=False):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
         set_current_rollout_id(rollout_id)
         self.health_monitoring_resume()
 
-        result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
+        previous_final = getattr(self.args, "mixrl_eval_final", False)
+        self.args.mixrl_eval_final = final
+        try:
+            result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
+        finally:
+            self.args.mixrl_eval_final = previous_final
         data = result.data
         save_debug_rollout_data(
             self.args.save_debug_rollout_data,
