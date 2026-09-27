@@ -59,35 +59,38 @@ curl -s http://127.0.0.1:8025/v1/models | jq .
 
 ---
 
-### Step 2: Start the Reward Microservice (`eval_stack.reward_service`)
-The reward microservice bridges Slime rollouts with both deterministic evaluation graders and the local vLLM judge.
-
-From the `chimera-eval` directory, start the reward service in the background:
+### Step 2: Start the Reward Microservice Container (`chimera-eval`)
+The reward microservice bridges Slime rollouts with deterministic evaluation graders and the local vLLM judge. Run it as a daemon container using host networking:
 
 ```bash
-cd /workspace/chimera-eval
-
-export JUDGE_URL=http://127.0.0.1:8025/v1
-export JUDGE_NAME=mixrl-judge-4b
-export JUDGE_CONTEXT=16384
-export JUDGE_MAX_TOKENS=1024
-export JUDGE_MAX_RETRY_TOKENS=2048
-export JUDGE_CONCURRENCY=8
-export JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}'
-
-python3 -m eval_stack.reward_service \
-  --data-dir /data/datasets/chimera-eval-data \
-  --cache-dir /data/cache/scorer_cache \
-  --host 127.0.0.1 \
-  --port 18020 \
-  --workers 8 \
-  --judge-revision "mixrl-judge-4b" &
+docker run -d --name chimera-reward-service \
+  --net=host \
+  --ipc=host \
+  --restart=unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /data/datasets:/data/datasets \
+  -v /data/cache/scorer_cache:/data/cache/scorer_cache \
+  -e JUDGE_URL=http://127.0.0.1:8025/v1 \
+  -e JUDGE_NAME=mixrl-judge-4b \
+  -e JUDGE_CONTEXT=16384 \
+  -e JUDGE_MAX_TOKENS=1024 \
+  -e JUDGE_MAX_RETRY_TOKENS=2048 \
+  -e JUDGE_CONCURRENCY=8 \
+  -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' \
+  suryavikram6/chimera-eval:0.1.1 \
+  python3 -m eval_stack.reward_service \
+    --data-dir /data/datasets/chimera-eval-data \
+    --cache-dir /data/cache/scorer_cache \
+    --host 127.0.0.1 \
+    --port 18020 \
+    --workers 8 \
+    --judge-revision "mixrl-judge-4b"
 ```
 
 **Verify Reward Service Readiness:**
 ```bash
 curl -s http://127.0.0.1:18020/health
-# Expected: {"protocol_id": "...", "status": "ready"}
+# Expected output: {"protocol_id": "...", "status": "ready"}
 ```
 
 ---
