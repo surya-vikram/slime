@@ -61,7 +61,7 @@ DEFAULT_16K_CAPS='{"gsm8k_train":8192,"nemotron_math":8192,"mcqa":4096,"openqa":
 export MIXRL_CAPS=${MIXRL_CAPS:-$DEFAULT_16K_CAPS}
 
 # High-Throughput Concurrency (Prevents reward scoring bottleneck on 4,096 samples):
-export MIXRL_REWARD_CONCURRENCY=${MIXRL_REWARD_CONCURRENCY:-64}     # Concurrent requests to reward service
+export MIXRL_REWARD_CONCURRENCY=${MIXRL_REWARD_CONCURRENCY:-128}    # Concurrent requests to reward service
 export MIXRL_RESPONSE_CONCURRENCY=${MIXRL_RESPONSE_CONCURRENCY:-64} # Concurrent generation requests
 export MIXRL_INFLIGHT_GROUPS=${MIXRL_INFLIGHT_GROUPS:-16}           # In-flight prompt groups in rollout
 
