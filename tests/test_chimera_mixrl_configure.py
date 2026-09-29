@@ -52,7 +52,7 @@ class ConfigTests(unittest.TestCase):
             path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
             manifest['splits'][split] = {'hash': digest(rows)}
         write_json(data / 'manifest.json', manifest)
-        self.tasks_path = root / 'mixrl_tasks.json'
+        self.tasks_path = root / 'tasks.json'
         self.tasks = {'eval': {'samples_per_prompt': 2},
                       'domains': {'knowledge': {'summary': 'fixture'}, 'grounding': {'summary': 'fixture'}},
                       'tasks': {'mcqa': task_entry('mcqa', True), 'hotpot_train': task_entry('hotpot_train', False)}}
@@ -213,13 +213,13 @@ class ConfigTests(unittest.TestCase):
             env = dict(os.environ, **self.env)
             # Exercise the actual new defaults, not fixture generation counts.
             env.pop('N_SAMPLES_PER_PROMPT', None)
-            env.update(RECIPE='mixrl', PREFLIGHT_ONLY='1', EXECUTION_MODE='sync',
+            env.update(PREFLIGHT_ONLY='1', EXECUTION_MODE='sync',
                        CONTEXT_PHASE='auto', TRAIN_SEQUENCE_LENGTH='256',
                        MIXRL_CONTEXT_HEADROOM='16',
                        DATA_ROOT=self.temp.name, RUN_NAME='launcher-preflight',
                        MIXRL_RUNS_ROOT=str(Path(self.temp.name) / 'runs'),
                        MIXRL_SCORER_URL=f'http://127.0.0.1:{server.server_port}', **updates)
-            result = subprocess.run(['bash', str(REPO / 'examples/chimera/train.sh')],
+            result = subprocess.run(['bash', str(REPO / 'mixrl/internal/launch.sh')],
                                     env=env, capture_output=True, text=True, timeout=20)
             return result, Path(env['MIXRL_RUNS_ROOT']) / env['RUN_NAME'] / 'manifests/mixrl_config.json'
         finally:
@@ -231,13 +231,13 @@ class ConfigTests(unittest.TestCase):
         result, path = self.launch(self.health)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = json.loads(path.read_text())
-        self.assertEqual(config['samples_per_prompt'], 4)
+        self.assertEqual(config['samples_per_prompt'], 8)  # mixrl/config.env default
         self.assertEqual(config['eval_samples'], 2)
         self.assertEqual(config['context_headroom'], 16)
         self.assertEqual(config['rollout_batch_size'], 1)
         self.assertEqual(config['checkpoint_context'],
                          {'phase': 'native', 'model_max_context': 32768, 'sequence_cap': 256})
-        self.assertIn('1 of 2 tasks enabled; 1 prompts per step x 4 responses = 4 samples', result.stdout)
+        self.assertIn('1 of 2 tasks enabled; 1 prompts per step x 8 responses = 8 samples', result.stdout)
         self.assertIn('judge: not needed', result.stdout)
         self.assertIn('mcqa: mcqa fixture', result.stdout)
 

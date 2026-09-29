@@ -146,7 +146,7 @@ in training (`mixrl/<task>/think_rate`) and eval (`evaluation.json`) to watch it
 - Judge: one reward-service setup; `/health` reports judge reachability, which
   tasks can call the judge, and startup grading-check failures. Training refuses
   enabled tasks it cannot grade, at launch and before every rollout.
-- Judge context default 32,768 in `scripts/airgapped/02_host_reward_service.sh`.
+- Judge context default 32,768 (`JUDGE_CONTEXT` in `mixrl/config.env`).
 - rl_val grown to 512 (v4, published on Hugging Face; seeds and targets recorded in
   the manifest's `val_growth`); domains and a single eval tier.
 - `think_rate` per task in training metrics and eval summaries.

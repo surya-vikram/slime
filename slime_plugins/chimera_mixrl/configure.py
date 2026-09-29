@@ -1,4 +1,4 @@
-"""Resolve the central train.sh MixRL block before any GPU service is started."""
+"""Resolve mixrl/config.env, the task file and the launcher settings before any GPU service starts."""
 import json
 import os
 import hashlib
@@ -192,7 +192,7 @@ def resolve():
     c['data_hash'] = digest(manifest)
     c['implementation_hash'] = digest({p.name: p.read_text() for p in sorted(Path(__file__).parent.glob('*.py'))})
     repo = Path(__file__).resolve().parents[2]
-    c['launcher_hash'] = digest((repo / 'examples/chimera/train.sh').read_text())
+    c['launcher_hash'] = digest((repo / 'mixrl/internal/launch.sh').read_text())
     c['training_loop_hash'] = digest((repo / ('train_async.py' if c['execution_mode'] == 'async' else 'train.py')).read_text())
     c['backend_model_hash'] = digest((repo / 'slime/backends/megatron_utils/model.py').read_text())
     c['rollout_manager_hash'] = digest((repo / 'slime/ray/rollout.py').read_text())

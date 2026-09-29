@@ -1,7 +1,7 @@
 """The MixRL task file: which tasks train, how many prompts each, how eval is sized, and what each task is.
 
-Only task and eval-size choices live here. Everything else (batch geometry, eval
-cadence, optimizer) stays in examples/chimera/train.sh. Preview a file with:
+Only task and eval-size choices live here; every other run setting is in
+mixrl/config.env. Preview with `mixrl/run.sh tasks`, or directly:
 
     python3 -m slime_plugins.chimera_mixrl.tasks [path] [--samples-per-prompt N]
 """
@@ -9,7 +9,7 @@ import argparse
 import json
 from pathlib import Path
 
-DEFAULT_PATH = Path(__file__).resolve().parents[2] / 'examples' / 'chimera' / 'mixrl_tasks.json'
+DEFAULT_PATH = Path(__file__).resolve().parents[2] / 'mixrl' / 'tasks.json'
 JUDGE_USES = ('none', 'on_miss', 'to_pass', 'always')
 REWARDS = ('binary', 'graded')
 EVAL = {'samples_per_prompt'}

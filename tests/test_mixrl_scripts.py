@@ -1,0 +1,181 @@
+"""mixrl/run.sh, reward.sh and judge.sh: host checks and the exact docker/vLLM calls, with stubs."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import threading
+import unittest
+
+REPO = Path(__file__).resolve().parents[1]
+MIXRL = REPO / 'mixrl'
+STUB = '''#!/usr/bin/env bash
+# Records each call; docker copies --env-file before the caller deletes it.
+{ printf '%s\\n' "$@"; echo ---; } >> "$STUB_LOG/$(basename "$0").calls"
+if [[ "$(basename "$0")" == docker ]]; then
+    prev=
+    for arg in "$@"; do
+        if [[ "$prev" == --env-file ]]; then cp "$arg" "$STUB_LOG/env_file"; fi
+        prev=$arg
+    done
+    if [[ "$1" == ps ]]; then echo running; fi
+fi
+exit 0
+'''
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+class Services(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = {'/health': {'protocol_id': 'x', 'judge': {'model': 'mixrl-judge', 'ready': True}, 'task_errors': {},
+                            'task_judge': {}},
+                '/v1/models': {'data': [{'id': 'mixrl-judge'}]}}.get(self.path)
+        self.send_response(200 if body else 404)
+        self.end_headers()
+        self.wfile.write(json.dumps(body or {}).encode())
+
+    def log_message(self, *args):
+        pass
+
+
+class ScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.base = root / 'base'
+        for path in ('models/m/hf/config.json', 'models/m/mcore/latest_checkpointed_iteration.txt',
+                     'datasets/d/manifest.json', 'repos/transformers/src/transformers/models/chimera/__init__.py',
+                     'repos/chimera-eval/eval_stack/reward_service.py'):
+            (self.base / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.base / path).write_text('{}')
+        (self.base / 'models/judge').mkdir()
+        self.log = root / 'log'
+        self.log.mkdir()
+        bin_dir = root / 'bin'
+        bin_dir.mkdir()
+        for name in ('docker', 'vllm'):
+            (bin_dir / name).write_text(STUB)
+            (bin_dir / name).chmod(0o755)
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Services)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        port = str(self.server.server_port)
+        self.env = dict(os.environ, PATH=f'{bin_dir}:{os.environ["PATH"]}', STUB_LOG=str(self.log),
+                        BASE_DIR=str(self.base), MODEL_NAME='m', DATASET_NAME='d', JUDGE_MODEL_DIR='judge',
+                        REWARD_PORT=port, JUDGE_PORT=port)
+
+    def run_script(self, *args, **env):
+        return subprocess.run(['bash', str(MIXRL / args[0]), *args[1:]], env=dict(self.env, **env),
+                              capture_output=True, text=True, timeout=30)
+
+    def calls(self, name):
+        path = self.log / f'{name}.calls'
+        return [c.strip('\n').split('\n') for c in path.read_text().split('---\n') if c.strip()] if path.exists() else []
+
+    def env_file(self):
+        return dict(line.split('=', 1) for line in (self.log / 'env_file').read_text().splitlines())
+
+    def test_tasks_preview_needs_no_docker(self):
+        result = self.run_script('run.sh', 'tasks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('16 of 16 tasks enabled; 512 prompts per step x 8 responses = 4096 samples', result.stdout)
+        self.assertEqual(self.calls('docker'), [])
+
+    def test_preflight_uses_no_gpus_and_carries_every_setting(self):
+        result = self.run_script('run.sh', 'preflight', 'check-1', LR='2e-6')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls('docker')
+        self.assertEqual(call[:2], ['run', '--rm'])
+        self.assertNotIn('--gpus', call)
+        self.assertIn('DRY_RUN=1', call)
+        self.assertIn('MIXRL_RUNS_ROOT=/tmp/mixrl-preflight', call)
+        self.assertEqual(call[-3:], ['suryavikram6/slime:pinned', 'bash', 'mixrl/internal/launch.sh'])
+        settings = self.env_file()
+        names = [line.split('=')[0] for line in (MIXRL / 'config.env').read_text().splitlines()
+                 if line[:1].isupper() and '=' in line]
+        self.assertLessEqual(set(names), set(settings))
+        self.assertEqual((settings['LR'], settings['RUN_NAME'], settings['RESUME'], settings['DATA_ROOT']),
+                         ('2e-6', 'check-1', '0', '/data'))
+
+    def test_start_and_resume(self):
+        result = self.run_script('run.sh', 'start', 'gsm8k-01')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls('docker')
+        self.assertIn('"device=0,1"', call)
+        self.assertIn(f'{self.base}/runs:/data/runs', call)
+        self.assertNotIn('DRY_RUN=1', call)
+        self.assertEqual(self.env_file()['RESUME'], '0')
+        run_dir = self.base / 'runs/chimera/mixrl/gsm8k-01'
+        # An early failure leaves only folders and the resolved config: the name can be retried.
+        (run_dir / 'manifests').mkdir(parents=True)
+        (run_dir / 'manifests/mixrl_config.json').write_text('{}')
+        self.assertEqual(self.run_script('run.sh', 'start', 'gsm8k-01').returncode, 0)
+        (run_dir / 'logs').mkdir()
+        (run_dir / 'logs/train.log').write_text('step 1')
+        result = self.run_script('run.sh', 'start', 'gsm8k-01')
+        self.assertIn('already exists', result.stderr)
+        result = self.run_script('run.sh', 'resume', 'gsm8k-01')
+        self.assertIn('no checkpoint to resume', result.stderr)
+        (run_dir / 'checkpoints').mkdir()
+        (run_dir / 'checkpoints/latest_checkpointed_iteration.txt').write_text('10')
+        result = self.run_script('run.sh', 'resume', 'gsm8k-01')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.env_file()['RESUME'], self.env_file()['RUN_NAME']), ('1', 'gsm8k-01'))
+
+    def test_clear_errors_before_any_container(self):
+        cases = (
+            (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=2'),
+            (('run.sh', 'start'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
+            (('run.sh', 'start'), {'MODEL_NAME': 'missing'}, 'check BASE_DIR, MODEL_NAME'),
+            (('run.sh', 'start', 'bad/name'), {}, "use letters, digits"),
+            (('judge.sh',), {'JUDGE_GPUS': '2,3'}, 'lists 2 GPUs but JUDGE_TP=1'),
+            (('judge.sh',), {'JUDGE_CONTEXT': '65536'}, 'must not exceed JUDGE_MAX_MODEL_LEN'),
+        )
+        for args, env, message in cases:
+            with self.subTest(args=args, env=env):
+                result = self.run_script(*args, **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+        self.assertEqual(self.calls('docker'), [])
+        self.assertEqual(self.run_script('run.sh', 'train').returncode, 2)
+
+    def test_reward_service_start(self):
+        result = self.run_script('reward.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Judge is up', result.stdout)
+        self.assertIn('Reward service ready. Judge mixrl-judge: reachable.', result.stdout)
+        run = next(c for c in self.calls('docker') if c[0] == 'run')
+        for expected in ('/var/run/docker.sock:/var/run/docker.sock', f'{self.base}/repos/chimera-eval:/opt/chimera-eval',
+                         f'JUDGE_URL=http://127.0.0.1:{self.env["JUDGE_PORT"]}/v1', 'JUDGE_CONTEXT=32768',
+                         '--judge-revision', 'mixrl-judge', self.env['REWARD_PORT']):
+            self.assertIn(expected, run)
+
+    def test_judge_native_and_docker(self):
+        result = self.run_script('judge.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls('vllm')
+        self.assertEqual(call[:2], ['serve', f'{self.base}/models/judge'])
+        for flag, value in (('--tensor-parallel-size', '1'), ('--max-model-len', '32768'),
+                            ('--served-model-name', 'mixrl-judge'), ('--host', '127.0.0.1')):
+            self.assertEqual(call[call.index(flag) + 1], value)
+        (self.base / 'models/judge-assistant').mkdir()
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = next(c for c in self.calls('docker') if c[0] == 'run')
+        self.assertEqual(run[run.index('--gpus') + 1], '"device=2,3"')
+        self.assertIn('/models/judge', run)
+        spec = json.loads(run[run.index('--speculative-config') + 1])
+        self.assertEqual(spec['model'], '/models/judge-assistant')
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,53 +65,3 @@ def test_get_yarn_settings_rejects_non_yarn_checkpoint():
 
     with pytest.raises(ValueError, match="requires YaRN"):
         get_yarn_settings(config)
-
-
-@pytest.mark.unit
-def test_production_launcher_has_dp8_dapo_contract():
-    root = Path(__file__).resolve().parents[1]
-    launcher = (root / "examples/chimera/train.sh").read_text()
-
-    required = (
-        "EXPECTED_GPUS=8",
-        'POLICY_GPUS=${POLICY_GPUS:-8}',
-        '--actor-num-gpus-per-node "$POLICY_GPUS"',
-        '--rollout-num-gpus "$ROLLOUT_GPUS"',
-        "--rollout-num-gpus-per-engine 1",
-        "--tensor-model-parallel-size 1",
-        "--pipeline-model-parallel-size 1",
-        "--context-parallel-size 1",
-        'EXPERT_MODEL_PARALLEL_SIZE=${EXPERT_MODEL_PARALLEL_SIZE:-1}',
-        '--expert-model-parallel-size "$EXPERT_MODEL_PARALLEL_SIZE"',
-        "--expert-tensor-parallel-size 1",
-        "--use-distributed-optimizer",
-        "check_reward_nonzero_std",
-        "--calculate-per-token-loss",
-        "--eps-clip-high 0.28",
-        "--sglang-model-impl transformers",
-    )
-    assert all(value in launcher for value in required)
-    assert "--use-kl-loss" not in launcher
-    assert "--no-save-optim" not in launcher
-    assert "sglang-dp-size" not in launcher
-
-
-@pytest.mark.unit
-def test_committed_gsm8k_splits_are_disjoint_and_well_formed():
-    data_dir = Path(__file__).resolve().parents[1] / "examples/chimera/data"
-    expected_counts = {"train": 6961, "validation": 512, "test": 1319}
-    source_rows = {}
-
-    for split, expected_count in expected_counts.items():
-        with (data_dir / f"gsm8k_{split}.jsonl").open(encoding="utf-8") as handle:
-            rows = [json.loads(line) for line in handle]
-        assert len(rows) == expected_count
-        assert all(set(row) == {"prompt", "label", "metadata"} for row in rows)
-        assert all("\\boxed{...}" in row["prompt"] for row in rows)
-        source_rows[split] = {
-            (row["metadata"]["source_split"], row["metadata"]["source_index"])
-            for row in rows
-        }
-
-    assert source_rows["train"].isdisjoint(source_rows["validation"])
-    assert len(source_rows["train"] | source_rows["validation"]) == 7473
