@@ -10,7 +10,7 @@ mixrl/
 ├── reward.sh         start the reward service
 ├── run.sh            tasks | preflight | start | resume
 ├── internal/launch.sh   runs inside the training container; never run by hand
-└── docs/             AIRGAPPED.md (setup and transfer), RUNBOOK.md (how it works), TASK_AUDIT.md
+└── docs/             AIRGAPPED.md (setup and transfer), RUNBOOK.md (how it works), TASK_AUDIT.md, GSM8K.md (GSM8K-only run on 8×H200)
 ```
 
 ## Running
