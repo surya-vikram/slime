@@ -268,14 +268,19 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     scoring_slots = asyncio.Semaphore(c.get('reward_concurrency', 8))
 
     async def score(sample):
-        # Slime retains EOS in decoded response text for token/logprob alignment.
-        # Graders consume ordinary assistant content, not serialization markers.
+        # Slime retains the stop marker in decoded response text for token/logprob
+        # alignment, and the tokens keep it so the policy learns to end its turn.
+        # Graders consume ordinary assistant content, not serialization markers:
+        # Chimera ends a turn with the <end_of_turn> stop string, other models with EOS.
         text = sample.response
         eos = getattr(source.tokenizer, 'eos_token', None)
         eos_id = getattr(source.tokenizer, 'eos_token_id', None)
-        if (sample.status == Sample.Status.COMPLETED and eos and sample.tokens
-                and sample.tokens[-1] == eos_id and text.endswith(eos)):
-            text = text[:-len(eos)]
+        if sample.status == Sample.Status.COMPLETED:
+            stop = next((s for s in getattr(args, 'rollout_stop', None) or [] if s and text.endswith(s)), None)
+            if stop:
+                text = text[:-len(stop)]
+            elif eos and sample.tokens and sample.tokens[-1] == eos_id and text.endswith(eos):
+                text = text[:-len(eos)]
         sample.metadata['grading_text'] = text
         sample.metadata['reward_queued_at'] = time.time()
         async with scoring_slots:

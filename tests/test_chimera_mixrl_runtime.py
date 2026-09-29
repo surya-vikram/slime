@@ -302,6 +302,26 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(group[0].rollout_log_probs), 2)
             self.assertTrue(group[2].metadata['grading_text'].endswith('<EOS>'))
 
+    async def test_grading_strips_the_end_of_turn_stop_string_not_training_tokens(self):
+        # Chimera's chat turns end with <end_of_turn>; SGLang stops on it as a string and
+        # (no_stop_trim) keeps it in the response. The 2026-09-27 H200 run graded it verbatim.
+        from slime.rollout import sglang_rollout
+        original = sglang_rollout.generate
+        async def with_end_of_turn(*args):
+            sample = await original(*args)
+            sample.response += '<end_of_turn>'
+            return sample
+        self.args.rollout_stop = ['<end_of_turn>']
+        with patch.object(sglang_rollout, 'generate', with_end_of_turn):
+            output = await runtime._rollout(self.args, 0, self.source)
+        for group in output.samples:
+            self.assertEqual(group[0].reward, 1.)
+            self.assertEqual(group[0].metadata['grading_text'], 'B')
+            self.assertEqual(group[0].response, 'B<end_of_turn>')
+            self.assertEqual(len(group[0].rollout_log_probs), 2)
+            # A truncated response never reached the stop; its text is graded as generated.
+            self.assertTrue(group[2].metadata['grading_text'].endswith('<end_of_turn>'))
+
     async def test_reward_concurrency_is_independent_and_bounded(self):
         self.c['reward_concurrency'] = 1
         original = runtime.request

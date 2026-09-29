@@ -499,8 +499,11 @@ EXIT_STEPS+=('if [[ -n "$GPU_METRICS_PID" ]]; then kill "$GPU_METRICS_PID" 2>/de
 # sitecustomize each would import torch and Transformers (~0.8 GB apiece); job
 # processes still get the full PYTHONPATH from the runtime env below.
 RAY_SERVICE_PYTHONPATH="$REPO_ROOT:$MEGATRON_ROOT"
+# Plain text in train.log: no color codes around Ray worker prefixes or CLI output.
+export RAY_COLOR_PREFIX=0
 PYTHONPATH="$RAY_SERVICE_PYTHONPATH" ray start \
     --head \
+    --log-color false \
     --node-ip-address "${MASTER_ADDR:-127.0.0.1}" \
     --num-gpus "$EXPECTED_GPUS" \
     --disable-usage-stats \
@@ -519,6 +522,7 @@ keys = (
     "NVSHMEM_DISABLE_NCCL",
     "PYTHONPATH",
     "PYTHONUNBUFFERED",
+    "RAY_COLOR_PREFIX",
     "TENSORBOARD_DIR",
     "MIXRL_WALLCLOCK_SECONDS",
     "MIXRL_FINAL_RESERVE_SECONDS",
@@ -540,6 +544,7 @@ PY
 )
 
 PYTHONPATH="$RAY_SERVICE_PYTHONPATH" ray job submit \
+    --log-color false \
     --address="http://${MASTER_ADDR:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}" \
     --runtime-env-json="$RUNTIME_ENV_JSON" \
     -- "${TRAIN_COMMAND[@]}"
