@@ -1,0 +1,377 @@
+{
+  "_readme": [
+    "MixRL tasks: which tasks train, how many prompts each adds per step, how eval is sized, and what each task is.",
+    "Edit: tasks.<name>.enabled / prompts_per_step / eval_prompts / max_response_tokens, and eval.",
+    "Training: each enabled task adds prompts_per_step prompts per step from its about.train_pool; rollout batch = their sum.",
+    "  A task reshuffles and starts a new pass when its pool runs out.",
+    "Eval: each enabled task evaluates eval_prompts prompts (\"all\" by default, or a number up to about.val_pool) from",
+    "  rl_val, eval.samples_per_prompt samples each, at baseline, every EVAL_INTERVAL steps and at the end.",
+    "Do not edit 'about' by hand: launch checks it against rl_train/rl_val and the reward service and stops on any mismatch.",
+    "about.judge: none = never calls the judge; on_miss = only when the exact check fails;",
+    "  to_pass = deterministic checks can only fail an answer, passing needs the judge; always = every answer.",
+    "Reasoning inside <think>...</think> is not graded; the answer after it is. A response whose reasoning",
+    "  never reaches an answer is unfinished, like a truncated one: masked in training, 0 in eval.",
+    "Training will not start if an enabled task needs the judge and the judge is unreachable, or if the reward",
+    "  service cannot grade a task (for example a missing package).",
+    "Preview: python3 -m slime_plugins.chimera_mixrl.tasks --samples-per-prompt 8"
+  ],
+  "eval": {
+    "samples_per_prompt": 4
+  },
+  "domains": {
+    "math": {
+      "summary": "Math problems with one checkable final answer."
+    },
+    "knowledge": {
+      "summary": "Factual and science questions, multiple choice and open answer."
+    },
+    "grounding": {
+      "summary": "Answer only from supplied passages, without unsupported claims."
+    },
+    "quality": {
+      "summary": "Open-ended assistant requests judged for helpfulness and correctness."
+    },
+    "multiturn": {
+      "summary": "Keep following earlier instructions deep into a conversation."
+    },
+    "instruction": {
+      "summary": "Follow explicit, automatically checkable constraints."
+    },
+    "structure": {
+      "summary": "Produce schema-valid JSON, YAML, TOML or CSV."
+    },
+    "logic": {
+      "summary": "Puzzles and scheduling with exact answers."
+    },
+    "python": {
+      "summary": "Write Python programs that pass hidden tests."
+    }
+  },
+  "tasks": {
+    "gsm8k_train": {
+      "enabled": true,
+      "prompts_per_step": 48,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Grade-school math word problems (openai/gsm8k) with the final answer in \\boxed{}.",
+        "grading": "math_verify checks the boxed answer against the gold number.",
+        "answer_format": "Exactly one \\boxed{...} in the answer; math_verify compares it with the gold number.",
+        "requires": [
+          "math_verify in the reward service"
+        ],
+        "domain": "math",
+        "verifier": "math",
+        "judge": "none",
+        "reward": "binary",
+        "train_pool": 4984,
+        "val_pool": 29
+      }
+    },
+    "nemotron_math": {
+      "enabled": true,
+      "prompts_per_step": 48,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Harder competition-style math with free-form answers (nvidia/Nemotron-RL-Math-v2).",
+        "grading": "The judge decides whether the extracted final answer is equivalent to the reference.",
+        "answer_format": "No required format: the judge sees the last \"Answer:\"/\"Final answer:\" line if there is one, otherwise the whole response.",
+        "requires": [
+          "judge"
+        ],
+        "domain": "math",
+        "verifier": "equivalence",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 1834,
+        "val_pool": 28
+      }
+    },
+    "mcqa": {
+      "enabled": true,
+      "prompts_per_step": 32,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Multiple-choice knowledge questions with up to ten options (nvidia/Nemotron-RL-knowledge-mcqa).",
+        "grading": "The chosen label must equal the answer key: 1.0 in the format the prompt asks for, 0.5 in the other explicit format, 0 otherwise. pass@k counts only the requested format.",
+        "answer_format": "A final \"Answer: X\" line or \\boxed{X}, whichever the row's prompt asks for (the other format earns half credit); the last match counts.",
+        "requires": [
+          "regex in the reward service"
+        ],
+        "domain": "knowledge",
+        "verifier": "choice",
+        "judge": "none",
+        "reward": "binary",
+        "train_pool": 9320,
+        "val_pool": 19
+      }
+    },
+    "openqa": {
+      "enabled": true,
+      "prompts_per_step": 32,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Open-ended knowledge questions answered in \\boxed{} (nvidia/Nemotron-RL-knowledge-openqa).",
+        "grading": "The judge decides whether the boxed answer is equivalent to the reference.",
+        "answer_format": "\\boxed{...} (at most two nested brace levels); only the last boxed span goes to the judge.",
+        "requires": [
+          "judge",
+          "regex in the reward service"
+        ],
+        "domain": "knowledge",
+        "verifier": "equivalence",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 9987,
+        "val_pool": 19
+      }
+    },
+    "science": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Open science questions; each prompt names its own final-answer format (nvidia/Nemotron-RL-Science-v1).",
+        "grading": "The judge decides whether the extracted final answer is equivalent to the reference.",
+        "answer_format": "One of nine formats named in the prompt (\\boxed{}, **bold**, ((X)), Final Answer: ||X||, (Answer: X), <final_answer>, Answer is [X], <<X>>, [Answer: X]); only the last match goes to the judge.",
+        "requires": [
+          "judge",
+          "regex in the reward service"
+        ],
+        "domain": "knowledge",
+        "verifier": "equivalence",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 3986,
+        "val_pool": 19
+      }
+    },
+    "hotpot_train": {
+      "enabled": true,
+      "prompts_per_step": 96,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Multi-hop questions answered only from supplied Wikipedia passages (hotpotqa, distractor setting).",
+        "grading": "The judge checks the answer matches a reference alias and every claim is supported by the passages.",
+        "answer_format": "Ends with \"Final answer: <short answer>\"; the judge reads the whole response and rejects claims the passages do not support.",
+        "requires": [
+          "judge"
+        ],
+        "domain": "grounding",
+        "verifier": "grounded",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 19969,
+        "val_pool": 57
+      }
+    },
+    "cascade_chat": {
+      "enabled": true,
+      "prompts_per_step": 64,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "General assistant requests (nvidia/Nemotron-Cascade-RL-RLHF, not list or plan prompts).",
+        "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
+        "answer_format": "Free form; the judge reads the whole response. Rubric: accurate, complete, obeys the request; length is neither rewarded nor penalized.",
+        "requires": [
+          "judge"
+        ],
+        "domain": "quality",
+        "verifier": "quality",
+        "judge": "always",
+        "reward": "graded",
+        "train_pool": 12000,
+        "val_pool": 19
+      }
+    },
+    "cascade_lists": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Assistant requests that ask for a list or enumeration (nvidia/Nemotron-Cascade-RL-RLHF).",
+        "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
+        "answer_format": "Free form; the judge reads the whole response. Rubric also rejects repeated list items.",
+        "requires": [
+          "judge"
+        ],
+        "domain": "quality",
+        "verifier": "quality",
+        "judge": "always",
+        "reward": "graded",
+        "train_pool": 1194,
+        "val_pool": 19
+      }
+    },
+    "cascade_plans": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Assistant requests that ask for a plan, itinerary or schedule (nvidia/Nemotron-Cascade-RL-RLHF).",
+        "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
+        "answer_format": "Free form; the judge reads the whole response. Rubric: accurate, complete, obeys the request.",
+        "requires": [
+          "judge"
+        ],
+        "domain": "quality",
+        "verifier": "quality",
+        "judge": "always",
+        "reward": "graded",
+        "train_pool": 623,
+        "val_pool": 19
+      }
+    },
+    "nvidia_multichallenge": {
+      "enabled": true,
+      "prompts_per_step": 32,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Final turn of a multi-turn chat that tests memory of earlier instructions (Nemotron-RL-Multichallenge, vanilla).",
+        "grading": "The judge answers each rubric check against the completed conversation, the response as its final turn; every check must pass.",
+        "answer_format": "Free form; each rubric check is judged against the whole response.",
+        "requires": [
+          "judge: up to 2 calls per answer",
+          "judge context of at least 32K tokens (JUDGE_CONTEXT)"
+        ],
+        "domain": "multiturn",
+        "verifier": "rubric",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 728,
+        "val_pool": 29
+      }
+    },
+    "nvidia_multichallenge_advanced": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Harder multi-turn chats with system personas and longer histories (Nemotron-RL-Multichallenge, advanced).",
+        "grading": "The judge answers each rubric check against the completed conversation, the response as its final turn; every check must pass.",
+        "answer_format": "Free form; each rubric check is judged against the whole response.",
+        "requires": [
+          "judge: up to 6 calls per answer",
+          "judge context of at least 32K tokens (JUDGE_CONTEXT)"
+        ],
+        "domain": "multiturn",
+        "verifier": "rubric",
+        "judge": "always",
+        "reward": "binary",
+        "train_pool": 505,
+        "val_pool": 28
+      }
+    },
+    "nemotron_if": {
+      "enabled": true,
+      "prompts_per_step": 32,
+      "eval_prompts": "all",
+      "max_response_tokens": 4096,
+      "about": {
+        "summary": "Requests with verifiable format constraints such as case, length or punctuation (nvidia/Nemotron-RL-instruction_following).",
+        "grading": "IFBench checkers test each constraint; all must pass.",
+        "answer_format": "Free form, but every listed constraint (length, case, keywords, layout) is checked on the whole response.",
+        "requires": [
+          "ifbench with nltk, spacy, langdetect, emoji, syllapy and immutabledict in the reward service"
+        ],
+        "domain": "instruction",
+        "verifier": "instruction",
+        "judge": "none",
+        "reward": "binary",
+        "train_pool": 9953,
+        "val_pool": 57
+      }
+    },
+    "structured_train": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Produce JSON, YAML, TOML or CSV that matches a given schema (Nemotron-RL-Instruction-Following-Structured-Outputs-v2).",
+        "grading": "Data that parses and matches the schema goes to the judge, which must confirm the content; CSV cells are converted to the schema's types.",
+        "answer_format": "Valid JSON/YAML/TOML/CSV for the schema, alone or inside explanation (a fenced block, or an embedded JSON value); the last one given counts and must match the schema.",
+        "requires": [
+          "judge",
+          "pyyaml, jsonschema and defusedxml in the reward service",
+          "judge context of at least 32K tokens (JUDGE_CONTEXT)"
+        ],
+        "domain": "structure",
+        "verifier": "structure",
+        "judge": "to_pass",
+        "reward": "binary",
+        "train_pool": 5946,
+        "val_pool": 57
+      }
+    },
+    "reasoning_gym": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Procedurally generated logic puzzles (nvidia/Nemotron-RL-ReasoningGym-v1).",
+        "grading": "Exact match on the final answer; the judge re-checks only answers that miss.",
+        "answer_format": "Exact match on the last \"Answer:\"/\"Final answer:\" line, or on the whole response if there is none; misses go to the judge.",
+        "requires": [
+          "judge (only for answers that miss the exact match)"
+        ],
+        "domain": "logic",
+        "verifier": "exact",
+        "judge": "on_miss",
+        "reward": "binary",
+        "train_pool": 941,
+        "val_pool": 28
+      }
+    },
+    "calendar": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Multi-turn scheduling: return a JSON calendar that satisfies every time constraint (Nemotron-RL-Instruction-Following-Calendar-v2).",
+        "grading": "A deterministic checker validates the final calendar against every constraint.",
+        "answer_format": "The final calendar as a JSON list, alone or inside explanation; the last JSON value given counts.",
+        "requires": [],
+        "domain": "logic",
+        "verifier": "calendar",
+        "judge": "none",
+        "reward": "binary",
+        "train_pool": 2974,
+        "val_pool": 28
+      }
+    },
+    "apps": {
+      "enabled": true,
+      "prompts_per_step": 16,
+      "eval_prompts": "all",
+      "max_response_tokens": 8192,
+      "about": {
+        "summary": "Competitive programming problems solved in Python (codeparrot/apps).",
+        "grading": "The last Python code block runs against the problem's tests in a Docker sandbox; needs the APPS audit (MIXRL_CODE_AUDIT_DIR).",
+        "answer_format": "The last ```python block (or the whole response) runs against the tests; stdout must match token by token.",
+        "requires": [
+          "Docker CLI and the sandbox image suryavikram6/chimera-eval:0.1.1 visible to the reward service",
+          "APPS audit directory (MIXRL_CODE_AUDIT_DIR)"
+        ],
+        "domain": "python",
+        "verifier": "apps",
+        "judge": "none",
+        "reward": "binary",
+        "train_pool": 1319,
+        "val_pool": 57
+      }
+    }
+  }
+}

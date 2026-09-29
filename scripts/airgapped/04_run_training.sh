@@ -5,12 +5,21 @@
 set -Eeuo pipefail
 
 BASE_DIR="/nvme_zone3/home/ekamai1/chimera/mixrl"
-TRAINING_GPUS="${TRAINING_GPUS:-0,1,2,3}"
+TRAINING_GPUS="${TRAINING_GPUS:-0,1,2,3}" # e.g. TRAINING_GPUS=0,1 with POLICY_GPUS=2
 
 echo "=== Launching Chimera 10B Adam MixRL Training ==="
 echo "Base Directory: $BASE_DIR"
 echo "Training GPUs: $TRAINING_GPUS (devices $TRAINING_GPUS)"
-echo "Batch: 512 prompts x 8 responses = 4,096 samples/step"
+echo "Tasks and batch: examples/chimera/mixrl_tasks.json (preview printed below)"
+
+# Host overrides forwarded into the container only when set, e.g.
+#   POLICY_GPUS=2 EXPERT_MODEL_PARALLEL_SIZE=2 RUN_NAME=gsm8k-01 bash 04_run_training.sh
+OVERRIDES=(RUN_NAME RESUME POLICY_GPUS ROLLOUT_GPUS EXPERT_MODEL_PARALLEL_SIZE N_SAMPLES_PER_PROMPT
+    NUM_ROLLOUT LR EVAL_INTERVAL SAVE_INTERVAL MIXRL_TASKS_CONFIG MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE
+    MIXRL_INFLIGHT_GROUPS MIXRL_RESPONSE_CONCURRENCY MIXRL_REWARD_CONCURRENCY MIXRL_COLLECTION_TIMEOUT
+    SGLANG_CUDA_GRAPH_MAX_BS SGLANG_MEM_FRACTION_STATIC)
+OVERRIDE_ARGS=()
+for name in "${OVERRIDES[@]}"; do OVERRIDE_ARGS+=(-e "$name"); done
 
 mkdir -p "$BASE_DIR/runs"
 
@@ -35,5 +44,6 @@ docker run -it --rm \
   -e CHIMERA_TRANSFORMERS_ROOT=/workspace/transformers \
   -e MIXRL_SCORER_URL=http://127.0.0.1:18020 \
   -e RUNS_ROOT=/data/runs \
+  "${OVERRIDE_ARGS[@]}" \
   suryavikram6/slime:pinned \
   bash run_mixrl.sh "$@"

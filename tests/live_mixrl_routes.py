@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 
 from slime_plugins.chimera_mixrl.core import digest, load_split, write_json
-from slime_plugins.chimera_mixrl.routes import ROUTES, validate_route
+from slime_plugins.chimera_mixrl import tasks as task_file
+from slime_plugins.chimera_mixrl.routes import validate_route
 from slime_plugins.chimera_mixrl.runtime import request
 
 
@@ -26,11 +27,13 @@ def main():
     parser.add_argument('--max-tokens', type=int, default=1024)
     parser.add_argument('--concurrency', type=int, default=2)
     parser.add_argument('--tasks', default='', help='Optional comma-separated route subset for targeted rechecks')
+    parser.add_argument('--tasks-file', default=str(task_file.DEFAULT_PATH))
     args = parser.parse_args()
     rows, manifest = load_split(args.data_dir, 'rl_val')
     protocol = request(args.scorer_url + '/health', timeout=10)['protocol_id']
-    routes = args.tasks.split(',') if args.tasks else list(ROUTES)
-    if set(routes) - ROUTES.keys():
+    catalog = task_file.routes(task_file.load(args.tasks_file)['tasks'])
+    routes = args.tasks.split(',') if args.tasks else list(catalog)
+    if set(routes) - catalog.keys():
         raise ValueError('Unknown training route')
     selected = [min((r for r in rows if r['task'] == route),
                     key=lambda r: len(json.dumps(r['messages']))) for route in routes]
@@ -43,7 +46,7 @@ def main():
         start = time.monotonic()
         record = {'row_id': row['id'], 'task': row['task'], 'identity': identity}
         try:
-            validate_route(row)
+            validate_route(row, catalog)
             if path.exists():
                 record = json.loads(path.read_text())
                 if record['identity'] != identity:

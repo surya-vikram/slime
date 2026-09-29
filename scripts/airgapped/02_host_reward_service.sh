@@ -10,18 +10,21 @@ JUDGE_URL="${JUDGE_URL:-http://127.0.0.1:8025/v1}"
 JUDGE_NAME="${JUDGE_NAME:-mixrl-judge}"
 WORKERS="${WORKERS:-64}"
 JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-128}"
+# Judge prompt + judge answer budget. Long multi-turn/structured tasks need ~21K at full
+# response length; keep at or below the judge's --max-model-len (01_host_judge.sh MAX_MODEL_LEN).
+JUDGE_CONTEXT="${JUDGE_CONTEXT:-32768}"
 
 echo "=== Starting Reward Microservice (chimera-reward-service) ==="
-echo "Target Judge: $JUDGE_URL (model: $JUDGE_NAME)"
 echo "Workers: $WORKERS | Concurrency: $JUDGE_CONCURRENCY | Port: $SCORER_PORT"
 
-# 1. Verify judge server is reachable before starting reward service
-if ! curl -sf --connect-timeout 5 "$JUDGE_URL/models" >/dev/null 2>&1; then
-    echo "[ERROR] Cannot connect to judge at: $JUDGE_URL/models" >&2
-    echo "Please ensure the judge server (01_host_judge.sh) is running first." >&2
-    exit 1
+# 1. Report the judge. The service starts either way: judge-free tasks still score, and
+#    training refuses to start any enabled task that needs the judge while it is unreachable.
+echo "Judge: $JUDGE_URL (model: $JUDGE_NAME, context $JUDGE_CONTEXT)"
+if curl -sf --connect-timeout 5 "$JUDGE_URL/models" >/dev/null 2>&1; then
+    echo "[OK] Judge server is live."
+else
+    echo "[WARN] Judge not reachable at $JUDGE_URL/models: only judge-free tasks can train until it is up." >&2
 fi
-echo "[OK] Judge server is live."
 
 # 2. Stop any existing container instance
 docker rm -f chimera-reward-service 2>/dev/null || true
@@ -41,7 +44,7 @@ docker run -d --name chimera-reward-service \
   --entrypoint python3 \
   -e JUDGE_URL="$JUDGE_URL" \
   -e JUDGE_NAME="$JUDGE_NAME" \
-  -e JUDGE_CONTEXT=16384 \
+  -e JUDGE_CONTEXT="$JUDGE_CONTEXT" \
   -e JUDGE_MAX_TOKENS=1024 \
   -e JUDGE_MAX_RETRY_TOKENS=2048 \
   -e JUDGE_CONCURRENCY="$JUDGE_CONCURRENCY" \

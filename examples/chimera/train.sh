@@ -8,6 +8,15 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # Edit this block, or set the same names in the environment.
 RECIPE=${RECIPE:-mixrl} # mixrl | gsm8k (control) | sft (Qwen reference only).
 MODEL_PROFILE=${MODEL_PROFILE:-chimera} # qwen3-0.6B: reference MixRL validation only.
+if [[ "$RECIPE" == mixrl ]]; then
+    for removed in MIXRL_QUOTAS MIXRL_CAPS MIXRL_EVAL_QUOTAS MIXRL_MAIN_EVAL_QUOTAS ROLLOUT_BATCH_SIZE \
+            MIXRL_EVAL_SAMPLES MIXRL_MAIN_EVAL_INTERVAL MIXRL_MAIN_EVAL_SAMPLES; do
+        if [[ -n "${!removed:-}" ]]; then
+            echo "$removed is no longer read for MixRL; set tasks, prompt counts and eval size in the task file (MIXRL_TASKS_CONFIG)" >&2
+            exit 1
+        fi
+    done
+fi
 export CHIMERA_MODEL_SIZE=${CHIMERA_MODEL_SIZE:-full} # tiny: canonical 8-layer local mechanics only.
 DEFAULT_FP32_LM_HEAD=0
 if [[ "$MODEL_PROFILE" == chimera && "$RECIPE" == mixrl ]]; then DEFAULT_FP32_LM_HEAD=1; fi
@@ -48,7 +57,7 @@ SFT_WARMUP_FRACTION=${SFT_WARMUP_FRACTION:-0.05}
 SFT_SAVE_INTERVAL=${SFT_SAVE_INTERVAL:-} # Empty: final-only; 1 for isolated resume qualification.
 INITIAL_ACTOR_CHECKPOINT=${INITIAL_ACTOR_CHECKPOINT:-} # Fresh RL from SFT MCore weights, not optimizer.
 SAVE_HF=${SAVE_HF:-0} # Opt-in native HF export beside MCore saves; Qwen validation only.
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32} # MixRL: replaced by the task file's enabled prompt sum after preflight.
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-$DEFAULT_SAMPLES}
 OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-64}
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-512}
@@ -94,15 +103,9 @@ MODEL_CONTEXT_LENGTH=$TRAIN_SEQUENCE_LENGTH
 MIXRL_DATA_DIR=${MIXRL_DATA_DIR:-$DATA_ROOT/datasets/chimera-eval-data}
 MIXRL_CODE_AUDIT_DIR=${MIXRL_CODE_AUDIT_DIR:-$MIXRL_DATA_DIR/audits/apps} # Reference+negative sandbox report.
 MIXRL_SCORER_URL=${MIXRL_SCORER_URL:-http://127.0.0.1:18020}
-# Fixed sampled groups: 32 total across all nine training domains; no refilling.
-MIXRL_QUOTAS=${MIXRL_QUOTAS:-'{"gsm8k_train":3,"nemotron_math":3,"mcqa":2,"openqa":2,"science":1,"hotpot_train":6,"cascade_chat":4,"cascade_lists":1,"cascade_plans":1,"nvidia_multichallenge":2,"nvidia_multichallenge_advanced":1,"nemotron_if":2,"structured_train":1,"reasoning_gym":1,"calendar":1,"apps":1}'}
-# 8K integration allowances; 16K runs reserve twice as much response space.
-# Explicit MIXRL_CAPS overrides either profile. Never truncate prompts to fit.
-DEFAULT_MIXRL_CAPS='{"gsm8k_train":4096,"nemotron_math":4096,"mcqa":2048,"openqa":2048,"science":4096,"hotpot_train":2048,"cascade_chat":4096,"cascade_lists":4096,"cascade_plans":4096,"nvidia_multichallenge":2048,"nvidia_multichallenge_advanced":2048,"nemotron_if":2048,"structured_train":4096,"reasoning_gym":4096,"calendar":4096,"apps":4096}'
-if [[ "$TRAIN_SEQUENCE_LENGTH" == 16384 ]]; then
-    DEFAULT_MIXRL_CAPS='{"gsm8k_train":8192,"nemotron_math":8192,"mcqa":4096,"openqa":4096,"science":8192,"hotpot_train":4096,"cascade_chat":8192,"cascade_lists":8192,"cascade_plans":8192,"nvidia_multichallenge":4096,"nvidia_multichallenge_advanced":4096,"nemotron_if":4096,"structured_train":8192,"reasoning_gym":8192,"calendar":8192,"apps":8192}'
-fi
-MIXRL_CAPS=${MIXRL_CAPS:-$DEFAULT_MIXRL_CAPS}
+# Which tasks train, prompts per step, response caps and eval prompt counts. The
+# rollout batch is the sum of enabled prompts. Preview: python3 -m slime_plugins.chimera_mixrl.tasks
+MIXRL_TASKS_CONFIG=${MIXRL_TASKS_CONFIG:-$SCRIPT_DIR/mixrl_tasks.json}
 MIXRL_TRUNCATION=${MIXRL_TRUNCATION:-mask} # mask: exclude caps from loss AND group stats; zero: fixed-budget learning.
 MIXRL_SEED=${MIXRL_SEED:-42}
 MIXRL_CONTEXT_HEADROOM=${MIXRL_CONTEXT_HEADROOM:-1024} # Reserved, not added to generation allowance.
@@ -113,11 +116,6 @@ MIXRL_COLLECTION_TIMEOUT=${MIXRL_COLLECTION_TIMEOUT:-1800}
 MIXRL_REWARD_TIMEOUT=${MIXRL_REWARD_TIMEOUT:-600}
 MIXRL_REWARD_ATTEMPTS=${MIXRL_REWARD_ATTEMPTS:-3}
 MIXRL_REWARD_CONCURRENCY=${MIXRL_REWARD_CONCURRENCY:-8} # Match the default Glimmer/scorer request capacity.
-MIXRL_EVAL_SAMPLES=${MIXRL_EVAL_SAMPLES:-4}
-MIXRL_EVAL_QUOTAS=${MIXRL_EVAL_QUOTAS:-'{}'} # {}: all 128 rl_val prompts; per-route positive overrides for a faster pilot.
-MIXRL_MAIN_EVAL_INTERVAL=${MIXRL_MAIN_EVAL_INTERVAL:-50} # Multiple of EVAL_INTERVAL; baseline/final also use main tier.
-MIXRL_MAIN_EVAL_SAMPLES=${MIXRL_MAIN_EVAL_SAMPLES:-4} # Binary pass@k follows this count; change explicitly for a larger budget.
-MIXRL_MAIN_EVAL_QUOTAS=${MIXRL_MAIN_EVAL_QUOTAS:-'{}'} # Same disjoint rl_val pool (currently 128), never borrow main_test.
 MIXRL_OBJECTIVE=${MIXRL_OBJECTIVE:-mimo} # mimo: fixed detached-IS/group-token objective; dapo: control.
 export MIXRL_ROUTER_METRICS=${MIXRL_ROUTER_METRICS:-1} # Per-rank/layer/microbatch full-input expert counts.
 MIXRL_IS_POSITIVE_BOUNDS=${MIXRL_IS_POSITIVE_BOUNDS:-'[0.2,5.0]'}
@@ -249,27 +247,28 @@ CONTEXT_VALUES=$(PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m s
 read -r RESOLVED_CONTEXT_PHASE MODEL_MAX_CONTEXT TRAIN_SEQUENCE_LENGTH <<< "$CONTEXT_VALUES"
 if [[ "$RECIPE" == mixrl ]]; then
     export CHIMERA_MIXRL_CONFIG="$MANIFEST_DIR/mixrl_config.json"
-    export MIXRL_DATA_DIR MIXRL_SCORER_URL MIXRL_QUOTAS MIXRL_CAPS MIXRL_TRUNCATION
+    export MIXRL_DATA_DIR MIXRL_SCORER_URL MIXRL_TASKS_CONFIG MIXRL_TRUNCATION
     export MIXRL_CODE_AUDIT_DIR
     export MIXRL_SEED MIXRL_INFLIGHT_GROUPS MIXRL_RESPONSE_CONCURRENCY MIXRL_MAX_ATTEMPTS
     export MIXRL_CONTEXT_HEADROOM
-    export MIXRL_COLLECTION_TIMEOUT MIXRL_REWARD_TIMEOUT MIXRL_REWARD_ATTEMPTS MIXRL_EVAL_SAMPLES
+    export MIXRL_COLLECTION_TIMEOUT MIXRL_REWARD_TIMEOUT MIXRL_REWARD_ATTEMPTS
     export MIXRL_REWARD_CONCURRENCY
-    export MODEL_CONTEXT_LENGTH POLICY_GPUS EXPERT_MODEL_PARALLEL_SIZE N_SAMPLES_PER_PROMPT ROLLOUT_BATCH_SIZE RUN_DIR
+    export MODEL_CONTEXT_LENGTH POLICY_GPUS EXPERT_MODEL_PARALLEL_SIZE N_SAMPLES_PER_PROMPT RUN_DIR
     export MODEL_PROFILE CHAT_TEMPLATE_KWARGS HF_CHECKPOINT MCORE_CHECKPOINT LR MAX_TOKENS_PER_GPU
     export WEIGHT_DECAY CLIP_GRAD ADAM_BETA1 ADAM_BETA2
     export EXECUTION_MODE COLOCATE ROLLOUT_GPUS USE_ROLLOUT_LOGPROBS
     export NUM_ROLLOUT RESUME MIXRL_EXTEND_CONSTANT_HORIZON
     export INITIAL_ACTOR_CHECKPOINT
     export MIXRL_OBJECTIVE MIXRL_IS_POSITIVE_BOUNDS MIXRL_IS_NEGATIVE_BOUNDS
-    export MIXRL_EVAL_QUOTAS
-    export EVAL_INTERVAL MIXRL_MAIN_EVAL_INTERVAL MIXRL_MAIN_EVAL_SAMPLES MIXRL_MAIN_EVAL_QUOTAS
+    export EVAL_INTERVAL
     export MIXRL_EVAL_UPDATES
     export CHIMERA_ROUTING_REPLAY
     export CONTEXT_PHASE TRAIN_SEQUENCE_LENGTH
     export CHIMERA_CONTEXT_OVERRIDE
     PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m slime_plugins.chimera_mixrl.configure
     if [[ "$PREFLIGHT_ONLY" == 1 ]]; then exit 0; fi
+    read -r ROLLOUT_BATCH_SIZE MIXRL_EVAL_SAMPLES < <(python3 -c 'import json, os
+c = json.load(open(os.environ["CHIMERA_MIXRL_CONFIG"])); print(c["rollout_batch_size"], c["eval_samples"])')
 fi
 
 if [[ "$RESUME" != 0 && "$RESUME" != 1 ]]; then
@@ -593,6 +592,7 @@ TRAIN_COMMAND=(
 )
 
 cp "$0" "$MANIFEST_DIR/train.sh"
+if [[ "$RECIPE" == mixrl ]]; then cp "$MIXRL_TASKS_CONFIG" "$MANIFEST_DIR/mixrl_tasks.json"; fi
 if [[ "$RECIPE" == mixrl || "$RECIPE" == sft ]]; then
     tar --exclude=__pycache__ -cf "$MANIFEST_DIR/mixrl_source.tar" -C "$REPO_ROOT" \
         slime_plugins/chimera_mixrl "scripts/models/$MODEL_PROFILE.sh" train.py train_async.py \

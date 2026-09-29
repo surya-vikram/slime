@@ -7,7 +7,16 @@ set -Eeuo pipefail
 BASE_DIR="/nvme_zone3/home/ekamai1/chimera/mixrl"
 
 echo "=== Running Zero-FLOP Dry-Run Preflight in Slime Container ==="
-echo "Verifying model shards, YaRN 32K context, 512x8 quotas, patches, and scorer connection..."
+echo "Verifying model shards, YaRN 32K context, task file, patches, and scorer connection..."
+
+# Host overrides forwarded into the container only when set, e.g.
+#   POLICY_GPUS=2 EXPERT_MODEL_PARALLEL_SIZE=2 RUN_NAME=gsm8k-01 bash 04_run_training.sh
+OVERRIDES=(RUN_NAME RESUME POLICY_GPUS ROLLOUT_GPUS EXPERT_MODEL_PARALLEL_SIZE N_SAMPLES_PER_PROMPT
+    NUM_ROLLOUT LR EVAL_INTERVAL SAVE_INTERVAL MIXRL_TASKS_CONFIG MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE
+    MIXRL_INFLIGHT_GROUPS MIXRL_RESPONSE_CONCURRENCY MIXRL_REWARD_CONCURRENCY MIXRL_COLLECTION_TIMEOUT
+    SGLANG_CUDA_GRAPH_MAX_BS SGLANG_MEM_FRACTION_STATIC)
+OVERRIDE_ARGS=()
+for name in "${OVERRIDES[@]}"; do OVERRIDE_ARGS+=(-e "$name"); done
 
 mkdir -p "$BASE_DIR/runs"
 
@@ -31,5 +40,6 @@ docker run --rm \
   -e CHIMERA_TRANSFORMERS_ROOT=/workspace/transformers \
   -e MIXRL_SCORER_URL=http://127.0.0.1:18020 \
   -e RUNS_ROOT=/data/runs \
+  "${OVERRIDE_ARGS[@]}" \
   suryavikram6/slime:pinned \
   bash run_mixrl.sh

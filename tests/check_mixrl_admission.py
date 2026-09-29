@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from slime_plugins.chimera_mixrl import runtime
+from slime_plugins.chimera_mixrl import runtime, tasks
 
 
 def main():
@@ -14,14 +14,13 @@ def main():
     parser.add_argument('--hf-checkpoint', required=True)
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--config', help='Resolved launcher manifest; audits exactly that route/cap configuration')
+    parser.add_argument('--tasks-file', default=str(tasks.DEFAULT_PATH), help='Used when --config is not given')
     parser.add_argument('--context', type=int, help='Diagnostic comparison budget; does not change launcher config')
     parser.add_argument('--response-multiplier', type=int, default=1)
     parser.add_argument('--headroom', type=int, default=0)
     args = parser.parse_args()
-    c = dict(data_dir=args.data_dir, run_dir=args.output_dir,
-             quotas={'mcqa': 2, 'gsm8k_train': 1, 'openqa': 1},
-             caps={'mcqa': 2048, 'gsm8k_train': 4096, 'openqa': 2048},
-             context=8192, seed=42, chat_template_kwargs={'enable_thinking': False})
+    c = dict(tasks.resolved(tasks.load(args.tasks_file)), data_dir=args.data_dir, run_dir=args.output_dir,
+             context=16384, seed=42, chat_template_kwargs={'enable_thinking': False})
     if args.config:
         c = json.loads(Path(args.config).read_text())
         c.update(data_dir=args.data_dir, run_dir=args.output_dir)

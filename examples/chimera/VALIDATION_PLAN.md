@@ -76,14 +76,14 @@ export MIXRL_CODE_AUDIT_DIR="$MIXRL_DATA_DIR/audits/apps"
 export MIXRL_SCORER_URL=http://127.0.0.1:18020
 export CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}'
 export CONTEXT_PHASE=auto TRAIN_SEQUENCE_LENGTH=8192 MAX_TOKENS_PER_GPU=8192
-export MIXRL_OBJECTIVE=mimo N_SAMPLES_PER_PROMPT=4 MIXRL_EVAL_SAMPLES=4
-export ROLLOUT_BATCH_SIZE=32 NUM_ROLLOUT=2 EVAL_INTERVAL=1 SAVE_INTERVAL=1
+export MIXRL_OBJECTIVE=mimo N_SAMPLES_PER_PROMPT=4
+export NUM_ROLLOUT=2 EVAL_INTERVAL=1 SAVE_INTERVAL=1
 export MIXRL_MAX_ATTEMPTS=24 MIXRL_COLLECTION_TIMEOUT=600
 export MIXRL_RESPONSE_CONCURRENCY=8 MIXRL_REWARD_CONCURRENCY=8
 export RUN_NAME=qwen-fullmix-dp2-gate-001
-unset MIXRL_QUOTAS MIXRL_CAPS
-# One fixed rl_val prompt per route for this gate; all nine domains represented.
-export MIXRL_EVAL_QUOTAS='{"gsm8k_train":1,"nemotron_math":1,"mcqa":1,"openqa":1,"science":1,"hotpot_train":1,"cascade_chat":1,"cascade_lists":1,"cascade_plans":1,"nvidia_multichallenge":1,"nvidia_multichallenge_advanced":1,"nemotron_if":1,"structured_train":1,"reasoning_gym":1,"calendar":1,"apps":1}'
+# A copy of examples/chimera/mixrl_tasks.json for this gate: all 16 tasks enabled,
+# prompts_per_step summing to 32, eval sized in its domains/eval sections (all nine domains).
+export MIXRL_TASKS_CONFIG=$DATA_ROOT/fullmix_gate_tasks.json
 PREFLIGHT_ONLY=1 bash examples/chimera/train.sh
 DRY_RUN=1 bash examples/chimera/train.sh
 bash examples/chimera/train.sh
@@ -117,8 +117,8 @@ policy-cache reuse. Fresh SFT imports are weights-only; exact RL resume is not.
 ## Gate 3: useful learning evidence, only if time permits
 
 Measure update and eval time first. Choose a fresh run's horizon once, fitting
-the remaining budget with a 15-minute reserve. Use all 128 fixed rl_val prompts
-(`MIXRL_EVAL_QUOTAS='{}'`) for comparable baseline/final evaluation when affordable.
+the remaining budget with a 15-minute reserve. Keep the task file's domain eval sizes fixed
+across compared runs so baseline/final evaluation uses the same prompts.
 Keep four samples, per-domain means, binary pass@4 and equal-domain aggregate.
 Compare the same prompts/scoring protocol and report cap rates beside scores.
 Neither sixteen smoke prompts nor one improving draw establishes learning.

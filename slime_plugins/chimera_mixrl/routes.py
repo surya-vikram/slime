@@ -1,25 +1,15 @@
-"""Frozen-data route contracts and domain-balanced evaluation summaries."""
+"""Training-row contracts and domain-balanced evaluation summaries."""
 
 import statistics
 
-# Route -> (domain, existing evaluator verifier). No new reward implementation.
-ROUTES = {
-    'gsm8k_train': ('math', 'math'), 'nemotron_math': ('math', 'equivalence'),
-    'mcqa': ('knowledge', 'choice'), 'openqa': ('knowledge', 'equivalence'),
-    'science': ('knowledge', 'equivalence'), 'hotpot_train': ('grounding', 'grounded'),
-    'cascade_chat': ('quality', 'quality'), 'cascade_lists': ('quality', 'quality'),
-    'cascade_plans': ('quality', 'quality'),
-    'nvidia_multichallenge': ('multiturn', 'rubric'),
-    'nvidia_multichallenge_advanced': ('multiturn', 'rubric'),
-    'nemotron_if': ('instruction', 'instruction'), 'structured_train': ('structure', 'structure'),
-    'reasoning_gym': ('logic', 'exact'), 'calendar': ('logic', 'calendar'),
-    'apps': ('python', 'apps'),
-}
+# The policy is a non-thinking instruct model; reasoning tags are an SFT artifact to watch, not a mode.
+THINK_TAG = '<think>'
 
 
-def validate_route(row):
-    expected = ROUTES.get(row['task'])
-    if expected != (row['domain'], row['verifier']):
+def validate_route(row, routes):
+    """routes: {task: about subset} for enabled tasks, from the task file."""
+    route = routes.get(row['task'])
+    if route is None or (row['domain'], row['verifier']) != (route['domain'], route['verifier']):
         raise ValueError(f"Unknown/mismatched training route: {row['task']}")
     if row.get('turns'):
         raise ValueError('Interactive trajectories are eval-only; training uses frozen conversation history')
@@ -29,9 +19,8 @@ def validate_route(row):
     if any(m['role'] not in ('system', 'user', 'assistant') or not isinstance(m['content'], str)
            for m in messages):
         raise ValueError('Invalid training conversation')
-    expected_binary = row['verifier'] != 'quality'
-    if row.get('binary') is not expected_binary:
-        raise ValueError('Route binary/quality metadata mismatch')
+    if row.get('binary') is not (route['reward'] == 'binary'):
+        raise ValueError('Route binary/graded metadata mismatch')
 
 
 def evaluation_summary(groups):
@@ -48,7 +37,9 @@ def evaluation_summary(groups):
         if any(g.get('status') != 'valid' for g in grades):
             raise ValueError('Evaluation cannot aggregate failed grading')
         item = {'mean_score': statistics.mean(g['score'] for g in grades),
-                'cap_rate': statistics.mean(s.status.name == 'TRUNCATED' for s in samples)}
+                'cap_rate': statistics.mean(s.status.name == 'TRUNCATED' for s in samples),
+                'incomplete_rate': statistics.mean(g.get('components', {}).get('incomplete') is True for g in grades),
+                'think_rate': statistics.mean(THINK_TAG in s.metadata.get('grading_text', '') for s in samples)}
         if row['binary']:
             if any(type(g.get('passed')) is not bool for g in grades):
                 raise ValueError('Binary route lacks an explicit pass verdict')

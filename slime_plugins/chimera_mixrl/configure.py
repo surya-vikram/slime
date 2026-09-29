@@ -10,7 +10,8 @@ from slime_plugins.models.chimera_geometry import validate_geometry, validate_mc
 
 from .core import digest, load_split, write_json
 from .runtime import request
-from .routes import ROUTES, validate_route
+from .routes import validate_route
+from . import tasks as task_file
 from .code_admission import code_exclusions
 
 
@@ -34,29 +35,24 @@ def checkpoint_identity(root):
 
 def resolve():
     env = os.environ
-    quotas = json.loads(env['MIXRL_QUOTAS'])
-    caps = json.loads(env['MIXRL_CAPS'])
-    if not quotas or set(quotas) - ROUTES.keys():
-        raise ValueError('Unknown training route; long-context/main-test routes are evaluation-only')
-    if any(type(v) is not int or v < 1 for v in quotas.values()):
-        raise ValueError('Invalid sampled quotas')
-    if set(caps) != set(quotas) or any(type(v) is not int or v < 1 for v in caps.values()):
-        raise ValueError('Exactly one positive response cap is required per enabled route')
-    c = {'quotas': quotas, 'caps': caps, 'data_dir': env['MIXRL_DATA_DIR'],
-         'run_dir': env['RUN_DIR'], 'scorer_url': env['MIXRL_SCORER_URL'].rstrip('/'),
-         'truncation': env['MIXRL_TRUNCATION'], 'seed': int(env['MIXRL_SEED']),
-         'context': int(env['MODEL_CONTEXT_LENGTH']),
-         'inflight_groups': int(env['MIXRL_INFLIGHT_GROUPS']),
-         'response_concurrency': int(env['MIXRL_RESPONSE_CONCURRENCY']),
-         'max_attempts': int(env['MIXRL_MAX_ATTEMPTS']),
-         'collection_timeout': int(env['MIXRL_COLLECTION_TIMEOUT']),
-         'reward_timeout': int(env['MIXRL_REWARD_TIMEOUT']),
-         'reward_attempts': int(env['MIXRL_REWARD_ATTEMPTS']),
-         'reward_concurrency': int(env.get('MIXRL_REWARD_CONCURRENCY', '8')),
-         'eval_samples': int(env['MIXRL_EVAL_SAMPLES']),
-         'samples_per_prompt': int(env['N_SAMPLES_PER_PROMPT']),
-         'policy_gpus': int(env['POLICY_GPUS']),
-         'expert_model_parallel_size': int(env.get('EXPERT_MODEL_PARALLEL_SIZE', '1'))}
+    tasks_path = Path(env.get('MIXRL_TASKS_CONFIG', str(task_file.DEFAULT_PATH))).resolve()
+    spec = task_file.load(tasks_path)
+    c = {'tasks_file': str(tasks_path), **task_file.resolved(spec)}
+    quotas, caps = c['quotas'], c['caps']
+    c.update({'data_dir': env['MIXRL_DATA_DIR'],
+        'run_dir': env['RUN_DIR'], 'scorer_url': env['MIXRL_SCORER_URL'].rstrip('/'),
+        'truncation': env['MIXRL_TRUNCATION'], 'seed': int(env['MIXRL_SEED']),
+        'context': int(env['MODEL_CONTEXT_LENGTH']),
+        'inflight_groups': int(env['MIXRL_INFLIGHT_GROUPS']),
+        'response_concurrency': int(env['MIXRL_RESPONSE_CONCURRENCY']),
+        'max_attempts': int(env['MIXRL_MAX_ATTEMPTS']),
+        'collection_timeout': int(env['MIXRL_COLLECTION_TIMEOUT']),
+        'reward_timeout': int(env['MIXRL_REWARD_TIMEOUT']),
+        'reward_attempts': int(env['MIXRL_REWARD_ATTEMPTS']),
+        'reward_concurrency': int(env.get('MIXRL_REWARD_CONCURRENCY', '8')),
+        'samples_per_prompt': int(env['N_SAMPLES_PER_PROMPT']),
+        'policy_gpus': int(env['POLICY_GPUS']),
+        'expert_model_parallel_size': int(env.get('EXPERT_MODEL_PARALLEL_SIZE', '1'))})
     c['model_profile'] = env['MODEL_PROFILE']
     c['chimera_model_size'] = env.get('CHIMERA_MODEL_SIZE', 'full')
     if c['chimera_model_size'] not in ('full', 'tiny'):
@@ -67,24 +63,13 @@ def resolve():
     if c['context'] > 16384:
         raise ValueError('DP-only MixRL requires prompt plus response within 16384 tokens; CP is out of scope')
     c['objective'] = env.get('MIXRL_OBJECTIVE', 'dapo')
-    c['eval_quotas'] = json.loads(env.get('MIXRL_EVAL_QUOTAS', '{}'))
     c['eval_interval'] = int(env.get('EVAL_INTERVAL', '10'))
-    c['main_eval_interval'] = int(env.get('MIXRL_MAIN_EVAL_INTERVAL', '50'))
-    c['main_eval_samples'] = int(env.get('MIXRL_MAIN_EVAL_SAMPLES', str(c['eval_samples'])))
-    c['main_eval_quotas'] = json.loads(env.get('MIXRL_MAIN_EVAL_QUOTAS', '{}'))
     c['eval_updates'] = [int(value) for value in env.get('MIXRL_EVAL_UPDATES', '').split(',') if value]
-    if (c['eval_interval'] < 1 or c['main_eval_interval'] < 1 or c['main_eval_samples'] < 1
-            or c['main_eval_interval'] % c['eval_interval']):
-        raise ValueError('Main eval interval must be a positive multiple of EVAL_INTERVAL; samples must be positive')
+    if c['eval_interval'] < 1:
+        raise ValueError('EVAL_INTERVAL must be positive')
     if (c['eval_updates'] != sorted(set(c['eval_updates'])) or
             any(update < 1 or update > int(env.get('NUM_ROLLOUT', '1')) for update in c['eval_updates'])):
         raise ValueError('MIXRL_EVAL_UPDATES must be sorted unique 1-based updates within NUM_ROLLOUT')
-    if (not isinstance(c['main_eval_quotas'], dict) or set(c['main_eval_quotas']) - quotas.keys() or
-        any(type(n) is not int or n < 1 for n in c['main_eval_quotas'].values())):
-        raise ValueError('Main eval quotas must be positive counts for enabled routes')
-    if (not isinstance(c['eval_quotas'], dict) or set(c['eval_quotas']) - quotas.keys() or
-        any(type(n) is not int or n < 1 for n in c['eval_quotas'].values())):
-        raise ValueError('Eval quotas must be positive counts for enabled routes')
     c['routing_replay'] = int(env.get('CHIMERA_ROUTING_REPLAY', '0'))
     c['router_metrics'] = int(env.get('MIXRL_ROUTER_METRICS', '1'))
     if c['router_metrics'] not in (0, 1):
@@ -135,9 +120,7 @@ def resolve():
         raise ValueError('EXPERT_MODEL_PARALLEL_SIZE must positively divide POLICY_GPUS')
     if c['samples_per_prompt'] < 2 or c['truncation'] not in ('mask', 'zero'):
         raise ValueError('Invalid group size or truncation policy')
-    if sum(quotas.values()) != int(env['ROLLOUT_BATCH_SIZE']):
-        raise ValueError('ROLLOUT_BATCH_SIZE must equal the sampled quota sum')
-    if sum(quotas.values()) * c['samples_per_prompt'] % c['policy_gpus']:
+    if c['rollout_batch_size'] * c['samples_per_prompt'] % c['policy_gpus']:
         raise ValueError('v0 requires response batch divisible by policy DP; do not silently round')
     if max(caps.values()) >= c['context']:
         raise ValueError('Output budget leaves no prompt space')
@@ -187,15 +170,16 @@ def resolve():
         raise ValueError('DP-only sequence cap exceeds MAX_TOKENS_PER_GPU; packing does not split long samples')
     rows, manifest = load_split(c['data_dir'], 'rl_train')
     val, _ = load_split(c['data_dir'], 'rl_val')
+    task_file.check_data(spec, rows, val)
     for row in rows + val:
         if row['task'] in quotas:
-            validate_route(row)
+            validate_route(row, c['routes'])
     if {r['family_id'] for r in rows} & {r['family_id'] for r in val}:
         raise ValueError('Train/validation overlap')
-    for route, quota in quotas.items():
-        if len({r['family_id'] for r in rows if r['task'] == route}) < quota:
-            raise ValueError(f'{route}: insufficient training families')
-    c['scorer_protocol'] = request(c['scorer_url'] + '/health', timeout=30)['protocol_id']
+    health = request(c['scorer_url'] + '/health', timeout=30)
+    task_file.check_scorer(spec, health)
+    c['scorer_protocol'] = health['protocol_id']
+    c['judge'] = health['judge']['model']
     admission = request(c['scorer_url'] + '/admission', timeout=30)
     if admission['protocol_id'] != c['scorer_protocol']:
         raise ValueError('Scoring service changed during preflight')
@@ -247,10 +231,9 @@ def resolve():
     if path.exists() and json.loads(path.read_text()) != c:
         raise ValueError('Existing resolved config differs; choose a fresh run name')
     write_json(path, c)
-    printable = {**c, 'excluded_row_ids': f'{len(c["excluded_row_ids"])} quarantined; IDs in saved config'}
-    if 'code_exclusion_reasons' in printable:
-        printable['code_exclusion_reasons'] = f'{len(c["code_exclusion_reasons"])} code exclusions; reasons in saved config'
-    print(json.dumps(printable, indent=2))
+    print(f'MixRL tasks ({tasks_path})\n' + task_file.table(spec, c['samples_per_prompt']))
+    print(f'Reward service judge: {c["judge"]} ({"reachable" if health["judge"]["ready"] else "not reachable"}); '
+          f'{len(c["excluded_row_ids"])} quarantined rows; resolved config: {path}')
 
 
 if __name__ == '__main__':

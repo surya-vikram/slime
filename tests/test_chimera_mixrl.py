@@ -1,5 +1,6 @@
 """No torch/Ray/SGLang required for the v0 contract tests."""
 import asyncio
+import collections
 import copy
 import unittest
 
@@ -95,6 +96,64 @@ class SamplerTests(unittest.TestCase):
         broken['fingerprint'] = 'different'
         with self.assertRaises(ValueError):
             b.restore(broken)
+
+    def test_clashing_row_leads_the_next_batch(self):
+        rows = [{'id': str(i), 'family_id': str(i), 'task': 'a'} for i in range(7)]
+        sampler = RouteSampler(rows, ['a'])
+        order = [rows[i]['id'] for i in sampler._order('a', 0)]
+        # Every family but the pass's last row is already in this batch, so the six drawn first wait.
+        row, _ = sampler.take('a', set(order[:-1]))
+        self.assertEqual(row['id'], order[-1])
+        self.assertEqual(sampler.state['a']['deferred'], order[:-1])
+        seen = set()
+        following = [sampler.take('a', seen)[0]['id'] for _ in range(6)]
+        self.assertEqual(following, order[:-1])
+        self.assertEqual(sampler.position('a'), {'pass': 1, 'pass_progress': 1.0, 'deferred': 0})
+
+    def test_batches_across_pass_boundaries_lose_no_rows(self):
+        deferred_happened = False
+        for seed in range(30):
+            rows = [{'id': str(i), 'family_id': str(i), 'task': 'a'} for i in range(7)]
+            sampler = RouteSampler(rows, ['a'], seed)
+            served = collections.Counter()
+            for _ in range(60):
+                seen = set()
+                batch = [sampler.take('a', seen)[0]['id'] for _ in range(3)]
+                self.assertEqual(len(set(batch)), 3)
+                served.update(batch)
+                state = sampler.state['a']
+                waiting = state.get('deferred', [])
+                deferred_happened |= bool(waiting)
+                # Every row drawn from a pass is either served or still waiting; none is dropped.
+                self.assertEqual(sum(served.values()) + len(waiting), state['epoch'] * 7 + state['offset'])
+            self.assertLessEqual(max(served.values()) - min(served.values()), 2)
+        self.assertTrue(deferred_happened)
+
+    def test_waiting_rows_survive_resume(self):
+        rows = [{'id': str(i), 'family_id': str(i), 'task': 'a'} for i in range(7)]
+        for seed in range(30):
+            a = RouteSampler(rows, ['a'], seed)
+            for _ in range(20):
+                seen = set()
+                for _ in range(3):
+                    a.take('a', seen)
+                if a.state['a']['deferred']:
+                    break
+            if not a.state['a']['deferred']:
+                continue
+            b = RouteSampler(rows, ['a'], seed)
+            b.restore(a.snapshot())
+            for _ in range(10):
+                seen_a, seen_b = set(), set()
+                self.assertEqual([a.take('a', seen_a)[0]['id'] for _ in range(3)],
+                                 [b.take('a', seen_b)[0]['id'] for _ in range(3)])
+            for corrupt in (['missing'], ['0', '0']):
+                broken = a.snapshot()
+                broken['state']['a']['deferred'] = corrupt
+                with self.assertRaises(ValueError):
+                    b.restore(broken)
+            return
+        self.fail('No seed produced a waiting row')
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):

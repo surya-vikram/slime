@@ -37,7 +37,7 @@ export MIXRL_DATA_DIR=${MIXRL_DATA_DIR:-$DATA_ROOT/datasets/chimera-eval-data}
 export MIXRL_CODE_AUDIT_DIR=${MIXRL_CODE_AUDIT_DIR:-$MIXRL_DATA_DIR/audits/apps}
 export CHIMERA_TRANSFORMERS_ROOT=${CHIMERA_TRANSFORMERS_ROOT:-$([[ -d /workspace/transformers ]] && echo /workspace/transformers || echo "$DATA_ROOT/repos/transformers")}
 export RUNS_ROOT=${RUNS_ROOT:-$DATA_ROOT/runs}
-export RUN_NAME=${RUN_NAME:-chimera-mixrl-4gpus-512x8-$(date +%Y%m%d-%H%M%S)}
+export RUN_NAME=${RUN_NAME:-chimera-mixrl-${POLICY_GPUS}gpus-$(date +%Y%m%d-%H%M%S)}
 
 # ------------------------------------------------------------------------------
 # 3. Reward Microservice (Scorer) Endpoint
@@ -46,19 +46,12 @@ export RUN_NAME=${RUN_NAME:-chimera-mixrl-4gpus-512x8-$(date +%Y%m%d-%H%M%S)}
 export MIXRL_SCORER_URL=${MIXRL_SCORER_URL:-http://127.0.0.1:18020}
 
 # ------------------------------------------------------------------------------
-# 4. Batch Geometry & Quotas (512 Prompts x 8 Responses = 4,096 Samples/Step)
+# 4. Tasks & Batch Geometry
 # ------------------------------------------------------------------------------
-export ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-512}           # Prompts per boundary
+# Tasks, prompts per step, response caps and eval prompts live in the task file.
+# Rollout batch = sum of enabled prompts_per_step (default file: 16 tasks, 512 prompts).
+export MIXRL_TASKS_CONFIG=${MIXRL_TASKS_CONFIG:-$SCRIPT_DIR/examples/chimera/mixrl_tasks.json}
 export N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}         # Responses per prompt group
-export OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-$ROLLOUT_BATCH_SIZE}
-
-# 16-Domain training quotas scaled proportionally to sum to exactly 512:
-DEFAULT_512_QUOTAS='{"gsm8k_train":48,"nemotron_math":48,"mcqa":32,"openqa":32,"science":16,"hotpot_train":96,"cascade_chat":64,"cascade_lists":16,"cascade_plans":16,"nvidia_multichallenge":32,"nvidia_multichallenge_advanced":16,"nemotron_if":32,"structured_train":16,"reasoning_gym":16,"calendar":16,"apps":16}'
-export MIXRL_QUOTAS=${MIXRL_QUOTAS:-$DEFAULT_512_QUOTAS}
-
-# 16K sequence budget allowances per route:
-DEFAULT_16K_CAPS='{"gsm8k_train":8192,"nemotron_math":8192,"mcqa":4096,"openqa":4096,"science":8192,"hotpot_train":4096,"cascade_chat":8192,"cascade_lists":8192,"cascade_plans":8192,"nvidia_multichallenge":4096,"nvidia_multichallenge_advanced":4096,"nemotron_if":4096,"structured_train":8192,"reasoning_gym":8192,"calendar":8192,"apps":8192}'
-export MIXRL_CAPS=${MIXRL_CAPS:-$DEFAULT_16K_CAPS}
 
 # High-Throughput Concurrency (Prevents reward scoring bottleneck on 4,096 samples):
 export MIXRL_REWARD_CONCURRENCY=${MIXRL_REWARD_CONCURRENCY:-128}    # Concurrent requests to reward service
@@ -85,9 +78,7 @@ export CHIMERA_ROUTING_REPLAY=${CHIMERA_ROUTING_REPLAY:-1}     # Route-replay (R
 # ------------------------------------------------------------------------------
 # 6. Evaluation, Checkpointing & Diagnostics Cadence
 # ------------------------------------------------------------------------------
-export EVAL_INTERVAL=${EVAL_INTERVAL:-10}                      # Quick eval (rl_val pass@4) every N boundaries
-export MIXRL_MAIN_EVAL_INTERVAL=${MIXRL_MAIN_EVAL_INTERVAL:-50} # Main eval every N boundaries
-export MIXRL_EVAL_SAMPLES=${MIXRL_EVAL_SAMPLES:-4}
+export EVAL_INTERVAL=${EVAL_INTERVAL:-10}                      # Eval every N boundaries, plus baseline/final; size is in the task file
 export SAVE_INTERVAL=${SAVE_INTERVAL:-50}                      # Checkpoint save interval
 export NO_SAVE_OPTIM=${NO_SAVE_OPTIM:-0}                       # 1: Save model weights only
 
@@ -111,12 +102,15 @@ export NVSHMEM_DISABLE_NCCL=1
 # PRE-FLIGHT VALIDATION & PREREQUISITE CHECKS
 # ==============================================================================
 echo "=== Chimera 10B Adam MixRL Preflight Check ==="
-echo "Node GPUs: $POLICY_GPUS | Batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT responses | Sequence Cap: $TRAIN_SEQUENCE_LENGTH"
+echo "Node GPUs: $POLICY_GPUS | Sequence Cap: $TRAIN_SEQUENCE_LENGTH"
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -m slime_plugins.chimera_mixrl.tasks \
+    "$MIXRL_TASKS_CONFIG" --samples-per-prompt "$N_SAMPLES_PER_PROMPT"
 
 # 1. Verify required files exist at specified paths
 REQUIRED_FILES=(
     "$HF_CHECKPOINT/config.json"
     "$MCORE_CHECKPOINT/latest_checkpointed_iteration.txt"
+    "$MIXRL_TASKS_CONFIG"
     "$MIXRL_DATA_DIR/manifest.json"
     "$MIXRL_DATA_DIR/splits/rl_train.jsonl"
     "$MIXRL_DATA_DIR/splits/rl_val.jsonl"

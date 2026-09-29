@@ -6,6 +6,7 @@ This intentionally does not claim a live Megatron/SGLang integration test.
 import asyncio
 import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -53,42 +54,90 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seeds[:2], seeds[2:])
         self.assertNotEqual(identities[:2], identities[2:])
 
-    async def test_main_and_quick_evaluation_budgets(self):
-        self.c['main_eval_interval'] = 5
-        self.c['main_eval_samples'] = 3
-        self.args.num_rollout = 100
-        for rollout_id, tier, samples in ((0, 'main', 3), (1, 'quick', 2), (4, 'main', 3),
-                                          (99, 'main', 3), (6, 'main', 3)):
-            self.args.mixrl_eval_final = rollout_id == 6
+    async def test_every_eval_uses_the_same_panel_and_samples(self):
+        self.c['eval_samples'] = 3
+        for rollout_id in (0, 1, 4, 99):
             await runtime._rollout(self.args, rollout_id, self.source, evaluation=True)
             reports = list((self.source.run_dir / 'rollouts').glob(f'eval-{rollout_id}-eval-*/evaluation.json'))
             self.assertEqual(len(reports), 1)
             summary = json.loads(reports[0].read_text())
-            self.assertEqual(summary['tier'], tier)
-            self.assertEqual(summary['samples_per_prompt'], samples)
+            self.assertNotIn('tier', summary)
+            self.assertEqual((summary['samples_per_prompt'], summary['tasks']['mcqa']['prompts']), (3, 1))
+
+    async def test_unreachable_judge_stops_before_generation(self):
+        self.c['routes']['mcqa']['judge'] = 'always'
+        self.health['judge']['ready'] = False
+        for evaluation in (False, True):
+            with self.subTest(evaluation=evaluation), \
+                    self.assertRaisesRegex(RuntimeError, "mcqa: needs the judge \\(always\\), but judge 'fixture-judge'"):
+                await runtime._rollout(self.args, 0, self.source, evaluation=evaluation)
+        self.assertEqual(self.generated, 0)
+        self.health['judge']['ready'] = True
+        self.health['task_errors'] = {'mcqa': 'No module named regex'}
+        with self.assertRaisesRegex(RuntimeError, 'mcqa: grading check failed: No module named regex'):
+            await runtime._rollout(self.args, 0, self.source)
+        self.assertEqual(self.generated, 0)
 
     async def test_full_nine_domain_collection_and_evaluation(self):
-        from slime_plugins.chimera_mixrl.routes import ROUTES
-        self.c['quotas'] = {t: 1 for t in ROUTES}
-        self.c['caps'] = {t: 8 for t in ROUTES}
-        self.args.rollout_batch_size = len(ROUTES)
+        from slime_plugins.chimera_mixrl import tasks
+        routes = tasks.resolved(tasks.load())['routes']
+        self.c.update(quotas={t: 1 for t in routes}, caps={t: 8 for t in routes}, routes=routes,
+                      eval_quotas={t: 1 for t in routes})
+        self.args.rollout_batch_size = len(routes)
         manifest = {'splits': {}}
         for split in ('rl_train', 'rl_val'):
             rows = []
-            for t, (domain, verifier) in ROUTES.items():
+            for t, route in routes.items():
                 rows.append(dict(id=f'{split}-{t}', family_id=f'{split}-{t}', task=t,
-                                 domain=domain, verifier=verifier, binary=verifier != 'quality',
+                                 domain=route['domain'], verifier=route['verifier'],
+                                 binary=route['reward'] == 'binary',
                                  messages=[{'role': 'user', 'content': 'Question'}]))
             (self.data / 'splits' / f'{split}.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
             manifest['splits'][split] = {'hash': digest(rows)}
         write_json(self.data / 'manifest.json', manifest)
         source = runtime.DataSource(self.args)
         output = await runtime._rollout(self.args, 0, source)
-        self.assertEqual({g[0].metadata['mixrl']['task'] for g in output.samples}, set(ROUTES))
+        self.assertEqual({g[0].metadata['mixrl']['task'] for g in output.samples}, set(routes))
         raw, normalized = runtime.post_process_rewards(self.args, [s for g in output.samples for s in g])
         self.assertEqual(len(raw), 48)
         evaluation = await runtime._rollout(self.args, 0, source, evaluation=True)
         self.assertEqual(evaluation.data['equal_domain_mean']['rewards'], [.5])
+
+    async def test_pool_exhaustion_starts_a_logged_new_pass(self):
+        # Eight fixture rows at two prompts per step: rollouts 0-3 are pass 1, rollout 4 starts pass 2.
+        drawn, passes = [], []
+        for rollout_id in range(5):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                output = await runtime._rollout(self.args, rollout_id, self.source)
+            drawn.append([g[0].metadata['mixrl']['row_id'] for g in output.samples])
+            passes.append(output.metrics['mixrl/mcqa/pass'])
+            logged = [json.loads(line.split(' ', 1)[1]) for line in stream.getvalue().splitlines()
+                      if line.startswith('MIXRL_PASS ')]
+            expected = [{'rollout_id': 4, 'task': 'mcqa', 'pass': 2, 'pool': 8}] if rollout_id == 4 else []
+            self.assertEqual(logged, expected)
+        self.assertEqual(passes, [1, 1, 1, 1, 2])
+        self.assertEqual(len({row for batch in drawn[:4] for row in batch}), 8)
+        self.assertEqual(output.metrics['mixrl/mcqa/pass_progress'], 2 / 8)
+        self.assertEqual(output.metrics['mixrl/mcqa/deferred'], 0)
+        # Samples 1-2 of each group of 3 carry reasoning tags; sample 2 is truncated.
+        self.assertAlmostEqual(output.metrics['mixrl/mcqa/think_rate'], 2 / 3)
+
+    async def test_unfinished_reasoning_is_masked_like_truncation(self):
+        original = runtime.request
+        def request(url, payload=None, timeout=1):
+            result = original(url, payload, timeout)
+            if payload and payload['response']['text'] == 'B':
+                result['grade'] = {'status': 'valid', 'score': 0., 'passed': False,
+                                   'components': {'failure': 'unfinished_reasoning', 'incomplete': True}}
+            return result
+        with patch.object(runtime, 'request', side_effect=request):
+            output = await runtime._rollout(self.args, 0, self.source)
+        for group in output.samples:
+            # Sample 0 is unfinished and sample 2 truncated: both masked; group of one left is constant.
+            self.assertEqual([runtime.unfinished(s) for s in group], [True, False, True])
+            self.assertTrue(all(s.loss_mask == [0, 0] for s in group))
+        self.assertEqual(output.metrics['mixrl/mcqa/cap_rate'], 2 / 3)
 
     async def test_fresh_weight_import_does_not_restore_sampler(self):
         source = runtime.DataSource(self.args)
@@ -134,6 +183,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                    for name, rs in (('rl_train', rows), ('rl_val', val))}})
         self.c = {'data_dir': str(self.data), 'run_dir': str(self.root / 'run'),
                   'quotas': {'mcqa': 2}, 'caps': {'mcqa': 8}, 'context': 32, 'seed': 42,
+                  'eval_quotas': {'mcqa': 1},
+                  'routes': {'mcqa': {'domain': 'knowledge', 'verifier': 'choice', 'judge': 'none',
+                                      'reward': 'binary'}},
                   'scorer_protocol': 'fixture', 'scorer_url': 'http://fixture', 'truncation': 'mask',
                   'inflight_groups': 2, 'response_concurrency': 4, 'max_attempts': 8,
                   'collection_timeout': 5, 'reward_timeout': 1, 'reward_attempts': 1, 'eval_samples': 2}
@@ -152,7 +204,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.generated += 1
             self.started.append(sample.index)
             await asyncio.sleep(.001 if sample.metadata['mixrl']['sample'] == 0 else .02)
-            sample.response = 'B' if sample.metadata['mixrl']['sample'] == 0 else 'A'
+            sample.response = 'B' if sample.metadata['mixrl']['sample'] == 0 else '<think>\nmaybe</think>\nA'
             sample.response_length = 2
             sample.tokens += [9, 10]
             sample.rollout_log_probs = [-.5, -.7]
@@ -167,9 +219,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         generation.GenerateState = lambda args: state
         generation.generate = generate
         generation.abort = abort
+        self.health = {'protocol_id': 'fixture', 'judge': {'model': 'fixture-judge', 'ready': True},
+                       'task_errors': {}}
         def request(url, payload=None, timeout=1):
             if payload is None:
-                return {'protocol_id': 'fixture'}
+                return self.health
             self.judged += 1
             if self.fail_judge:
                 raise RuntimeError('fixture judge outage')

@@ -38,13 +38,19 @@ def load_split(root, split):
 
 
 class RouteSampler:
-    """Independent seeded route epochs, resumable without cross-route spillover."""
+    """Independent seeded passes per task, resumable without cross-task spillover.
+
+    Each pass visits every row once in a fresh seeded order. A row whose family is
+    already in the current batch (a batch that straddles two passes) is deferred to
+    the next batch instead of being dropped for the whole pass.
+    """
     def __init__(self, rows, routes, seed=42):
         self.pools = {r: sorted([x for x in rows if x['task'] == r], key=lambda x: x['id']) for r in routes}
         if any(not p for p in self.pools.values()):
             raise ValueError('An enabled route has no admitted rows')
+        self.rows = {r: {x['id']: x for x in p} for r, p in self.pools.items()}
         self.seed = seed
-        self.state = {r: {'epoch': 0, 'offset': 0} for r in routes}
+        self.state = {r: {'epoch': 0, 'offset': 0, 'deferred': []} for r in routes}
         self.group_index = 0
         self.fingerprint = digest({'pools': {r: [x['id'] for x in p] for r, p in self.pools.items()}, 'seed': seed})
         self.orders = {}
@@ -57,32 +63,52 @@ class RouteSampler:
         if snapshot['fingerprint'] != self.fingerprint or set(snapshot['state']) != set(self.pools):
             raise ValueError('Sampler checkpoint does not match admitted data/seed/routes')
         for route, state in snapshot['state'].items():
-            if not 0 <= state['offset'] <= len(self.pools[route]) or state['epoch'] < 0:
+            deferred = state.get('deferred')
+            if (set(state) != {'epoch', 'offset', 'deferred'} or state['epoch'] < 0
+                    or not 0 <= state['offset'] <= len(self.pools[route]) or not isinstance(deferred, list)
+                    or len(set(deferred)) != len(deferred) or any(i not in self.rows[route] for i in deferred)):
                 raise ValueError('Invalid sampler cursor')
         self.state = json.loads(json.dumps(snapshot['state']))
         self.group_index = snapshot['group_index']
 
+    def position(self, route):
+        """1-based pass number, fraction of the current pass drawn, and rows waiting for the next batch."""
+        state = self.state[route]
+        return {'pass': state['epoch'] + 1, 'pass_progress': state['offset'] / len(self.pools[route]),
+                'deferred': len(state['deferred'])}
+
+    def _order(self, route, epoch):
+        key = (route, epoch)
+        if key not in self.orders:
+            order = list(range(len(self.pools[route])))
+            random.Random(f'{self.seed}:{route}:{epoch}').shuffle(order)
+            self.orders = {k: v for k, v in self.orders.items() if k[0] != route}
+            self.orders[key] = order
+        return self.orders[key]
+
+    def _accept(self, row, seen):
+        seen.add(row['family_id'])
+        index = self.group_index
+        self.group_index += 1
+        return row, index
+
     def take(self, route, seen):
-        pool = self.pools[route]
+        pool, cursor = self.pools[route], self.state[route]
+        for row_id in cursor['deferred']:
+            row = self.rows[route][row_id]
+            if row['family_id'] not in seen:
+                cursor['deferred'].remove(row_id)
+                return self._accept(row, seen)
         for _ in range(len(pool) * 2):
-            cursor = self.state[route]
             if cursor['offset'] == len(pool):
                 cursor['epoch'] += 1
                 cursor['offset'] = 0
-            key = (route, cursor['epoch'])
-            if key not in self.orders:
-                order = list(range(len(pool)))
-                random.Random(f'{self.seed}:{route}:{cursor["epoch"]}').shuffle(order)
-                self.orders = {k: v for k, v in self.orders.items() if k[0] != route}
-                self.orders[key] = order
-            row = pool[self.orders[key][cursor['offset']]]
+            row = pool[self._order(route, cursor['epoch'])[cursor['offset']]]
             cursor['offset'] += 1
-            if row['family_id'] in seen:
-                continue
-            seen.add(row['family_id'])
-            index = self.group_index
-            self.group_index += 1
-            return row, index
+            if row['family_id'] not in seen:
+                return self._accept(row, seen)
+            if row['id'] not in cursor['deferred']:
+                cursor['deferred'].append(row['id'])
         raise RuntimeError(f'{route}: distinct family pool exhausted within this update')
 
 

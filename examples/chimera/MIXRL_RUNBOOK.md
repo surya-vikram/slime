@@ -7,6 +7,89 @@ The current scope is synchronous training only. Small reference-model GPU smoke
 tests have run, but full-mixture learning and final Chimera qualification remain
 pending. Finish local preparation before requesting another GPU allocation.
 
+## Choosing tasks
+
+Everything about tasks lives in one file, `examples/chimera/mixrl_tasks.json`
+(point `MIXRL_TASKS_CONFIG` at a different copy if needed):
+
+- `tasks.<name>`: `enabled`, `prompts_per_step` (drawn from `about.train_pool`),
+  `eval_prompts` (`"all"` by default, or a number up to `about.val_pool`; more is
+  capped with a note), `max_response_tokens`, and an `about` block: one-line
+  summary, how it is graded, the answer format the grader needs, its requirements,
+  domain, verifier, judge use and pool sizes.
+- `domains.<name>`: a one-line summary; the preview totals each domain.
+- `eval`: `samples_per_prompt`. The preview shows what an eval costs relative to a
+  training step (prompts x samples x response cap); it never blocks a launch.
+
+The rollout batch is the sum of enabled `prompts_per_step`. `ROLLOUT_BATCH_SIZE`,
+`MIXRL_QUOTAS`, `MIXRL_CAPS`, `MIXRL_*EVAL_QUOTAS`, `MIXRL_EVAL_SAMPLES` and
+`MIXRL_MAIN_EVAL_*` are refused. Samples per prompt for training, eval cadence
+(`EVAL_INTERVAL`) and the optimizer stay in `train.sh`. Preview without launching:
+
+```bash
+python3 -m slime_plugins.chimera_mixrl.tasks [path] --samples-per-prompt 8
+```
+
+Launch stops, naming the task and the reason, when:
+
+- `about` disagrees with rl_train/rl_val or with the reward service;
+- an enabled task needs the judge and `/health` reports it unreachable (checked
+  again before every rollout, so a judge that dies mid-run stops the next step);
+- the reward service's startup grading check failed for an enabled task
+  (missing package, checker data or code sandbox).
+
+There is one reward-service setup: it always has its judge configured. Tasks that
+never call the judge (gsm8k_train, mcqa, nemotron_if, calendar, apps) train
+while the judge is down; the rest cannot start until it is up.
+
+| judge | tasks |
+|---|---|
+| none | gsm8k_train, mcqa, nemotron_if, calendar, apps |
+| on_miss (exact match first, judge on a miss) | reasoning_gym |
+| to_pass (parser can fail, judge must pass) | structured_train |
+| always | nemotron_math, openqa, science, hotpot_train, cascade_chat/lists/plans, nvidia_multichallenge(_advanced) |
+
+The policy never exceeds 16,384 tokens (prompt + response). The judge sees the
+prompt, the response and references; long multi-turn and structured tasks need
+about 21K judge tokens at full response length, so run the judge and
+`JUDGE_CONTEXT` at 32,768 or more (the judge supports up to 131,072).
+
+The task file expects the v4 data published on Hugging Face
+(`surya-vikram/chimera-eval-data`; download the revision pinned in
+`AIRGAPPED_RUN.md`): rl_val grown from 128 to 512 prompts (56-57 per domain) by
+moving seeded rows out of rl_train, only rows a response can pass; main_test is
+unchanged; the move is recorded under `val_growth` in `manifest.json`. Launch
+checks every task's pool sizes against the downloaded splits. Per-task audit notes
+are in `MIXRL_TASK_AUDIT.md`.
+
+Grading rules that affect what earns reward (reward service, shared with main_test):
+
+- `<think>...</think>`: the policy is a non-thinking model that sometimes writes
+  these tags. Only the answer after the last closed block is graded, so tags never
+  cost reward. Reasoning that never closes, or closes with no answer after it, is
+  unfinished: like a truncated response it follows the truncation policy (masked in
+  training by default) and scores 0 in eval (`incomplete_rate`). `think_rate` is
+  logged per task in training and eval.
+- mcqa: 1.0 for the correct label in the format the prompt asks for, 0.5 in the
+  other explicit format ("Answer: X" vs `\boxed{X}`), 0 otherwise; pass@k counts
+  only the requested format.
+- structured_train: data counts even inside explanation (a fenced block, or an
+  embedded JSON value). The last one given is the answer and must match the schema;
+  an earlier valid block does not rescue it. CSV cells are converted to the
+  schema's types.
+- calendar: the final calendar may come with explanation; the last JSON value given
+  is checked.
+- multichallenge: the judge gets each rubric criterion with the completed
+  conversation (the response as its final turn) once; the rubric's expected verdict
+  is applied by the grader and never shown to the judge.
+- gsm8k keeps "exactly one `\boxed{}`": the model must follow the instruction. Rows no response can pass (CSV with nested fields, TOML with a
+  top-level array schema: 830 rows) are quarantined at startup and never train.
+
+Each task samples its own seeded pass over its pool. When a pool runs out the
+task reshuffles and starts a new pass (`MIXRL_PASS` log line; `mixrl/<task>/pass`,
+`pass_progress` and `deferred` metrics). A row whose family is already in the
+current batch waits for the next batch instead of being skipped for the pass.
+
 ## Current Chimera synchronous entrypoint
 
 Inside the pinned Slime image, mount this repository, the matching Transformers
@@ -33,18 +116,16 @@ without launching Ray. The HF config must already contain the approved YaRN
 historical MCore positional mismatch, not to bypass missing metadata.
 
 Defaults: full Chimera, synchronous MixRL, 8 policy GPUs, all model-parallel sizes1,
-32 prompts x8 responses, 100 rollout boundaries, 16K sequence/1K headroom,
-LR1e-6, WD0, clip1, betas0.9/0.98, MiMo objective and R3 replay enabled.
-The 16 route quotas sum to32. Change quotas with the prompt batch; they must
-remain compatible with DP. Scorer/judge GPU allocation is separate.
+the task file's 512 prompts x8 responses, 100 rollout boundaries, 16K sequence/1K
+headroom, LR1e-6, WD0, clip1, betas0.9/0.98, MiMo objective and R3 replay enabled.
+The prompt total times responses must divide by the policy GPU count. Scorer/judge
+GPU allocation is separate.
 
-Quick evaluation is every10 rollout boundaries; main replaces it every50 and at
-baseline/final (including an early-stop boundary). Both default to128 fixed rl_val
-prompts x4 responses. Change `MIXRL_EVAL_QUOTAS`, `MIXRL_MAIN_EVAL_QUOTAS`,
-`MIXRL_EVAL_SAMPLES`, `MIXRL_MAIN_EVAL_SAMPLES` and their intervals in the script.
-Main cadence must be a multiple of quick cadence. These are rollout-boundary
-counts: an all-constant batch does not increment the optimizer/scheduler.
-Neither monitoring tier borrows from main_test. Each reports per-domain metrics,
+Evaluation runs at baseline, every10 rollout boundaries and at the final (or
+early-stop) boundary, always on the same panel: each trained domain's
+`eval_prompts` from rl_val x `eval.samples_per_prompt` responses, sized by the
+task file. These are rollout-boundary counts: an all-constant batch does not
+increment the optimizer/scheduler. Evaluation never borrows from main_test. It reports per-domain metrics,
 equal-domain aggregate, binary-only pass@k and truncation/error rates separately.
 
 Fresh initialization loads weights without optimizer; `RESUME=1` restores the
@@ -169,7 +250,7 @@ Run locally from `chimera-eval` with its grader dependencies installed:
 
 ```bash
 JUDGE_URL=http://127.0.0.1:8010/v1 JUDGE_NAME=eval-long2b \
-JUDGE_CONTEXT=16384 JUDGE_MAX_TOKENS=1024 JUDGE_MAX_RETRY_TOKENS=2048 \
+JUDGE_CONTEXT=32768 JUDGE_MAX_TOKENS=1024 JUDGE_MAX_RETRY_TOKENS=2048 \
 JUDGE_CONCURRENCY=2 JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' \
 python -m eval_stack.reward_service --data-dir "$DATA_DIR" \
   --cache-dir "$SCORER_CACHE" --port 8020 --workers 4 \
@@ -206,9 +287,8 @@ export MIXRL_DATA_DIR=$DATA_ROOT/datasets/chimera-eval-data
 export MIXRL_SCORER_URL=http://127.0.0.1:18020
 export CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}'
 export CONTEXT_PHASE=auto TRAIN_SEQUENCE_LENGTH=8192 N_SAMPLES_PER_PROMPT=4
-export MIXRL_EVAL_SAMPLES=4
-export ROLLOUT_BATCH_SIZE=4 MIXRL_QUOTAS='{"mcqa":4}'
-export MIXRL_CAPS='{"mcqa":2048}'
+# A copy of mixrl_tasks.json with only mcqa enabled, prompts_per_step 4, max_response_tokens 2048:
+export MIXRL_TASKS_CONFIG=$DATA_ROOT/mcqa_smoke_tasks.json
 export MIXRL_MAX_ATTEMPTS=32 MIXRL_COLLECTION_TIMEOUT=600
 export MIXRL_RESPONSE_CONCURRENCY=8 MIXRL_INFLIGHT_GROUPS=2
 export NUM_ROLLOUT=2 EVAL_INTERVAL=1 SAVE_INTERVAL=1
@@ -225,14 +305,13 @@ Megatron validates the saved scheduler horizon even with constant LR; extending
 it needs a separately explicit scheduler policy, not a silent larger rollout count.
 Fresh runs load weights only; saves retain optimizer/RNG/sampler state.
 
-The single-route command above is diagnostic only. For full MixRL, leave
-`MIXRL_QUOTAS` and `MIXRL_CAPS` unset to use the launcher defaults: 32 sampled
-prompt groups across all 16 routes/nine domains. Set `ROLLOUT_BATCH_SIZE=32`.
-Every quota is configurable, but their sum must equal the batch size. There is
-no replacement sampling: constant-reward groups are fully loss-masked. Sampling
-is seeded without replacement within each route epoch, with cursors saved for
-resume. Exhausted routes reshuffle independently and keep their sampling quotas;
-slots never spill into another domain. Hard/easy weighting is deferred.
+The single-route command above is diagnostic only. For full MixRL, use the
+default task file: 512 sampled prompt groups across all 16 routes/nine domains.
+There is no replacement sampling: constant-reward groups are fully loss-masked.
+Sampling is seeded without replacement within each route pass, with cursors and
+waiting rows saved for resume. Exhausted routes reshuffle independently and keep
+their sampling quotas; slots never spill into another domain. Hard/easy
+weighting is deferred.
 
 Before enabling APPS, run this once in the evaluator environment with Docker
 access (dataset code runs only in the restricted child container):
@@ -298,10 +377,9 @@ Chimera retains its established MCore checkpoint/Transformers registration path.
   is disabled because the pinned TE fused route bypasses Slime's replay hook;
   attention CUDA graphs remain enabled. Captured IDs use compressed non-pickle
   persistence. **Do not claim replay is GPU-qualified from CPU tests.**
-- Periodic eval uses only enabled routes in `rl_val`, four samples/prompt, no
-  filtering. Main-test never enters training or this monitoring path.
-- `MIXRL_EVAL_QUOTAS` optionally selects fewer fixed prompts per enabled route;
-  `{}` uses every admitted rl_val row (128 in the audited reference profile).
+- Periodic eval uses only enabled routes in `rl_val`, no filtering. Main-test
+  never enters training or this monitoring path.
+- `domains.<name>.eval_prompts` sets each trained domain's fixed eval panel.
   Selection is deterministic from the seed. Failed judging retries the same
   persisted evaluation draws, not a new easier sample. `evaluation.json` records
   per-task and per-domain scores, binary-only pass@k, cap rates, and the equal

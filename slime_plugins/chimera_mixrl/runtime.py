@@ -10,7 +10,8 @@ import urllib.error
 import time
 
 from .core import RouteSampler, collect, digest, group_rewards, load_split, write_json
-from .routes import evaluation_summary, validate_route
+from .routes import THINK_TAG, evaluation_summary, validate_route
+from .tasks import blocked
 from .objective import group_length_scales
 from .records import load_sample, save_sample
 
@@ -46,7 +47,7 @@ class DataSource:
                 reason = self.c.get('code_exclusion_reasons', {}).get(row['id'], 'scorer_metadata_quarantine')
                 self.excluded.append({'id': row['id'], 'task': row['task'], 'reason': reason})
                 return False
-            validate_route(row)
+            validate_route(row, self.c['routes'])
             cap = self.c['caps'][row['task']]
             prompt = self.tokenizer.apply_chat_template(
                 row['messages'], tokenize=False, add_generation_prompt=True,
@@ -61,19 +62,13 @@ class DataSource:
             return True
         admitted_rows = [r for r in rows if admitted(r)]
         self.val = [r for r in val if admitted(r)]
-        self.main_val = []
         selected_val = []
         for route in self.c['quotas']:
             pool = [r for r in self.val if r['task'] == route]
-            count = self.c.get('eval_quotas', {}).get(route, len(pool))
-            if count > len(pool):
-                raise ValueError(f'{route}: eval quota exceeds admitted validation rows')
+            # Context admission or quarantine can leave fewer rows than the task file's val_pool.
+            count = min(self.c['eval_quotas'][route], len(pool))
             pool.sort(key=lambda r: digest([self.c['seed'], 'eval', r['id']]))
             selected_val.extend(pool[:count])
-            main_count = self.c.get('main_eval_quotas', {}).get(route, len(pool))
-            if main_count > len(pool):
-                raise ValueError(f'{route}: main eval quota exceeds admitted validation rows')
-            self.main_val.extend(pool[:main_count])
         self.val = selected_val
         if any(not any(r['task'] == t for r in self.val) for t in self.c['quotas']):
             raise ValueError('An enabled route has no context-admitted rl_val rows')
@@ -168,6 +163,14 @@ async def reward(args, sample, **kwargs):
     return float(score)
 
 
+def unfinished(sample):
+    """No finished answer: cut off at the cap, or reasoning tags that never reached an answer.
+    Both follow the truncation policy (masked by default): never rewarded, never punished."""
+    from slime.utils.types import Sample
+    grade = sample.metadata.get('grade') or {}
+    return sample.status == Sample.Status.TRUNCATED or grade.get('components', {}).get('incomplete') is True
+
+
 def post_process_rewards(args, samples):
     from slime.utils.types import Sample
     c = config()
@@ -177,7 +180,7 @@ def post_process_rewards(args, samples):
         raise ValueError('Incomplete accepted batch')
     informative = sum(group_rewards(
         [s.metadata['grade'] for s in samples[start:start+n]],
-        [s.status == Sample.Status.TRUNCATED for s in samples[start:start+n]],
+        [unfinished(s) for s in samples[start:start+n]],
         c['truncation'])[-1] for start in range(0, len(samples), n))
     # Native reduction divides by the fixed global response count. Compensate
     # once, before DP partitioning, to average only informative prompt groups.
@@ -188,7 +191,7 @@ def post_process_rewards(args, samples):
     for start in range(0, len(samples), n):
         group = samples[start:start + n]
         validate_group(group, n)
-        capped = [s.status == Sample.Status.TRUNCATED for s in group]
+        capped = [unfinished(s) for s in group]
         scores, advantages, eligible, usable = group_rewards(
             [s.metadata['grade'] for s in group], capped, c['truncation'],
             args.grpo_std_normalization if c.get('objective', 'dapo') == 'dapo' else False)
@@ -255,6 +258,12 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     health = await asyncio.to_thread(request, c['scorer_url'] + '/health')
     if health['protocol_id'] != c['scorer_protocol']:
         raise RuntimeError('Scorer protocol mismatch before rollout')
+    # Checked before every batch: the judge can go down mid-run, and that must stop
+    # training before generation, never turn judge-graded answers into zeros.
+    reasons = blocked(c['routes'], health)
+    if reasons:
+        raise RuntimeError('Reward service cannot grade enabled tasks: '
+                           + '; '.join(f'{task}: {reason}' for task, reason in reasons.items()))
     slots = asyncio.Semaphore(c['response_concurrency'])
     scoring_slots = asyncio.Semaphore(c.get('reward_concurrency', 8))
 
@@ -338,12 +347,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         if evaluation:
             data = {}
             evaluation_groups = []
-            main_interval = c.get('main_eval_interval', 0)
-            main_tier = bool(main_interval and (counter == 0 or getattr(args, 'mixrl_eval_final', False)
-                             or (rollout_id + 1) % main_interval == 0
-                             or rollout_id == getattr(args, 'num_rollout', -1) - 1))
-            panel = getattr(source, 'main_val', source.val) if main_tier else source.val
-            eval_samples = c.get('main_eval_samples', c['eval_samples']) if main_tier else c['eval_samples']
+            panel, eval_samples = source.val, c['eval_samples']
             # One timeout for the full panel, rolling bounded group dispatch.
             group_slots = asyncio.Semaphore(c['inflight_groups'])
             async def evaluate_group(group):
@@ -360,7 +364,6 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 entry['truncated'].extend(s.status == Sample.Status.TRUNCATED for s in group)
                 entry['samples'].extend(group)
             summary = evaluation_summary(evaluation_groups)
-            summary['tier'] = 'main' if main_tier else 'quick'
             summary['samples_per_prompt'] = eval_samples
             write_json(directory / 'evaluation.json', summary)
             print('MIXRL_EVAL ' + json.dumps({'rollout_id': rollout_id, **summary}), flush=True)
@@ -379,7 +382,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             return source.samples(row, index, version)
         def assess(group):
             validate_group(group, args.n_samples_per_prompt)
-            capped = [s.status == Sample.Status.TRUNCATED for s in group]
+            capped = [unfinished(s) for s in group]
             scores, _, _, usable = group_rewards([s.metadata['grade'] for s in group], capped, c['truncation'])
             return usable, scores, capped
         def event(route, job, group, decision):
@@ -387,7 +390,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 'rollout_id': rollout_id, 'route': route, 'group': group[0].group_index,
                 'decision': decision, 'rewards': [s.reward for s in group],
                 'response_tokens': [s.response_length for s in group],
-                'capped': [s.status == Sample.Status.TRUNCATED for s in group]}), flush=True)
+                'capped': [unfinished(s) for s in group]}), flush=True)
             with (directory / 'collection.jsonl').open('a') as stream:
                 stream.write(json.dumps({'route': route, 'group': group[0].group_index,
                                          'row': group[0].metadata['mixrl']['row_id'], 'decision': decision}) + '\n')
@@ -398,8 +401,17 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         for group in groups:
             usable, _, _ = assess(group)
             for sample in group:
-                if not usable or (c['truncation'] == 'mask' and sample.status == Sample.Status.TRUNCATED):
+                if not usable or (c['truncation'] == 'mask' and unfinished(sample)):
                     sample.loss_mask = [0] * sample.response_length
+        for route in metrics:
+            position = source.sampler.position(route)
+            metrics[route].update(position)
+            texts = [s.metadata['grading_text'] for g in groups for s in g if s.metadata['mixrl']['task'] == route]
+            metrics[route]['think_rate'] = sum(THINK_TAG in t for t in texts) / max(1, len(texts))
+            for number in range(snapshot['state'][route]['epoch'] + 2, position['pass'] + 1):
+                # The pool ran out during this batch; the task reshuffled and began a new pass.
+                print('MIXRL_PASS ' + json.dumps({'rollout_id': rollout_id, 'task': route, 'pass': number,
+                                                  'pool': len(source.sampler.pools[route])}), flush=True)
         write_json(directory / 'metrics.json', metrics)
         from .telemetry import collection_summary
         timing = collection_summary([s for g in groups for s in g],
