@@ -920,6 +920,12 @@ def train(
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
+            if os.environ.get("CHIMERA_MIXRL_CONFIG"):
+                import json
+
+                # MixRL: training metrics also go to the run log, next to MIXRL_COLLECTION/EVAL.
+                print("MIXRL_TRAIN " + json.dumps({"rollout_id": rollout_id, "step_id": step_id,
+                      **{key.removeprefix("train/"): value for key, value in log_dict.items()}}), flush=True)
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
                 threshold = args.ci_train_rollout_logprob_abs_diff_threshold

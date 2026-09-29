@@ -28,7 +28,8 @@ mixrl/run.sh resume gsm8k-01    # continue it from its latest checkpoint
 
 The run name only names the output folder, `$BASE_DIR/runs/chimera/mixrl/<name>/`
 (checkpoints, logs, evals, and a frozen copy of the settings and tasks it ran with).
-`start` refuses an existing name; `resume` continues one with the same settings.
+`start` refuses a name that already has rollouts or checkpoints (a start that failed
+before its first step can reuse its name); `resume` continues one with the same settings.
 
 ## Choosing what to train
 
@@ -57,9 +58,58 @@ Training won't start, and says why, when a task needs a judge that is down, the 
 service can't grade a task, the data doesn't match `tasks.json`, or GPUs and paths
 don't line up.
 
+### Rollout log-probs (`USE_ROLLOUT_LOGPROBS`)
+
+The MiMo loss weights each token by the ratio of two log-probs: the actor's, from the
+training forward pass, and SGLang's, recorded when the token was generated. It never
+uses a separately recomputed "old" log-prob.
+
+- `0` (default): before training, the actor runs one extra forward pass over the whole
+  batch to recompute log-probs. With `MIXRL_OBJECTIVE=mimo` and one optimizer step per
+  batch the loss does not read them (they match the training pass), so the pass only
+  costs time: up to about a quarter of the actor's compute per step.
+- `1`: skip that pass. Loss, advantages and the `train_rollout_logprob_abs_diff`
+  metric are unchanged; routing replay then applies the recorded expert routes in the
+  training forward and backward only.
+- With `MIXRL_OBJECTIVE=dapo` keep `0`: there the PPO ratio's old log-prob is the
+  recomputed one, and `1` would fold SGLang/Megatron numeric differences into the
+  clipped ratio.
+
+Status: `0` until confirmed on the H200s. To confirm, start a new run with
+`USE_ROLLOUT_LOGPROBS=1` and check that the first steps finish (no "R3 routing replay
+was not consumed exactly once") and that `MIXRL_TRAIN` loss and
+`train_rollout_logprob_abs_diff` look like a `0` run's. It is part of the recipe, so
+`resume` refuses a changed value.
+
 ## Watching a run
 
-`$BASE_DIR/runs/chimera/mixrl/<name>/logs/train.log`: search `MIXRL_EVAL` (eval scores),
-`MIXRL_COLLECTION` (per-step rewards, `think_rate`), `MIXRL_PASS` (a task reshuffled its
-pool) and `MIXRL_FAILURE`. Eval results are in `rollouts/eval-*/evaluation.json`. To stop
-cleanly at a step boundary, set `MIXRL_WALLCLOCK_SECONDS` or create `MIXRL_STOP_FILE`.
+All logs for a run are in `$BASE_DIR/runs/chimera/mixrl/<name>/logs/`:
+
+```
+train.log            everything the run printed: launcher, Ray, Megatron, SGLang and the MIXRL_* lines
+reward_service.log   the reward service's output during the run
+judge.log            the judge's output during the run (Docker judge; a native judge logs in its terminal)
+gpu_metrics.csv      GPU utilization, memory and power every 5 s
+ray_logs-*.tar.gz    Ray's internal logs (raylet, GCS, workers), saved when the run exits
+```
+
+Resume and retried starts append to the same files. `train.log` is also what the
+terminal shows; its MIXRL_* lines are one JSON object each:
+
+| Line | When | Contents |
+|---|---|---|
+| `MIXRL_COLLECTION` | each step | per task: groups `attempted`, informative (`accepted`, `acceptance_rate`), `all_correct`, `all_wrong`, `constant`; `raw_reward_mean`, `cap_rate`; pool `pass`, `deferred`; `think_rate` |
+| `MIXRL_GROUP` | each prompt group | its responses' rewards, lengths and cap flags |
+| `MIXRL_TRAIN` | each optimizer step | loss, `grad_norm`, `lr-pg_*`, entropy, importance ratio and clip fractions per direction, `train_rollout_logprob_abs_diff` (`active/*`: per contributing token) |
+| `MIXRL_ROUTER` | each optimizer step | expert load per MoE layer, whole batch over all ranks (MiMo section 5.4): `cv`, `peak` (max/mean), `cold` (share of experts under 0.1x mean), and token counts |
+| `MIXRL_SKIP` | step with no reward spread | no group was informative; optimizer and LR schedule untouched |
+| `MIXRL_EVAL` | each eval | per task and domain: `mean_score`, `pass@k`, `cap_rate`, `incomplete_rate`, `think_rate`; `equal_domain_mean` |
+| `MIXRL_TIMING` | each step | generation and grading times, tokens per second |
+| `MIXRL_PASS` / `MIXRL_FAILURE` / `MIXRL_STOP` | when they happen | a task reshuffled its pool / a rollout failed (with the error) / a clean stop |
+
+Slime also prints `rollout N: {...}`, `eval N: {...}` and `perf N: {...}` summaries;
+TensorBoard (`<run>/tensorboard`) has all of the above as curves. Eval results are in
+`rollouts/eval-*/evaluation.json`. With the router frozen, `MIXRL_ROUTER` should stay
+flat from step to step; a rising `cv`, `peak` or `cold` is the collapse MiMo saw with a
+trainable router. To stop cleanly at a step boundary, set `MIXRL_WALLCLOCK_SECONDS` or
+create `MIXRL_STOP_FILE`.

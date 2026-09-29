@@ -142,6 +142,77 @@ class ObjectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'changed'):
             routing.before_train_step(args, 2, 0, [model], None, None)
 
+    def test_router_hooks_report_whole_step_expert_balance(self):
+        import contextlib
+        import io
+        import json
+        import os
+        import sys
+        import types
+        import torch
+        from unittest.mock import patch
+        from slime_plugins.chimera_mixrl import routing
+
+        class Router(torch.nn.Module):
+            topk = 1
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(4, 2), requires_grad=False)
+                self.register_buffer('expert_bias', torch.zeros(4))
+
+            def forward(self, choice):
+                routing_map = torch.nn.functional.one_hot(choice, 4).bool()
+                return routing_map.float(), routing_map
+
+        class MLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.router, self.experts = Router(), torch.nn.Linear(2, 2)
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = MLP()
+
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Module()
+        model.decoder.layers = torch.nn.ModuleList([Layer(), Layer()])
+        args = SimpleNamespace(moe_router_bias_update_rate=0., moe_router_load_balancing_type='none',
+                               num_steps_per_rollout=1)
+        logged = []
+        observability = types.ModuleType('slime.observability')
+        observability.logging_utils = types.SimpleNamespace(log=lambda a, metrics, step_key: logged.append(metrics))
+        routing._snapshots.clear()
+        with patch.dict(os.environ, {'MIXRL_ROUTER_METRICS': '1'}), patch.dict(sys.modules, {
+                'slime.observability': observability}):
+            routing.before_train_step(args, 3, 0, [model], None, None)
+            first, second = (layer.mlp.router for layer in model.decoder.layers)
+            for choices in ([0, 0, 1], [0, 2]):  # two microbatches
+                first(torch.tensor(choices))
+            second(torch.tensor([1, 2, 3, 0, 1, 2, 3, 0]))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                routing.after_train_step(args, 3, 0, [model])
+        (line,) = [l for l in output.getvalue().splitlines() if l.startswith('MIXRL_ROUTER ')]
+        summary = json.loads(line.split(' ', 1)[1])
+        self.assertEqual(summary['counts'], {'0': [3, 1, 1, 0], '1': [2, 2, 2, 2]})
+        self.assertEqual(summary['layers']['0'], {'cv': 0.8718, 'peak': 2.4, 'cold': 0.25})
+        self.assertEqual(summary['layers']['1'], {'cv': 0., 'peak': 1., 'cold': 0.})
+        self.assertEqual((summary['worst_layer'], summary['peak_max']), ('0', 2.4))
+        self.assertEqual(logged[0]['train/step'], 3)
+        self.assertEqual(logged[0]['router/layer_0/cold'], 0.25)
+
+
+class RouterBalanceTests(unittest.TestCase):
+    def test_mimo_load_statistics(self):
+        from slime_plugins.chimera_mixrl.routing import load_balance, load_summary
+        self.assertEqual(load_balance([3, 1, 1, 0]), {'cv': 0.8718, 'peak': 2.4, 'cold': 0.25})
+        self.assertIsNone(load_balance([0, 0]))
+        summary = load_summary({'0:decoder.layers.2.mlp.router': [4, 4], '0:decoder.layers.3.mlp.router': [8, 0]})
+        self.assertEqual(summary['layers']['3'], {'cv': 1.0, 'peak': 2.0, 'cold': 0.5})
+        self.assertEqual((summary['cv_mean'], summary['cold_mean'], summary['worst_layer']), (0.5, 0.25, '3'))
+
 
 if __name__ == '__main__':
     unittest.main()

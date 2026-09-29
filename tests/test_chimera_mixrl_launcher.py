@@ -51,6 +51,39 @@ class LauncherTests(unittest.TestCase):
                     with self.subTest(name=name):
                         self.assertEqual(archive.extractfile(name).read(), (REPO / name).read_bytes())
 
+    def test_run_log_captures_everything_runs_cleanup_and_keeps_exit_status(self):
+        text = LAUNCHER.read_text()
+        block = text[text.index('mkdir -p "$LOG_DIR"\n'):text.index('trap on_exit EXIT') + len('trap on_exit EXIT')]
+        script = block + '''
+EXIT_STEPS+=('echo "cleanup ran"')
+echo "to stdout"
+echo "to stderr" >&2
+exit 3
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, LOG_DIR=f'{directory}/logs', RUN_NAME='r', RESUME='0', DRY_RUN='0')
+            for attempt in (1, 2):
+                result = subprocess.run(['bash', '-Eeuo', 'pipefail', '-c', script], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 3, result.stderr)
+            log = (Path(directory) / 'logs/train.log').read_text()
+            for line in ('RUN_NAME=r', 'to stdout', 'to stderr', 'cleanup ran'):
+                self.assertEqual(log.count(line), 2, log)  # appended, not overwritten, on the second launch
+            self.assertIn('cleanup ran', result.stdout)
+
+    def test_commit_recording_accepts_a_copy_without_git(self):
+        text = LAUNCHER.read_text()
+        function = next(line for line in text.splitlines() if line.startswith('commit_of()'))
+        with tempfile.TemporaryDirectory() as directory:
+            for path, expected in ((directory, 'unknown: '), (str(REPO), '')):
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', function + '\ncommit_of "$1"', '_', path],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if expected:
+                    self.assertTrue(result.stdout.startswith(expected), result.stdout)
+                elif (REPO / '.git').exists():
+                    self.assertRegex(result.stdout.strip(), r'^[0-9a-f]{40}$')
+
     def test_ray_workers_receive_router_metrics_and_geometry(self):
         import ast
         import contextlib

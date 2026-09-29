@@ -12,8 +12,10 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 MIXRL = REPO / 'mixrl'
 STUB = '''#!/usr/bin/env bash
-# Records each call; docker copies --env-file before the caller deletes it.
-{ printf '%s\\n' "$@"; echo ---; } >> "$STUB_LOG/$(basename "$0").calls"
+# Records each call in one append (callers run some in the background); docker copies
+# --env-file before the caller deletes it.
+record=$(printf '%s\\n' "$@" ---)
+printf '%s\\n' "$record" >> "$STUB_LOG/$(basename "$0").calls"
 if [[ "$(basename "$0")" == docker ]]; then
     prev=
     for arg in "$@"; do
@@ -21,6 +23,7 @@ if [[ "$(basename "$0")" == docker ]]; then
         prev=$arg
     done
     if [[ "$1" == ps ]]; then echo running; fi
+    if [[ "$1" == inspect ]]; then echo "${STUB_RESTARTS:-0}"; fi
 fi
 exit 0
 '''
@@ -109,18 +112,24 @@ class ScriptTests(unittest.TestCase):
     def test_start_and_resume(self):
         result = self.run_script('run.sh', 'start', 'gsm8k-01')
         self.assertEqual(result.returncode, 0, result.stderr)
-        (call,) = self.calls('docker')
+        calls = self.calls('docker')
+        (call,) = [c for c in calls if c[0] == 'run']
         self.assertIn('"device=0,1"', call)
         self.assertIn(f'{self.base}/runs:/data/runs', call)
         self.assertNotIn('DRY_RUN=1', call)
         self.assertEqual(self.env_file()['RESUME'], '0')
+        # The reward service's and judge's output for the run is followed into its logs folder.
         run_dir = self.base / 'runs/chimera/mixrl/gsm8k-01'
-        # An early failure leaves only folders and the resolved config: the name can be retried.
+        followed = [c for c in calls if c[:2] == ['logs', '-f']]
+        self.assertCountEqual([c[-1] for c in followed], ['mixrl-reward-service', 'mixrl-judge-server'])
+        self.assertTrue((run_dir / 'logs/reward_service.log').exists())
+        # An early failure leaves only logs and manifests: the name can be retried.
         (run_dir / 'manifests').mkdir(parents=True)
         (run_dir / 'manifests/mixrl_config.json').write_text('{}')
+        (run_dir / 'logs/train.log').write_text('failed before the first rollout')
         self.assertEqual(self.run_script('run.sh', 'start', 'gsm8k-01').returncode, 0)
-        (run_dir / 'logs').mkdir()
-        (run_dir / 'logs/train.log').write_text('step 1')
+        (run_dir / 'rollouts/train-0').mkdir(parents=True)
+        (run_dir / 'rollouts/train-0/metrics.json').write_text('{}')
         result = self.run_script('run.sh', 'start', 'gsm8k-01')
         self.assertIn('already exists', result.stderr)
         result = self.run_script('run.sh', 'resume', 'gsm8k-01')
@@ -175,6 +184,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('/models/judge', run)
         spec = json.loads(run[run.index('--speculative-config') + 1])
         self.assertEqual(spec['model'], '/models/judge-assistant')
+        self.assertIn('Judge ready', result.stdout)
+
+    def test_docker_judge_startup_crash_is_reported_not_left_looping(self):
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_PORT=str(free_port()), STUB_RESTARTS='2')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('the judge failed during startup', result.stderr)
+        commands = [c[:2] for c in self.calls('docker')]
+        self.assertIn(['logs', '--tail'], commands)
+        self.assertEqual(commands[-1], ['rm', '-f'])
 
 
 if __name__ == '__main__':

@@ -44,8 +44,25 @@ if [[ "$JUDGE_USE_DOCKER" == 1 ]]; then
     # Inner quotes keep a comma-separated device list as one value for Docker.
     docker run -d --name "$CONTAINER" --gpus "\"device=$JUDGE_GPUS\"" --ipc=host --net=host --restart=unless-stopped \
         -v "$BASE_DIR/models:/models:ro" -v "$BASE_DIR/cache/vllm_cache:/root/.cache/vllm" \
-        "$JUDGE_IMAGE" "/models/$JUDGE_MODEL_DIR" "${args[@]}"
-    echo "Started $CONTAINER; follow it with: docker logs -f $CONTAINER"
+        "$JUDGE_IMAGE" "/models/$JUDGE_MODEL_DIR" "${args[@]}" >/dev/null
+    echo "Started $CONTAINER; waiting for it to serve (up to 30 min; follow with: docker logs -f $CONTAINER)"
+    # The restart policy would hide a startup crash as a silent restart loop: report it instead.
+    for _ in $(seq 1 360); do
+        if curl -sf --connect-timeout 5 "http://$JUDGE_HOST:$JUDGE_PORT/v1/models" >/dev/null 2>&1; then
+            echo "Judge ready at http://$JUDGE_HOST:$JUDGE_PORT/v1 ($JUDGE_NAME)."
+            exit 0
+        fi
+        restarts=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || true)
+        if [[ "${restarts:-0}" != 0 ]] || ! docker ps -q --filter "name=^$CONTAINER$" | grep -q .; then
+            echo "error: the judge failed during startup; its log:" >&2
+            docker logs --tail 40 "$CONTAINER" >&2 || true
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        sleep 5
+    done
+    echo "error: the judge is still not serving after 30 min; see: docker logs $CONTAINER" >&2
+    exit 1
 else
     serve_args "$BASE_DIR/models"
     CUDA_VISIBLE_DEVICES="$JUDGE_GPUS" exec vllm serve "$MODEL_PATH" "${args[@]}"

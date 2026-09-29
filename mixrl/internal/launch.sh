@@ -55,7 +55,6 @@ OFFLOAD_ROLLOUT=${OFFLOAD_ROLLOUT:-1}
 EXECUTION_MODE=${EXECUTION_MODE:-sync} # async: native one-batch-lookahead experiment, Qwen only.
 COLOCATE=${COLOCATE:-1}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-$POLICY_GPUS}
-USE_ROLLOUT_LOGPROBS=${USE_ROLLOUT_LOGPROBS:-0}
 CHIMERA_CONTEXT_OVERRIDE=${CHIMERA_CONTEXT_OVERRIDE:-0} # Use HF YaRN over historical MCore positional metadata; record both.
 # MODEL_CONTEXT_LENGTH is what the preflight reads; it must equal TRAIN_SEQUENCE_LENGTH.
 if [[ -n "${MODEL_CONTEXT_LENGTH:-}" && "$MODEL_CONTEXT_LENGTH" != "$TRAIN_SEQUENCE_LENGTH" ]]; then
@@ -65,7 +64,7 @@ MODEL_CONTEXT_LENGTH=$TRAIN_SEQUENCE_LENGTH
 MIXRL_MAX_ATTEMPTS=${MIXRL_MAX_ATTEMPTS:-100} # Legacy compatibility only; fixed batches never refill.
 MIXRL_REWARD_TIMEOUT=${MIXRL_REWARD_TIMEOUT:-600}
 MIXRL_REWARD_ATTEMPTS=${MIXRL_REWARD_ATTEMPTS:-3}
-export MIXRL_ROUTER_METRICS=${MIXRL_ROUTER_METRICS:-1} # Per-rank/layer/microbatch full-input expert counts.
+export MIXRL_ROUTER_METRICS=${MIXRL_ROUTER_METRICS:-1} # Per-step expert-load balance over all ranks (MIXRL_ROUTER).
 MIXRL_IS_POSITIVE_BOUNDS=${MIXRL_IS_POSITIVE_BOUNDS:-'[0.2,5.0]'}
 MIXRL_IS_NEGATIVE_BOUNDS=${MIXRL_IS_NEGATIVE_BOUNDS:-'[0.2,5.0]'}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0} # Task/data/scorer checks only; no model, Ray or GPU work.
@@ -133,6 +132,22 @@ TRAIN_DATA=$MIXRL_DATA_DIR/splits/rl_train.jsonl
 EVAL_DATA=$MIXRL_DATA_DIR/splits/rl_val.jsonl
 MEGATRON_ROOT=${MEGATRON_ROOT:-/root/Megatron-LM}
 
+# Everything printed from here to exit also goes to logs/train.log (appended on retry and
+# resume). Cleanup steps registered below run first; then the log is flushed.
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_DIR/train.log") 2>&1
+LOG_TEE_PID=$!
+echo "=== $(date -u +%FT%TZ) mixrl/internal/launch.sh RUN_NAME=$RUN_NAME RESUME=$RESUME DRY_RUN=$DRY_RUN"
+EXIT_STEPS=()
+on_exit() {
+    local status=$? step
+    for step in "${EXIT_STEPS[@]}"; do eval "$step" || true; done
+    exec >&- 2>&-
+    wait "$LOG_TEE_PID" 2>/dev/null || true
+    exit "$status"
+}
+trap on_exit EXIT
+
 CONTEXT_OVERRIDE_ARGS=()
 case "$CHIMERA_CONTEXT_OVERRIDE" in
     0) ;;
@@ -181,7 +196,8 @@ if [[ "$RESUME" == 1 ]]; then
         echo "RESUME=1 but no checkpoint exists at $SAVE_PATH" >&2
         exit 1
     fi
-elif [[ -d "$RUN_DIR" ]] && find "$RUN_DIR" -type f ! -name mixrl_config.json -print -quit | grep -q .; then
+elif [[ -n "$(find "$SAVE_PATH" "$ROLLOUT_DIR" -type f -print -quit 2>/dev/null)" ]]; then
+    # A start that failed before any rollout or checkpoint (only logs/manifests) may be retried.
     echo "Run $RUN_NAME already exists at $RUN_DIR; choose a new name or resume it" >&2
     exit 1
 fi
@@ -435,11 +451,13 @@ tar --exclude=__pycache__ -cf "$MANIFEST_DIR/mixrl_source.tar" -C "$REPO_ROOT" \
     examples/chimera/runtime/sitecustomize.py \
     slime/backends/megatron_utils/actor.py slime/utils/routing_replay.py slime/backends/megatron_utils/loss.py \
     slime/backends/megatron_utils/cp_utils.py examples/chimera/patches
-git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" rev-parse HEAD > "$MANIFEST_DIR/slime_commit.txt"
+# Repos copied without .git (e.g. a GitHub zip) have no commit; mixrl_source.tar still holds the source.
+commit_of() { git -c safe.directory="$1" -C "$1" rev-parse HEAD 2>/dev/null || echo "unknown: $1 is not a git checkout"; }
+commit_of "$REPO_ROOT" > "$MANIFEST_DIR/slime_commit.txt"
 if [[ "$MODEL_PROFILE" == chimera ]]; then
-    git -c safe.directory="$CHIMERA_TRANSFORMERS_ROOT" -C "$CHIMERA_TRANSFORMERS_ROOT" rev-parse HEAD > "$MANIFEST_DIR/transformers_commit.txt"
+    commit_of "$CHIMERA_TRANSFORMERS_ROOT" > "$MANIFEST_DIR/transformers_commit.txt"
 fi
-git -C "$MEGATRON_ROOT" rev-parse HEAD > "$MANIFEST_DIR/megatron_image_commit.txt"
+commit_of "$MEGATRON_ROOT" > "$MANIFEST_DIR/megatron_image_commit.txt"
 {
     printf 'DATA_ROOT=%q\n' "$DATA_ROOT"
     printf 'RUN_NAME=%q\n' "$RUN_NAME"
@@ -470,11 +488,18 @@ ray stop --force >/dev/null 2>&1 || true
 GPU_METRICS_PID=
 if [[ "$GPU_METRICS_INTERVAL" != 0 ]]; then
     nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
-        --format=csv --loop="$GPU_METRICS_INTERVAL" > "$LOG_DIR/gpu_metrics.csv" 2> "$LOG_DIR/gpu_metrics.err" &
+        --format=csv --loop="$GPU_METRICS_INTERVAL" >> "$LOG_DIR/gpu_metrics.csv" &
     GPU_METRICS_PID=$!
 fi
-trap 'if [[ -n "$GPU_METRICS_PID" ]]; then kill "$GPU_METRICS_PID" 2>/dev/null || true; fi; ray stop --force >/dev/null 2>&1 || true' EXIT
-ray start \
+EXIT_STEPS+=('if [[ -n "$GPU_METRICS_PID" ]]; then kill "$GPU_METRICS_PID" 2>/dev/null; fi'
+    'ray stop --force >/dev/null 2>&1'
+    # Ray's own logs (raylet, GCS, workers) die with the container; keep them with the run.
+    'tar -czf "$LOG_DIR/ray_logs-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /tmp/ray/session_latest logs 2>/dev/null')
+# Ray's own services and the submit client do not need Chimera. Without the runtime
+# sitecustomize each would import torch and Transformers (~0.8 GB apiece); job
+# processes still get the full PYTHONPATH from the runtime env below.
+RAY_SERVICE_PYTHONPATH="$REPO_ROOT:$MEGATRON_ROOT"
+PYTHONPATH="$RAY_SERVICE_PYTHONPATH" ray start \
     --head \
     --node-ip-address "${MASTER_ADDR:-127.0.0.1}" \
     --num-gpus "$EXPECTED_GPUS" \
@@ -514,7 +539,7 @@ print(json.dumps({"env_vars": values}))
 PY
 )
 
-ray job submit \
+PYTHONPATH="$RAY_SERVICE_PYTHONPATH" ray job submit \
     --address="http://${MASTER_ADDR:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}" \
     --runtime-env-json="$RUNTIME_ENV_JSON" \
-    -- "${TRAIN_COMMAND[@]}" 2>&1 | tee "$LOG_DIR/train.log"
+    -- "${TRAIN_COMMAND[@]}"

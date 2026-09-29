@@ -37,12 +37,15 @@ Follow these exact commands to prepare and load the Docker images on the airgapp
 
 ### A. On Connected Workstation (with Internet)
 
-1. **Pull the images**:
+1. **Pull the images**. The slime image is published as `slimerl/slime`; pull it by digest
+   and tag it with the name `mixrl/config.env` uses (`SLIME_IMAGE`):
    ```bash
-   docker pull suryavikram6/slime:pinned
+   docker pull slimerl/slime@sha256:f7f8ee9acde9645a6e88f0c703597e69a58d2892abff56071630c88f23d5068f
+   docker tag slimerl/slime@sha256:f7f8ee9acde9645a6e88f0c703597e69a58d2892abff56071630c88f23d5068f suryavikram6/slime:pinned
    docker pull suryavikram6/chimera-eval:0.1.1
    docker pull vllm/vllm-openai:muse-glimmer   # (optional: only if running judge via Docker)
    ```
+   (The same digest is also tagged `slimerl/slime:nightly-dev-20260810a-cu129`; the digest pins it.)
 
 2. **Save / Tar the images**:
    ```bash
@@ -190,13 +193,33 @@ The slime repo can live anywhere; `mixrl/run.sh` mounts the checkout it is run f
 Deploy slime and chimera-eval at matching commits: training reads the reward
 service's `/health` fields.
 
+**Transferring the repos** (all three are public; about 53 MB packed). Clones keep the
+commit, which each run records in `manifests/`:
+
+```bash
+# Connected workstation
+git clone --depth 1 --branch chimera https://github.com/surya-vikram/slime.git
+git clone --depth 1 --branch main    https://github.com/surya-vikram/chimera-eval.git
+git clone --depth 1 --branch chimera https://github.com/surya-vikram/transformers.git
+tar -czf mixrl-repos.tar.gz slime chimera-eval transformers
+
+# Airgapped host
+mkdir -p $BASE_DIR/repos
+tar -xzf mixrl-repos.tar.gz -C $BASE_DIR/repos
+```
+
+GitHub "Download ZIP" copies also work: unzip them into `repos/` and rename
+`slime-chimera` to `slime`, `chimera-eval-main` to `chimera-eval` and
+`transformers-chimera` to `transformers`. Runs then record the commit as unknown;
+`manifests/mixrl_source.tar` still holds the exact MixRL source.
+
 ---
 
 ## 5. Running
 
 ```bash
 cd $BASE_DIR/repos/slime
-mixrl/judge.sh                 # only if an enabled task needs the judge
+mixrl/judge.sh                 # only if an enabled task needs the judge; with JUDGE_USE_DOCKER=1 it waits until the judge serves
 mixrl/reward.sh                # prints whether the judge is reachable and any task it cannot grade
 mixrl/run.sh tasks             # task table: prompts per step, eval size, judge use
 mixrl/run.sh preflight         # everything except the GPUs, in the real container (~minutes: hashes checkpoints)
@@ -216,17 +239,20 @@ Everything for a run is in `$BASE_DIR/runs/chimera/mixrl/<RUN_NAME>/`:
 
 | Path | Contents |
 |---|---|
-| `logs/train.log` | full log; search `MIXRL_EVAL`, `MIXRL_COLLECTION`, `MIXRL_PASS`, `MIXRL_FAILURE` |
+| `logs/train.log` | everything the run printed (same as the terminal), from launch to exit; search `MIXRL_COLLECTION` (rewards), `MIXRL_TRAIN` (loss, grad norm), `MIXRL_ROUTER` (expert load), `MIXRL_EVAL`, `MIXRL_FAILURE`; all lines in [`mixrl/README.md`](../README.md#watching-a-run) |
+| `logs/reward_service.log`, `logs/judge.log` | the reward service's and Docker judge's output during the run |
+| `logs/ray_logs-*.tar.gz` | Ray's internal logs, saved at exit (worker kills, raylet errors) |
+| `logs/gpu_metrics.csv` | GPU utilization, memory and power every 5 s |
 | `rollouts/train-N/` | per-step `metrics.json`, `timing.json`, `collection.jsonl` |
 | `rollouts/eval-*/evaluation.json` | per-task and per-domain eval scores |
 | `checkpoints/` | Megatron checkpoints (every `SAVE_INTERVAL` steps and at the end) |
 | `manifests/` | exactly what ran: `config.env`, `tasks.json`, resolved `mixrl_config.json`, source snapshot, command |
 | `tensorboard/` | `tensorboard --logdir <run>/tensorboard` |
-| `logs/gpu_metrics.csv` | GPU utilization, memory and power every 5 s |
 
-In the first steps, check that the router stays frozen (`router.weight`/`router.bias`
-unchanged), that `think_rate`, `cap_rate` and the importance-ratio clip fractions look
-sane, and GPU memory headroom in `gpu_metrics.csv`.
+In the first steps, check that the router stays frozen (a changed `router.weight`/`router.bias`
+stops training with an error) and its load stays flat (`MIXRL_ROUTER` `cv`, `peak`, `cold`), that
+`think_rate` and capped responses (`MIXRL_COLLECTION`, `MIXRL_EVAL`) and the importance-ratio
+clip fractions (`MIXRL_TRAIN`) look sane, and GPU memory headroom in `gpu_metrics.csv`.
 
 ---
 
@@ -234,6 +260,7 @@ sane, and GPU memory headroom in `gpu_metrics.csv`.
 
 | Symptom | Fix |
 |---|---|
+| `the judge failed during startup` (from `judge.sh`) | Its log is printed. Usually GPU memory: "KV cache is needed, which is larger than the available" means lower `JUDGE_MAX_MODEL_LEN` (keep `JUDGE_CONTEXT` at or below it) or raise `JUDGE_GPU_MEMORY_UTILIZATION`. |
 | `reward service not reachable on port 18020` | Start it: `mixrl/reward.sh`; `docker logs mixrl-reward-service` shows why it stopped. |
 | `needs the judge ..., but judge 'mixrl-judge' is not reachable` | Start `mixrl/judge.sh` or disable those tasks; nothing else needs restarting (the check runs at launch and before every step). |
 | `cannot grade <task>: ...` from `reward.sh` | A grading dependency is missing in the reward image (e.g. Docker for APPS); fix it or disable the task. |

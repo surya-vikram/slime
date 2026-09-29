@@ -27,23 +27,75 @@ def before_train_step(args, rollout_id, step_id, model, optimizer, opt_param_sch
                 state['registered'] = True
 
 
+def load_balance(counts):
+    """MiMo section 5.4 expert-load statistics for one layer's per-expert token counts:
+    coefficient of variation, peak load (max / mean) and fraction of cold experts (< 0.1 x mean)."""
+    n = len(counts)
+    mean = sum(counts) / n
+    if mean <= 0:
+        return None
+    std = (sum((c - mean) ** 2 for c in counts) / n) ** .5
+    return {'cv': round(std / mean, 4), 'peak': round(max(counts) / mean, 4),
+            'cold': round(sum(c < .1 * mean for c in counts) / n, 4)}
+
+
+def load_summary(layers):
+    """{layer name: per-expert counts} -> one step's summary; layers keyed by decoder index."""
+    import re
+    per_layer, counts = {}, {}
+    for name, values in layers.items():
+        match = re.search(r'layers\.(\d+)\.', name)
+        key = match.group(1) if match else name
+        stats = load_balance(values)
+        if stats is not None:
+            per_layer[key], counts[key] = stats, [int(v) for v in values]
+    if not per_layer:
+        return None
+    worst = max(per_layer, key=lambda k: per_layer[k]['cv'])
+    return {'cv_mean': round(sum(s['cv'] for s in per_layer.values()) / len(per_layer), 4),
+            'peak_max': max(s['peak'] for s in per_layer.values()),
+            'cold_mean': round(sum(s['cold'] for s in per_layer.values()) / len(per_layer), 4),
+            'worst_layer': worst, 'layers': per_layer, 'counts': counts}
+
+
 def after_train_step(args, rollout_id, step_id, model):
     import json
     import torch
     check_frozen(args, model)
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    names, totals = [], []
     for module in model:
         for router in module.modules():
             state = _loads.get(id(router))
             if state is None or not state['active']:
                 continue
             state['active'] = False
-            if state['counts']:
-                counts = torch.stack(state['counts']).cpu().tolist()
-                print('MIXRL_ROUTER_LOAD ' + json.dumps(dict(
-                    rollout_id=rollout_id, step_id=step_id, rank=rank, layer=state['name'],
-                    scope='full_input_including_padding_per_microbatch', counts=counts)), flush=True)
+            # This rank's microbatches; every rank reaches here with the same layers in the same order.
+            total = torch.zeros(router.weight.shape[0], dtype=torch.float64, device=router.weight.device)
+            for counts in state['counts']:
+                total += counts.to(total.dtype)
+            names.append(state['name'])
+            totals.append(total)
             state['counts'].clear()
+    if not totals:
+        return
+    loads = torch.stack(totals)
+    if torch.distributed.is_initialized():
+        # DP-only layout (TP=PP=CP=1): ranks route disjoint tokens, so the sum is the whole batch.
+        torch.distributed.all_reduce(loads)
+        if torch.distributed.get_rank() != 0:
+            return
+    summary = load_summary(dict(zip(names, loads.cpu().tolist())))
+    if summary is None:
+        return
+    # Tokens as routed in the training forward (replayed rollout routes under R3), padding included.
+    print('MIXRL_ROUTER ' + json.dumps({'rollout_id': rollout_id, 'step_id': step_id, **summary}), flush=True)
+    from slime.observability import logging_utils
+    metrics = {'router/cv_mean': summary['cv_mean'], 'router/peak_max': summary['peak_max'],
+               'router/cold_mean': summary['cold_mean']}
+    for layer, stats in summary['layers'].items():
+        metrics.update({f'router/layer_{layer}/{k}': v for k, v in stats.items()})
+    metrics['train/step'] = rollout_id * (getattr(args, 'num_steps_per_rollout', None) or 1) + step_id
+    logging_utils.log(args, metrics, step_key='train/step')
 
 
 def check_frozen(args, model):
