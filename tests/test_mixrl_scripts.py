@@ -12,10 +12,12 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 MIXRL = REPO / 'mixrl'
 STUB = '''#!/usr/bin/env bash
-# Records each call in one append (callers run some in the background); docker copies
+# Records each call under a lock (callers run some in the background); docker copies
 # --env-file before the caller deletes it.
-record=$(printf '%s\\n' "$@" ---)
-printf '%s\\n' "$record" >> "$STUB_LOG/$(basename "$0").calls"
+(
+    flock 9
+    printf '%s\\n' "$@" --- >&9
+) 9>> "$STUB_LOG/$(basename "$0").calls"
 if [[ "$(basename "$0")" == docker ]]; then
     prev=
     for arg in "$@"; do
@@ -24,6 +26,8 @@ if [[ "$(basename "$0")" == docker ]]; then
     done
     if [[ "$1" == ps ]]; then echo running; fi
     if [[ "$1" == inspect ]]; then echo "${STUB_RESTARTS:-0}"; fi
+    # A real `docker run` lasts the whole run; give background log followers time to start.
+    if [[ "$1" == run && " $* " == *" --gpus "* ]]; then sleep 0.5; fi
 fi
 exit 0
 '''

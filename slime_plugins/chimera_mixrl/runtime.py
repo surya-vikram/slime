@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 import time
 
-from .core import RouteSampler, collect, digest, group_rewards, load_split, write_json
+from .core import RouteSampler, collect, digest, group_rewards, length_penalties, load_split, write_json
 from .routes import THINK_TAG, evaluation_summary, validate_route
 from .tasks import blocked
 from .objective import group_length_scales
@@ -120,7 +120,7 @@ class DataSource:
         return [Sample(group_index=group_id, index=group_id * count + i,
                        prompt=prompt, tokens=list(tokens),
                        metadata={'mixrl': {'row_id': row['id'], 'row_hash': digest(row),
-                                           'task': row['task'], 'split': split, 'sample': i,
+                                           'task': row['task'], 'binary': row['binary'], 'split': split, 'sample': i,
                                            'policy_version': rollout_id, 'group_id': group_id,
                                            'cap': self.c['caps'][row['task']],
                                            'identity': self.identity}})
@@ -133,6 +133,15 @@ async def reward(args, sample, **kwargs):
     if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
         raise RuntimeError('Aborted/failed generation cannot be assigned a reward')
     meta = sample.metadata['mixrl']
+    if sample.status == Sample.Status.TRUNCATED:
+        # Cut off at its cap: no finished answer. The reward service's fixed-budget rule
+        # scores this 0 without looking at the text, so skip the request (and any judge call).
+        now = time.time()
+        sample.metadata.update(reward_started_at=now, reward_finished_at=now)
+        sample.metadata['grade'] = {'status': 'valid', 'score': 0., 'passed': False if meta.get('binary', True) else None,
+                                    'components': {'failure': 'candidate_truncated', 'scoring_policy': 'fixed_budget_v1',
+                                                   'graded_by': 'mixrl_runtime'}}
+        return 0.
     payload = {'request_id': digest([meta['identity'], meta['split'], meta['policy_version'],
                                      meta['group_id'], meta['row_id'], meta['sample']]),
                'protocol_id': c['scorer_protocol'], 'split': meta['split'],
@@ -165,7 +174,8 @@ async def reward(args, sample, **kwargs):
 
 def unfinished(sample):
     """No finished answer: cut off at the cap, or reasoning tags that never reached an answer.
-    Both follow the truncation policy (masked by default): never rewarded, never punished."""
+    Both follow the truncation policy: 'zero' (default) scores them 0 in their group like any
+    wrong answer; 'mask' leaves them out of the group statistics and the loss."""
     from slime.utils.types import Sample
     grade = sample.metadata.get('grade') or {}
     return sample.status == Sample.Status.TRUNCATED or grade.get('components', {}).get('incomplete') is True
@@ -192,9 +202,11 @@ def post_process_rewards(args, samples):
         group = samples[start:start + n]
         validate_group(group, n)
         capped = [unfinished(s) for s in group]
+        # Length penalties were computed at collection time from the same scores and lengths.
         scores, advantages, eligible, usable = group_rewards(
             [s.metadata['grade'] for s in group], capped, c['truncation'],
-            args.grpo_std_normalization if c.get('objective', 'dapo') == 'dapo' else False)
+            args.grpo_std_normalization if c.get('objective', 'dapo') == 'dapo' else False,
+            [s.metadata.get('length_penalty', 0.) for s in group])
         eligible = [keep and usable for keep in eligible]
         for sample, keep in zip(group, eligible):
             if not keep:
@@ -240,8 +252,13 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         raise ValueError('Partial/group-RM modes are not supported')
     if bool(args.use_rollout_routing_replay) != bool(c.get('routing_replay', 0)):
         raise ValueError('Routing-replay launcher/config mismatch')
-    if args.rollout_top_p != 1.0 or args.rollout_temperature != 1.0 or getattr(args, 'rollout_top_k', -1) != -1:
-        raise ValueError('MixRL v0 requires full-support temperature-1 training')
+    # Behaviour log-probs must describe exactly the distribution sampled from: temperature is
+    # applied on both sides, and top-p < 1 replays each token's candidate set in the loss (MiMo).
+    top_k = getattr(args, 'rollout_top_k', -1)
+    if (args.rollout_temperature != c.get('rollout_temperature', 1.0) or args.rollout_top_p != c.get('rollout_top_p', 1.0)
+            or top_k != c.get('rollout_top_k', -1) or (top_k > 0 and args.rollout_top_p == 1)):
+        raise ValueError('Rollout sampling differs from the resolved MixRL config (top-k needs top-p < 1 for replay)')
+    replay_top_p = args.rollout_top_p < 1 and not evaluation
     state = GenerateState(args)
     snapshot = source.sampler.snapshot()
     phase = 'eval' if evaluation else 'train'
@@ -255,6 +272,15 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         version = rollout_id
     directory = source.run_dir / 'rollouts' / f'{phase}-{version}'
     directory.mkdir(parents=True, exist_ok=True)
+    if not evaluation and os.environ.get('MIXRL_KEEP_TRAIN_SAMPLES', '1') == '0':
+        # A finished step's per-response files (tokens, log-probs, expert routes, top-p sets:
+        # up to MBs each) only serve a retry of that step. Keep its summaries and collection log.
+        for old in (source.run_dir / 'rollouts').glob('train-*'):
+            step = old.name.split('-', 1)[1]
+            if step.isdigit() and int(step) < rollout_id:
+                for path in old.glob('*.json'):
+                    if path.stem.isdigit():
+                        path.unlink()
     health = await asyncio.to_thread(request, c['scorer_url'] + '/health')
     if health['protocol_id'] != c['scorer_protocol']:
         raise RuntimeError('Scorer protocol mismatch before rollout')
@@ -303,6 +329,9 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                     return sample
             params = copy.deepcopy(state.sampling_params)
             params['max_new_tokens'] = meta['cap']
+            if evaluation:
+                # Eval samples like training but never trains: no candidate sets to return.
+                params.pop('custom_params', None)
             seed_key = (['eval', meta['row_id'], meta['sample']] if evaluation
                         else [version, meta['group_id'], meta['sample']])
             params['sampling_seed'] = (c['seed'] + int(digest(seed_key)[:8], 16)) % (2**31)
@@ -319,6 +348,11 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 raise RuntimeError('Missing generated tokens/behavior log probabilities')
             if not all(math.isfinite(p) for p in sample.rollout_log_probs):
                 raise RuntimeError('Nonfinite behavior log probabilities')
+            if replay_top_p:
+                ids, offsets = sample.rollout_top_p_token_ids, sample.rollout_top_p_token_offsets
+                if (ids is None or offsets is None or len(offsets) != sample.response_length + 1
+                        or int(offsets[-1]) != len(ids)):
+                    raise RuntimeError('Missing/misaligned top-p candidate sets for replay')
             if c.get('routing_replay'):
                 experts = sample.rollout_routed_experts
                 expected = (len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
@@ -400,19 +434,32 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 stream.write(json.dumps({'route': route, 'group': group[0].group_index,
                                          'row': group[0].metadata['mixrl']['row_id'], 'decision': decision}) + '\n')
         groups, metrics = await collect(c['quotas'], propose, execute, assess,
-                                        inflight=c['inflight_groups'], max_attempts=c['max_attempts'],
+                                        inflight=c['inflight_groups'], refill_rounds=c.get('refill_rounds', 0),
                                         timeout=c['collection_timeout'], event=event)
-        # Attach cap masks before conversion/logging, not just inside reward normalization.
+        # Length penalties and loss masks are fixed here, before conversion and logging,
+        # so reward normalization reads exactly what the logs report.
         for group in groups:
-            usable, _, _ = assess(group)
-            for sample in group:
+            usable, scores, _ = assess(group)
+            deltas = [0.] * len(group)
+            if c.get('length_penalty') and usable:
+                deltas = length_penalties(scores, [s.response_length for s in group], c['length_penalty'])
+            for sample, delta in zip(group, deltas):
+                sample.metadata['length_penalty'] = delta
                 if not usable or (c['truncation'] == 'mask' and unfinished(sample)):
                     sample.loss_mask = [0] * sample.response_length
         for route in metrics:
             position = source.sampler.position(route)
             metrics[route].update(position)
-            texts = [s.metadata['grading_text'] for g in groups for s in g if s.metadata['mixrl']['task'] == route]
+            batch = [s for g in groups for s in g if s.metadata['mixrl']['task'] == route]
+            texts = [s.metadata['grading_text'] for s in batch]
             metrics[route]['think_rate'] = sum(THINK_TAG in t for t in texts) / max(1, len(texts))
+            penalized = [s.metadata['length_penalty'] for s in batch if s.metadata['length_penalty'] < 0]
+            metrics[route]['length_penalized'] = len(penalized)
+            metrics[route]['length_penalty_mean'] = sum(penalized) / len(penalized) if penalized else 0.
+            if replay_top_p:
+                # Mean top-p candidate-set size per generated token (MiMo reports < 5 at top-p 0.97).
+                metrics[route]['top_p_set_mean'] = (sum(int(s.rollout_top_p_token_offsets[-1]) for s in batch)
+                                                   / max(1, sum(s.response_length for s in batch)))
             for number in range(snapshot['state'][route]['epoch'] + 2, position['pass'] + 1):
                 # The pool ran out during this batch; the task reshuffled and began a new pass.
                 print('MIXRL_PASS ' + json.dumps({'rollout_id': rollout_id, 'task': route, 'pass': number,

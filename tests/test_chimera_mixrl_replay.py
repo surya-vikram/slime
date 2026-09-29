@@ -106,6 +106,27 @@ class PersistenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_sample(path)
 
+    def test_top_p_candidate_sets_roundtrip_and_misalignment(self):
+        import torch
+        import json
+        from slime.utils.types import Sample
+        from slime_plugins.chimera_mixrl.records import load_sample, save_sample
+        sample = Sample(tokens=[1, 2, 3, 4], response='answer', response_length=2)
+        sample.rollout_top_p_token_ids = torch.tensor([9, 4, 10], dtype=torch.int32)
+        sample.rollout_top_p_token_offsets = torch.tensor([0, 2, 3], dtype=torch.int32)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'sample.json'
+            save_sample(path, sample)
+            record = json.loads(path.read_text())
+            self.assertEqual(record['rollout_top_p_token_ids']['codec'], 'zlib-base64-int32le-v1')
+            restored = load_sample(path)
+            torch.testing.assert_close(restored.rollout_top_p_token_ids, sample.rollout_top_p_token_ids)
+            torch.testing.assert_close(restored.rollout_top_p_token_offsets, sample.rollout_top_p_token_offsets)
+            record['response_length'] = 3
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, 'do not match'):
+                load_sample(path)
+
 
 if __name__ == '__main__':
     unittest.main()

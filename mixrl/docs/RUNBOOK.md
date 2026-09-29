@@ -48,11 +48,14 @@ prompt, the response and references; long multi-turn and structured tasks need
 about 21K judge tokens at full response length, so run the judge and
 `JUDGE_CONTEXT` at 32,768 or more (the judge supports up to 131,072).
 
-The task file expects the v4 data published on Hugging Face
+The task file expects the v5 data published on Hugging Face
 (`surya-vikram/chimera-eval-data`; download the revision pinned in
-[AIRGAPPED.md](AIRGAPPED.md)): rl_val grown from 128 to 512 prompts (56-57 per domain) by
-moving seeded rows out of rl_train, only rows a response can pass; main_test is
-unchanged; the move is recorded under `val_growth` in `manifest.json`. Launch
+[AIRGAPPED.md](AIRGAPPED.md)). v4 grew rl_val from 128 to 512 prompts (56-57 per domain) by
+moving seeded rows out of rl_train, only rows a response can pass (recorded under
+`val_growth` in `manifest.json`); v5 removes the 1,094 rl_train/rl_val rows no response
+can pass (structured schemas CSV/TOML cannot express or that contradict themselves, APPS
+with no passing or several valid outputs; listed in `removed_rows.json`), leaving 506
+rl_val prompts. main_test is unchanged. Launch
 checks every task's pool sizes against the downloaded splits. Per-task audit notes
 are in [TASK_AUDIT.md](TASK_AUDIT.md).
 
@@ -61,8 +64,8 @@ Grading rules that affect what earns reward (reward service, shared with main_te
 - `<think>...</think>`: the policy is a non-thinking model that sometimes writes
   these tags. Only the answer after the last closed block is graded, so tags never
   cost reward. Reasoning that never closes, or closes with no answer after it, is
-  unfinished: like a truncated response it follows the truncation policy (masked in
-  training by default) and scores 0 in eval (`incomplete_rate`). `think_rate` is
+  unfinished: like a truncated response it follows the truncation policy (scored 0
+  in training by default) and scores 0 in eval (`incomplete_rate`). `think_rate` is
   logged per task in training and eval.
 - mcqa: 1.0 for the correct label in the format the prompt asks for, 0.5 in the
   other explicit format ("Answer: X" vs `\boxed{X}`), 0 otherwise; pass@k counts
@@ -89,22 +92,35 @@ current batch waits for the next batch instead of being skipped for the pass.
 
 - Same versioned evaluator graders: MCQA extraction, mathematical verification,
   and OpenQA judging. No gold/reference fields are sent to the target model.
-- Grading removes a final tokenizer EOS string only when the completed sample's
-  last token ID is that EOS. Raw rollout text, token IDs, log-probabilities and
-  training masks are preserved. Do not feed this transport marker into strict
-  JSON/calendar graders or strip arbitrary special tokens from the answer.
-- `MIXRL_TRUNCATION=mask`: capped-response tokens have zero loss; censored scores
-  are excluded from sibling mean/std. Unfinished responses (reasoning tags with no
-  answer) are treated exactly like capped ones. Keep completed siblings. Accept only groups
-  with at least two eligible responses and nonzero reward spread.
-- `zero` is an explicit alternative; fixed-budget **evaluation** always scores
-  capped responses zero. Judge/transport failures are errors, never zero rewards.
-- Generate exactly the sampled quotas; do not replace constant groups or reroll
-  individual responses until successful. Constant groups remain in the fixed DP
-  batch with zero token masks and zero advantages. MiMo advantages are scaled by
-  total groups / informative groups before DP partitioning, so they do not dilute
-  the informative-prompt mean. An entirely uninformative batch skips optimizer
-  and scheduler execution. Bounded waves retain proposal order.
+- Grading removes the completed sample's stop marker: a trailing configured stop
+  string (Chimera's `<end_of_turn>`), else a final tokenizer EOS string when the
+  last token ID is that EOS. Raw rollout text, token IDs (which keep the marker, so
+  the policy learns to end its turn), log-probabilities and training masks are
+  preserved. Do not strip arbitrary special tokens from the answer.
+- `MIXRL_TRUNCATION=zero` (default, as in MiMo's and DAPO's public recipes): a
+  response with no finished answer (cut off at its cap, or reasoning that never
+  closed) is a wrong answer: reward 0, counted in its group's mean, trained with a
+  negative advantage. `mask` is the alternative: such responses get zero loss and
+  are excluded from sibling statistics. A capped response is scored 0 without a
+  reward-service request (the grader's fixed-budget rule never reads it); eval
+  always scores it 0. Judge/transport failures are errors, never zero rewards.
+- A group trains only with at least two eligible responses and nonzero outcome
+  spread. `MIXRL_LENGTH_PENALTY=1` applies MiMo's group-relative length penalty
+  (paper Eq. 4, public recipe values; matches MiMo's code exactly): in groups where
+  more than half passed (score >= 0.5), a passing response more than 30% longer
+  than the median passing length loses up to 0.1, ramping as t^1.5 to the full
+  deduction at twice the median. It shifts the scores used for advantages only;
+  logged and eval scores stay raw, and it never makes an all-correct group trainable.
+- Refill (`MIXRL_REFILL_ROUNDS`, default 2; 0 = off): a group without outcome
+  spread is replaced by a fresh prompt of the same task while the task is short of
+  `prompts_per_step` informative groups (counting groups still generating), up to
+  (1 + rounds) x `prompts_per_step` prompts per task per step. Then the step
+  continues with what it has; a short task fills its slots with its constant
+  groups (zero loss) so the DP batch keeps its fixed size. Groups are resolved in
+  proposal order, so a retried step proposes the same prompts and reuses its saved
+  responses. MiMo advantages are scaled by total groups / informative groups before
+  DP partitioning, so padding does not dilute the informative-prompt mean. An
+  entirely uninformative batch skips optimizer and scheduler execution.
 - Native diagnostic means retain the fixed response-count reporting denominator.
   Divide `importance_ratio`, `entropy`, `importance_masked_fraction` and
   `train_rollout_logprob_abs_diff` by `effective_response_fraction` to interpret
@@ -237,12 +253,40 @@ router weights stay fixed while expert weights update and a deliberate bias
 mutation is rejected. A full 10B optimizer step was not part of this numerical
 diagnostic; retain that as an integrated-training acceptance gate.
 
+### Train/rollout consistency (measured 2026-09-29, 2xH200, SFT iteration 3478)
+
+Each training step prints `MIXRL_CONSISTENCY` (per-token KL k1/k3 between SGLang's
+behaviour log-probs and Megatron's, mean/max |log-prob| and |prob| gap, max by
+response position and by likelihood, and `routes_overridden_by_replay`: the share of
+token-layer expert choices where Megatron's own router would have picked other experts than
+the rollout's; training always uses the rollout's) and `MIXRL_WORST_TOKENS` (the eight largest gaps with position,
+token id and both log-probs). Live measurements, one step each, about 50-100K tokens:
+
+| Run | KL k3 | mean |d| | max |d| | tokens |d|>0.1 | routes replay changed |
+|---|---|---|---|---|---|
+| route replay, top-p 1.0 | (not logged) | 0.0132 | 0.70 | 0.46% | 8.0% |
+| route replay, top-p 1.0, RMSNorm aligned | 1.8e-4 | 0.0113 | 0.58 | 0.22% | 9.1% |
+| route + top-p 0.95 replay | (not logged) | 0.0111 | 0.43 | 0.27% | not counted |
+
+For reference, the R3 paper (arXiv 2510.11370) reports SGLang/Megatron KL 7.5e-4
+for Qwen3-30B-A3B with R3 (1.5e-3 without) and 6.4e-4 for dense Qwen3-8B, and finds
+tokens with probability ratio above 2 even for dense models. No token here reached
+|d| > 1; the largest gaps sit mid-response, mostly deep in long responses, not at the
+first or last token. Top-p candidate-set replay adds no gap.
+
+YaRN (factor 4, original 8K, max 32K; run sequence cap 16K) was compared directly:
+SGLang's HF `ChimeraRotaryEmbedding` and Megatron's `YarnRotaryEmbedding` use the
+same positions (packed sequences restart at 0; slime sizes the table by the longest
+sequence) and the same scale (1.138629), and their fp32 cos/sin agree to 2e-6. In
+bf16 they are bit-identical below position 1,664 and differ by occasional single-ulp
+roundings beyond it.
+
+`CHIMERA_MATCH_RMSNORM=1` (default for Chimera) makes SGLang's RMSNorm cast after the
+weight multiplication, as TE does. Forward-only parity on 12 prompts gave KL k3
+1.8e-4 with it and 3.0e-4 without; the live run above confirms it. Any switch change
+requires a fresh run, not a silent resume.
+
 ### Other numerical experiments (not enabled in the baseline)
-`CHIMERA_MATCH_RMSNORM=1` switches only Chimera's SGLang RMSNorm rounding to
-cast after weight multiplication, matching the tested TE RMSNorm arithmetic.
-It preserves epsilon and weights. Default0; keep it disabled until the isolated
-layer-boundary diagnosis is complete. Any switch change requires a fresh run,
-not a silent resume.
 
 Two additional rollout-only experiments default to0:
 `CHIMERA_MATCH_DENSE_SWIGLU=1` uses SGLang's fused SiLU-and-multiply kernel in
@@ -257,8 +301,22 @@ MixRL configuration and propagated to Ray/SGLang workers. They are Tiny-qualifie
 experiments; full trained checkpoint and end-to-end training qualification remain
 pending. Inspect `CHIMERA_PRECISION` stderr diagnostics for actual activation.
 
-Keep full-support temperature1 sampling for v0 (enforced by runtime). Restricted
-top-p candidate replay is not implemented. Do not widen ratio bounds to hide drift.
+Rollouts sample at `ROLLOUT_TEMPERATURE=1.0`, `ROLLOUT_TOP_P=0.95`, `ROLLOUT_TOP_K=20`
+(MiMo's public code recipe; top-k 20 is also Qwen3's default); `rl_val` eval samples the
+same way. On this checkpoint (about 200B pretraining tokens) top-p 0.95 alone gave
+candidate sets with median 8 but p90 978 ids, and 9.1% of sampled tokens ranked beyond
+20 (HotpotQA, 13.6K tokens); top-k 20 caps the replay payload and that tail. Top-k needs
+top-p < 1: slime records and replays candidate sets only then. With top-p < 1, SGLang
+records each generated token's top-p candidate set and returns its log-prob
+renormalized over that set (plus the sampled token); the loss renormalizes the
+actor's log-prob over the same set (MiMo's top-p candidate-set replay; slime's
+trainer force-keeps the target token the same way). The runtime refuses a response
+without aligned candidate sets. `top_p_set_mean` in `MIXRL_COLLECTION` is the mean
+set size per generated token: MiMo reports under 5 at top-p 0.97 for its model. It
+also sizes the replay payload (Ray transfer and saved responses), so check it in the
+first H200 steps; a random-weight model gives ~44K (nearly the whole vocabulary).
+Temperature scaling is applied identically on both sides. Do not widen ratio bounds
+to hide drift.
 
 ## Experimental async comparison
 

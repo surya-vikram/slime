@@ -32,10 +32,12 @@ class ObjectiveTests(unittest.TestCase):
         backend = types.ModuleType('slime.backends.megatron_utils.loss')
         backend.get_log_probs_and_entropy = lambda *a, **kw: (None, {
             'log_probs': [current], 'entropy': [torch.ones(2)]})
+        backend.get_rollout_top_p_logprob_kwargs = lambda args, batch: {}
         args = SimpleNamespace(calculate_per_token_loss=False, kl_coef=0., entropy_coef=0.,
                                context_parallel_size=1)
         batch = dict(unconcat_tokens=[], total_lengths=[3], response_lengths=[2],
-                     rollout_log_probs=[current.detach().clone()], advantages=[torch.tensor([1., -1.])])
+                     rollout_log_probs=[current.detach().clone()], advantages=[torch.tensor([1., -1.])],
+                     loss_masks=[torch.ones(2)])
         with patch.dict(sys.modules, {backend.__name__: backend}), patch.object(runtime, 'config', return_value={
                 'is_positive_bounds': [.2, 5.], 'is_negative_bounds': [.2, 5.]}):
             value, metrics = loss(args, batch, None, lambda x: x.mean())
@@ -43,6 +45,32 @@ class ObjectiveTests(unittest.TestCase):
         torch.testing.assert_close(current.grad, torch.tensor([-.5, .5]))
         self.assertEqual(metrics['train_rollout_logprob_abs_diff'].item(), 0.)
         self.assertEqual(metrics['importance_masked_fraction'].item(), 0.)
+
+    def test_loss_renormalizes_over_recorded_top_p_candidate_sets(self):
+        import sys
+        import types
+        import torch
+        from unittest.mock import patch
+        from slime_plugins.chimera_mixrl.objective import loss
+        from slime_plugins.chimera_mixrl import runtime
+        current = torch.tensor([-1., -2.], requires_grad=True)
+        received = {}
+        def log_probs(*args, **kwargs):
+            received.update(kwargs)
+            return None, {'log_probs': [current], 'entropy': [torch.ones(2)]}
+        backend = types.ModuleType('slime.backends.megatron_utils.loss')
+        backend.get_log_probs_and_entropy = log_probs
+        backend.get_rollout_top_p_logprob_kwargs = lambda args, batch: {
+            'top_p_token_ids': batch['rollout_top_p_token_ids'], 'top_p_token_offsets': batch['rollout_top_p_token_offsets']}
+        args = SimpleNamespace(calculate_per_token_loss=False, kl_coef=0., entropy_coef=0., context_parallel_size=1)
+        batch = dict(unconcat_tokens=[], total_lengths=[3], response_lengths=[2],
+                     rollout_log_probs=[current.detach().clone()], advantages=[torch.tensor([1., -1.])],
+                     rollout_top_p_token_ids=[[9, 4, 10]], rollout_top_p_token_offsets=[[0, 2, 3]],
+                     loss_masks=[torch.ones(2)])
+        with patch.dict(sys.modules, {backend.__name__: backend}), patch.object(runtime, 'config', return_value={
+                'is_positive_bounds': [.2, 5.], 'is_negative_bounds': [.2, 5.]}):
+            loss(args, batch, None, lambda x: x.mean())
+        self.assertEqual((received['top_p_token_ids'], received['top_p_token_offsets']), ([[9, 4, 10]], [[0, 2, 3]]))
 
     def test_detached_weight_and_sign_specific_mask(self):
         import torch
@@ -180,6 +208,8 @@ class ObjectiveTests(unittest.TestCase):
         model.decoder.layers = torch.nn.ModuleList([Layer(), Layer()])
         args = SimpleNamespace(moe_router_bias_update_rate=0., moe_router_load_balancing_type='none',
                                num_steps_per_rollout=1)
+        from slime_plugins.chimera_mixrl import objective
+        objective.GAP.clear()  # no loss ran in this step: no consistency line
         logged = []
         observability = types.ModuleType('slime.observability')
         observability.logging_utils = types.SimpleNamespace(log=lambda a, metrics, step_key: logged.append(metrics))
@@ -200,8 +230,44 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(summary['layers']['0'], {'cv': 0.8718, 'peak': 2.4, 'cold': 0.25})
         self.assertEqual(summary['layers']['1'], {'cv': 0., 'peak': 1., 'cold': 0.})
         self.assertEqual((summary['worst_layer'], summary['peak_max']), ('0', 2.4))
-        self.assertEqual(logged[0]['train/step'], 3)
-        self.assertEqual(logged[0]['router/layer_0/cold'], 0.25)
+        (router_metrics,) = [m for m in logged if 'router/cv_mean' in m]
+        self.assertEqual(router_metrics['train/step'], 3)
+        self.assertEqual(router_metrics['router/layer_0/cold'], 0.25)
+
+
+@unittest.skipUnless(importlib.util.find_spec('torch'), 'requires CPU torch')
+class ConsistencyTests(unittest.TestCase):
+    def test_logprob_gap_and_route_agreement_line(self):
+        import contextlib
+        import io
+        import json
+        import math
+        import sys
+        import types
+        import torch
+        from unittest.mock import patch
+        from slime.utils import routing_replay
+        from slime_plugins.chimera_mixrl import objective, routing
+        objective.GAP.clear()
+        # Two microbatches; masked tokens (third of the first) never count.
+        objective.record_gap(torch.tensor([-1., -2., -9.]), torch.tensor([-1.05, -2., 0.]),
+                             [torch.tensor([1, 1]), torch.tensor([0])])
+        objective.record_gap(torch.tensor([-.5]), torch.tensor([-2.]), [torch.tensor([1])])
+        routing_replay.ROUTE_AGREEMENT.update(sets=200, mismatched=torch.tensor(3))
+        logged = []
+        observability = types.ModuleType('slime.observability')
+        observability.logging_utils = types.SimpleNamespace(log=lambda a, metrics, step_key: logged.append(metrics))
+        output = io.StringIO()
+        with patch.dict(sys.modules, {'slime.observability': observability}), contextlib.redirect_stdout(output):
+            routing.report_consistency(SimpleNamespace(num_steps_per_rollout=1), 4, 0)
+        line = json.loads(output.getvalue().split('MIXRL_CONSISTENCY ', 1)[1])
+        self.assertEqual((line['tokens'], line['tokens_over_0.1'], line['tokens_over_1']), (3, 1, 1))
+        self.assertAlmostEqual(line['logprob_abs_diff_max'], 1.5)
+        self.assertAlmostEqual(line['logprob_abs_diff_mean'], (.05 + 1.5) / 3, places=6)
+        self.assertAlmostEqual(line['prob_abs_diff_max'], math.exp(-.5) - math.exp(-2.), places=6)
+        self.assertEqual(line['routes_overridden_by_replay'], .015)
+        self.assertEqual(logged[0]['train/step'], 4)
+        self.assertEqual((objective.GAP, routing_replay.ROUTE_AGREEMENT), ({}, {'sets': 0, 'mismatched': 0, 'active': False}))
 
 
 class RouterBalanceTests(unittest.TestCase):

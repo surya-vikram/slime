@@ -42,6 +42,40 @@ class GroupTests(unittest.TestCase):
     def test_quality_not_forced_to_binary(self):
         self.assertTrue(group_rewards([grade(.5), grade(.75)], [False, False])[-1])
 
+    def test_zero_policy_scores_unfinished_as_wrong_inside_the_group(self):
+        raw, adv, eligible, usable = group_rewards([grade(1), grade(1), grade(1)], [False, False, True], 'zero',
+                                                   standardize=False)
+        self.assertEqual((raw, eligible, usable), ([1., 1., 0.], [True, True, True], True))
+        self.assertAlmostEqual(adv[2], -2 / 3)
+
+    def test_penalties_shape_advantages_but_not_informativeness(self):
+        # Every answer correct: no outcome spread, so a length penalty alone never trains the group.
+        _, adv, _, usable = group_rewards([grade(1)] * 3, [False] * 3, 'zero', False, [0., 0., -.1])
+        self.assertFalse(usable)
+        self.assertEqual(adv, [0.] * 3)
+        raw, adv, _, usable = group_rewards([grade(1), grade(1), grade(0)], [False] * 3, 'zero', False, [0., -.1, 0.])
+        self.assertTrue(usable)
+        self.assertEqual(raw, [1., 1., 0.])  # logged scores stay raw
+        for value, expected in zip(adv, (1 - 1.9 / 3, .9 - 1.9 / 3, -1.9 / 3)):
+            self.assertAlmostEqual(value, expected)
+
+
+class LengthPenaltyTests(unittest.TestCase):
+    """MiMo-V2.6 Eq. 4 with its public recipe values (checked against MiMo's verl code)."""
+
+    def test_only_long_correct_answers_in_mostly_passing_groups(self):
+        from slime_plugins.chimera_mixrl.core import length_penalties
+        # Passing lengths 100, 100, 200: anchor (median) 100. 200 is +100%: saturated, -0.1.
+        self.assertEqual(length_penalties([1, 1, 1, 0], [100, 100, 200, 5000]), [0., 0., -.1, 0.])
+        # +65%: t = (0.65 - 0.3) / 0.7 = 0.5, penalty 0.1 * 0.5 ** 1.5.
+        deltas = length_penalties([1, 1, 1, 1], [100, 100, 165, 100])
+        self.assertAlmostEqual(deltas[2], -.1 * .5 ** 1.5)
+        # Within the 30% deadzone, or a group where only half passed: no penalty.
+        self.assertEqual(length_penalties([1, 1, 1], [100, 100, 130]), [0.] * 3)
+        self.assertEqual(length_penalties([1, 1, 0, 0], [100, 400, 10, 10]), [0.] * 4)
+        # Partial credit at the 0.5 pass threshold counts as passing; failed answers are never penalized.
+        self.assertEqual(length_penalties([.5, 1, 1, 0], [100, 100, 900, 9000])[2:], [-.1, 0.])
+
 
 class SamplerTests(unittest.TestCase):
     def test_small_route_cycles_independently_without_cross_domain_spill(self):
@@ -192,7 +226,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             return job
         groups, metrics = await collect({'a': 3, 'b': 2}, propose, execute,
             lambda g: (g[1] % 2 == 0, [0., 1.], [False, False]), inflight=4,
-            max_attempts=20, event=lambda r, j, g, d: events.append((r, j, d)))
+            event=lambda r, j, g, d: events.append((r, j, d)))
         self.assertLessEqual(maximum, 4)
         self.assertEqual([metrics[r]['attempted'] for r in ('a', 'b')], [3, 2])
         self.assertEqual([metrics[r]['accepted'] for r in ('a', 'b')], [1, 1])
@@ -210,10 +244,58 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(job):
             return job
         groups, metrics = await collect({'a': 1}, lambda r: r, execute,
-                          lambda g: (False, [0., 0.], [False, False]), max_attempts=3)
+                          lambda g: (False, [0., 0.], [False, False]))
         self.assertEqual(groups, ['a'])
         self.assertEqual(metrics['a']['attempted'], 1)
         self.assertEqual(metrics['a']['accepted'], 0)
+
+    async def refill(self, outcomes, quotas, rounds, delays=None):
+        """outcomes[route][k] is whether that route's k-th proposal has reward spread."""
+        proposals = {r: 0 for r in quotas}
+        events = []
+        def propose(route):
+            proposals[route] += 1
+            return route, proposals[route]
+        async def execute(job):
+            await asyncio.sleep((delays or {}).get(job, .0001))
+            return job
+        def assess(job):
+            route, number = job
+            usable = outcomes[route][number - 1] if number <= len(outcomes[route]) else False
+            return usable, [1., 0.] if usable else [0., 0.], [False, False]
+        groups, metrics = await collect(quotas, propose, execute, assess, inflight=3, refill_rounds=rounds,
+                                        event=lambda r, j, g, d: events.append((j, d)))
+        return groups, metrics, events
+
+    async def test_refill_replaces_constant_groups_until_the_quota_is_informative(self):
+        groups, metrics, events = await self.refill({'a': [False, True, True, True]}, {'a': 2}, 2)
+        self.assertEqual(groups, [('a', 2), ('a', 3)])
+        self.assertEqual((metrics['a']['attempted'], metrics['a']['refilled'], metrics['a']['padding']), (3, 1, 0))
+        self.assertEqual(events[0], (('a', 1), 'replaced'))
+
+    async def test_refill_budget_is_bounded_then_pads_with_constant_groups(self):
+        # A task the model never gets any spread on: (1 + 2) x quota prompts, then carry on.
+        groups, metrics, _ = await self.refill({'a': [], 'b': [True]}, {'a': 2, 'b': 1}, 2)
+        self.assertEqual(groups, [('a', 1), ('a', 2), ('b', 1)])
+        self.assertEqual((metrics['a']['attempted'], metrics['a']['refilled'], metrics['a']['padding']), (6, 4, 2))
+        self.assertEqual((metrics['b']['attempted'], metrics['b']['refilled']), (1, 0))
+
+    async def test_refill_off_keeps_the_fixed_batch(self):
+        groups, metrics, events = await self.refill({'a': [False, True]}, {'a': 2}, 0)
+        self.assertEqual(groups, [('a', 2), ('a', 1)])
+        self.assertEqual((metrics['a']['attempted'], metrics['a']['refilled'], metrics['a']['padding']), (2, 0, 1))
+        self.assertNotIn('replaced', [d for _, d in events])
+
+    async def test_refill_never_overshoots_and_ignores_completion_order(self):
+        # Proposal 1 is constant and finishes first while 2 (informative) is still running:
+        # counting pending groups, one replacement is enough; both orders propose the same prompts.
+        outcomes = {'a': [False, True, True, True, True]}
+        slow_first = await self.refill(outcomes, {'a': 2}, 3, delays={('a', 1): .02})
+        slow_second = await self.refill(outcomes, {'a': 2}, 3, delays={('a', 2): .02})
+        for groups, metrics, events in (slow_first, slow_second):
+            self.assertEqual(groups, [('a', 2), ('a', 3)])
+            self.assertEqual(metrics['a']['attempted'], 3)
+        self.assertEqual(slow_first[2], slow_second[2])
 
     async def test_timeout_cancels_work(self):
         stopped = []

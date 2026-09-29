@@ -97,23 +97,23 @@ Follow these exact commands to prepare and load the Docker images on the airgapp
 
 ## 3. Dataset Download & Transfer (from Hugging Face)
 
-The dataset repository is public: `surya-vikram/chimera-eval-data` at pinned revision `ed33098918e42c0f024341a7f5984b5b76262051` (quality-v4-val512: rl_val grown to 512, main_test unchanged, APPS audit included; previous v3 revision `0c4b5e43d163f333422fa0855e6f1fb708acbc7a`).
+The dataset repository is public: `surya-vikram/chimera-eval-data` at pinned revision `9f204f733a762c3766407636e1fbb4f8aa41dc9e` (quality-v5-clean: removes 1,094 rl_train/rl_val rows no response can pass, which training already excluded, and strips leftover markdown from science references; main_test unchanged; the removed rows are listed in `removed_rows.json`. Previous v4 revision `ed33098918e42c0f024341a7f5984b5b76262051`).
 
 ### A. Download on Connected Workstation
 
 1. **Install the CLI and (optionally) log in**. The dataset is public, so no login is required,
-   but anonymous downloads of its 1,385 files hit Hugging Face rate limits and retry; a token avoids that:
+   but anonymous downloads of its 1,189 files hit Hugging Face rate limits and retry; a token avoids that:
    ```bash
    pip install -U huggingface_hub
    hf auth login   # optional
    ```
 
-2. **Download the pinned dataset v4 snapshot** (all files: manifest, splits, APPS audit; about 556 MB, a few minutes):
+2. **Download the pinned dataset v5 snapshot** (all files: manifest, splits, APPS audit; about 531 MB, a few minutes):
    ```bash
    # Using Hugging Face CLI:
    hf download surya-vikram/chimera-eval-data \
      --repo-type dataset \
-     --revision ed33098918e42c0f024341a7f5984b5b76262051 \
+     --revision 9f204f733a762c3766407636e1fbb4f8aa41dc9e \
      --local-dir ./chimera-eval-data
    ```
 
@@ -124,12 +124,12 @@ The dataset repository is public: `surya-vikram/chimera-eval-data` at pinned rev
    snapshot_download(
        repo_id="surya-vikram/chimera-eval-data",
        repo_type="dataset",
-       revision="ed33098918e42c0f024341a7f5984b5b76262051",
+       revision="9f204f733a762c3766407636e1fbb4f8aa41dc9e",
        local_dir="./chimera-eval-data"
    )
    ```
 
-3. **Archive into a tarball** (about 125 MB; skips the `.cache/` download metadata the CLI leaves behind):
+3. **Archive into a tarball** (about 122 MB; skips the `.cache/` download metadata the CLI leaves behind):
    ```bash
    tar --exclude=.cache -czf chimera-eval-data.tar.gz -C ./chimera-eval-data .
    ```
@@ -148,16 +148,16 @@ The dataset repository is public: `surya-vikram/chimera-eval-data` at pinned rev
    ```
    Must contain:
    * `manifest.json` (dataset manifest)
-   * `splits/rl_train.jsonl` (86,263 training records)
-   * `splits/rl_val.jsonl` (512 validation records; the task file expects this v4 split)
+   * `splits/rl_train.jsonl` (85,175 training records)
+   * `splits/rl_val.jsonl` (506 validation records; the task file expects this v5 split)
    * `splits/main_test.jsonl` (3,982 test records)
-   * `audits/apps/` (must be a real directory containing `summary.json` and 1,376 audited problem JSONs)
+   * `audits/apps/` (must be a real directory containing `summary.json` and 1,179 audited problem JSONs)
 
 3. **Verify counts and content hashes** (plain `python3`; the slime helpers used here need no extra packages):
    ```bash
    D=/nvme_zone3/home/ekamai1/chimera/mixrl/datasets/chimera-eval-data
-   wc -l $D/splits/*.jsonl       # 3982 main_test, 86263 rl_train, 512 rl_val
-   ls $D/audits/apps | wc -l     # 1377 (1,376 problems + summary.json)
+   wc -l $D/splits/*.jsonl       # 3982 main_test, 85175 rl_train, 506 rl_val
+   ls $D/audits/apps | wc -l     # 1180 (1,179 problems + summary.json)
    cd /nvme_zone3/home/ekamai1/chimera/mixrl/repos/slime
    python3 -c "from slime_plugins.chimera_mixrl.core import load_split; [load_split('$D', s) for s in ('rl_train', 'rl_val')]; print('splits match manifest')"
    python3 -m slime_plugins.chimera_mixrl.tasks   # task table; preflight also checks each task's pools against this data
@@ -243,7 +243,7 @@ Everything for a run is in `$BASE_DIR/runs/chimera/mixrl/<RUN_NAME>/`:
 | `logs/reward_service.log`, `logs/judge.log` | the reward service's and Docker judge's output during the run |
 | `logs/ray_logs-*.tar.gz` | Ray's internal logs, saved at exit (worker kills, raylet errors) |
 | `logs/gpu_metrics.csv` | GPU utilization, memory and power every 5 s |
-| `rollouts/train-N/` | per-step `metrics.json`, `timing.json`, `collection.jsonl` |
+| `rollouts/train-N/` | per-step `metrics.json`, `timing.json`, `collection.jsonl`; each response's file (tokens, log-probs, expert routes, top-p sets; MBs each), kept by default (`MIXRL_KEEP_TRAIN_SAMPLES=0` drops a step's files once the next step starts) |
 | `rollouts/eval-*/evaluation.json` | per-task and per-domain eval scores |
 | `checkpoints/` | Megatron checkpoints (every `SAVE_INTERVAL` steps and at the end) |
 | `manifests/` | exactly what ran: `config.env`, `tasks.json`, resolved `mixrl_config.json`, source snapshot, command |

@@ -64,7 +64,7 @@ class ConfigTests(unittest.TestCase):
         self.env = dict(MIXRL_TASKS_CONFIG=str(self.tasks_path),
             MIXRL_DATA_DIR=str(data), RUN_DIR=str(root / 'run'), MIXRL_SCORER_URL='http://fixture',
             MIXRL_TRUNCATION='mask', MIXRL_SEED='42', MODEL_CONTEXT_LENGTH='256',
-            MIXRL_INFLIGHT_GROUPS='1', MIXRL_RESPONSE_CONCURRENCY='2', MIXRL_MAX_ATTEMPTS='4',
+            MIXRL_INFLIGHT_GROUPS='1', MIXRL_RESPONSE_CONCURRENCY='2', MIXRL_REFILL_ROUNDS='2',
             MIXRL_COLLECTION_TIMEOUT='10', MIXRL_REWARD_TIMEOUT='5', MIXRL_REWARD_ATTEMPTS='2',
             N_SAMPLES_PER_PROMPT='2', POLICY_GPUS='2',
             EXPERT_MODEL_PARALLEL_SIZE='1',
@@ -177,7 +177,10 @@ class ConfigTests(unittest.TestCase):
                         {'CHAT_TEMPLATE_KWARGS': '{"tokenize":true}'},
                         {'TRAIN_SEQUENCE_LENGTH': '128'}, {'MAX_TOKENS_PER_GPU': '128'},
                         {'MIXRL_CONTEXT_HEADROOM': '-1'}, {'MIXRL_CONTEXT_HEADROOM': '256'},
-                        {'MIXRL_MAX_ATTEMPTS': '0'}):
+                        {'MIXRL_REFILL_ROUNDS': '-1'}, {'MIXRL_LENGTH_PENALTY': 'yes'},
+                        {'ROLLOUT_TOP_P': '0'}, {'ROLLOUT_TOP_P': '1.5'}, {'ROLLOUT_TEMPERATURE': '0'},
+                        {'ROLLOUT_TOP_K': '0'}, {'ROLLOUT_TOP_K': '-2'}, {'ROLLOUT_TOP_K': '20', 'ROLLOUT_TOP_P': '1.0'},
+                        {'LR_WARMUP_STEPS': '-1'}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.resolve(**changes)
         self.edit_tasks(lambda tasks: tasks['mcqa'].update(max_response_tokens=256))

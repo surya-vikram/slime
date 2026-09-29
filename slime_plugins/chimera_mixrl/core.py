@@ -112,11 +112,49 @@ class RouteSampler:
         raise RuntimeError(f'{route}: distinct family pool exhausted within this update')
 
 
-def group_rewards(grades, capped, policy='mask', standardize=True):
-    """Cap masking excludes censored scores from sibling statistics, not just loss.
+# MiMo-V2.6 group-relative length penalty (paper Eq. 4; public recipe values from
+# XiaomiMiMo/verl recipes/general/config/general.yaml, verl/utils/length_penalty.py).
+MIMO_LENGTH_PENALTY = {'max_penalty': 0.1, 'deadzone': 0.3, 'saturate': 1.0, 'exponent': 1.5,
+                       'pass_threshold': 0.5, 'anchor_quantile': 0.5, 'min_pass_rate': 0.5}
 
-    This is an explicit Chimera adaptation. Raw evaluation scores remain untouched.
-    None/invalid judgments must not be supplied as a valid zero.
+
+def length_penalties(scores, lengths, cfg=MIMO_LENGTH_PENALTY):
+    """Non-positive reward deltas for one prompt group; only passing responses are penalized.
+
+    Applies when more than min_pass_rate of the group passed. The anchor is the
+    anchor_quantile of the passing responses' generated-token counts; a passing
+    response whose relative excess over it exceeds the deadzone loses
+    max_penalty * t**exponent, with t ramping from 0 at the deadzone to 1 at saturate.
+    """
+    if len(scores) != len(lengths) or not scores:
+        raise ValueError('Length penalty needs one length per score')
+    deltas = [0.] * len(scores)
+    passed = [i for i, s in enumerate(scores) if s >= cfg['pass_threshold']]
+    if not passed or len(passed) / len(scores) <= cfg['min_pass_rate']:
+        return deltas
+    ordered = sorted(lengths[i] for i in passed)
+    position = cfg['anchor_quantile'] * (len(ordered) - 1)  # numpy.percentile's linear rule
+    low = math.floor(position)
+    anchor = ordered[low] + (ordered[min(low + 1, len(ordered) - 1)] - ordered[low]) * (position - low)
+    if anchor <= 0:
+        return deltas
+    for i in passed:
+        excess = max(0., (lengths[i] - anchor) / anchor)
+        if excess > cfg['deadzone']:
+            t = min((excess - cfg['deadzone']) / (cfg['saturate'] - cfg['deadzone']), 1.)
+            deltas[i] = -cfg['max_penalty'] * t ** cfg['exponent']
+    return deltas
+
+
+def group_rewards(grades, capped, policy='mask', standardize=True, penalties=None):
+    """Group-relative advantages from validated scores.
+
+    capped marks responses without a finished answer (cut off at the cap, or reasoning
+    that never closed). 'zero' scores them 0 inside the group (MiMo/DAPO: no answer is a
+    wrong answer); 'mask' excludes them from sibling statistics and the loss.
+    penalties (e.g. length_penalties) shift the scores used for advantages only; whether
+    the group is informative is decided by the outcome scores. Raw scores are returned
+    unchanged. None/invalid judgments must not be supplied as a valid zero.
     """
     if policy not in ('mask', 'zero') or len(grades) != len(capped) or len(grades) < 2:
         raise ValueError('Invalid group configuration')
@@ -129,78 +167,113 @@ def group_rewards(grades, capped, policy='mask', standardize=True):
     scores = [0. if cap else score for score, cap in zip(scores, capped)]
     eligible = [not cap or policy == 'zero' for cap in capped]
     valid = [s for s, keep in zip(scores, eligible) if keep]
-    if len(valid) < 2:
+    if len(valid) < 2 or max(valid) - min(valid) <= 1e-8:
         return scores, [0.] * len(scores), eligible, False
-    mean = statistics.mean(valid)
-    std = statistics.stdev(valid)
+    shaped = [s + d for s, d in zip(scores, penalties)] if penalties else scores
+    shaped_valid = [s for s, keep in zip(shaped, eligible) if keep]
+    mean = statistics.mean(shaped_valid)
+    std = statistics.stdev(shaped_valid)
     # Epsilon is only numerical protection, not permission for judge-noise rewards.
-    advantages = [(s - mean) / (std + 1e-6) if standardize else s - mean for s in scores]
+    advantages = [(s - mean) / (std + 1e-6) if standardize else s - mean for s in shaped]
     advantages = [a if keep else 0. for a, keep in zip(advantages, eligible)]
-    return scores, advantages, eligible, max(valid) - min(valid) > 1e-8
+    return scores, advantages, eligible, True
 
 
-async def collect(quotas, propose, execute, assess, *, inflight=4, max_attempts=100,
+async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds=0,
                   timeout=600, event=None):
-    """Fixed sampled quotas; constant groups are retained for zero-loss masking.
+    """Per task, collect `quota` groups for the batch, preferring informative ones.
 
-    Preselect the entire batch before execution. Bounded rolling dispatch releases
-    a slot as soon as its group finishes; results/events retain proposal order.
-    There is no finish-time selection, replacement or cross-policy leftover.
+    The whole initial batch is proposed up front and generated with bounded rolling
+    dispatch. With refill_rounds > 0, a group without reward spread is replaced by a
+    fresh prompt from the same task while the task is still short (informative plus
+    still-pending groups below its quota), up to (1 + refill_rounds) * quota prompts
+    per task per step. A task that stays short fills its remaining slots with its
+    constant groups (zero loss), so every step has the same batch shape.
+
+    Groups are resolved in proposal order, not completion order, so the sequence of
+    replacement proposals depends only on outcomes: a retried step proposes the same
+    prompts and can reuse its saved responses. Informative groups never exceed the quota.
     """
     if not quotas or any(type(v) is not int or v < 1 for v in quotas.values()):
         raise ValueError('Quotas must be positive integer sampled-group counts')
-    if inflight < 1 or max_attempts < 1 or timeout <= 0:
+    if inflight < 1 or type(refill_rounds) is not int or refill_rounds < 0 or timeout <= 0:
         raise ValueError('Invalid collection limits')
-    accepted = {r: [] for r in quotas}
     attempts = {r: 0 for r in quotas}
+    pending = {r: 0 for r in quotas}
+    informative = {r: [] for r in quotas}
+    constant = {r: [] for r in quotas}
+    budget = {r: quotas[r] * (1 + refill_rounds) for r in quotas}
     routes = deque(quotas)
-    metrics = {r: {'attempted': 0, 'accepted': 0, 'constant': 0, 'surplus': 0,
+    metrics = {r: {'attempted': 0, 'accepted': 0, 'constant': 0, 'refilled': 0, 'padding': 0,
                    'all_correct': 0, 'all_wrong': 0,
                    'score_sum': 0., 'responses': 0, 'capped': 0} for r in quotas}
 
     async def run():
         started = time.monotonic()
-        jobs = []
-        while any(attempts[r] < quotas[r] for r in quotas):
-            route = next(r for r in routes if attempts[r] < quotas[r])
-            while routes[0] != route:
-                routes.rotate(-1)
-            routes.rotate(-1)
-            jobs.append((route, propose(route)))
-            attempts[route] += 1
         slots = asyncio.Semaphore(inflight)
+        jobs = []
+
         async def bounded(job):
             async with slots:
                 return await execute(job)
-        tasks = [asyncio.create_task(bounded(job)) for _, job in jobs]
+
+        def dispatch(route):
+            job = propose(route)
+            jobs.append((route, job, asyncio.create_task(bounded(job))))
+            attempts[route] += 1
+            pending[route] += 1
+
         try:
-            results = await asyncio.gather(*tasks)
+            while any(attempts[r] < quotas[r] for r in quotas):
+                route = next(r for r in routes if attempts[r] < quotas[r])
+                while routes[0] != route:
+                    routes.rotate(-1)
+                routes.rotate(-1)
+                dispatch(route)
+            index = 0
+            while index < len(jobs):
+                route, job, task = jobs[index]
+                index += 1
+                group = await task
+                pending[route] -= 1
+                usable, scores, capped = assess(group)
+                m = metrics[route]
+                m['attempted'] += 1
+                m['score_sum'] += sum(scores)
+                m['responses'] += len(scores)
+                m['capped'] += sum(capped)
+                m['all_correct'] += int(not any(capped) and all(s == 1 for s in scores))
+                m['all_wrong'] += int(not any(capped) and all(s == 0 for s in scores))
+                if usable:
+                    informative[route].append(group)
+                    decision = 'accepted'
+                else:
+                    constant[route].append(group)
+                    decision = 'constant'
+                    if (len(informative[route]) + pending[route] < quotas[route]
+                            and attempts[route] < budget[route]):
+                        dispatch(route)
+                        m['refilled'] += 1
+                        decision = 'replaced'
+                m['accepted' if usable else 'constant'] += 1
+                if event:
+                    event(route, job, group, decision)
         except BaseException:
+            tasks = [task for _, _, task in jobs]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        for (route, job), group in zip(jobs, results):
-            usable, scores, capped = assess(group)
-            m = metrics[route]
-            m['attempted'] += 1
-            m['score_sum'] += sum(scores)
-            m['responses'] += len(scores)
-            m['capped'] += sum(capped)
-            m['all_correct'] += int(not any(capped) and all(s == 1 for s in scores))
-            m['all_wrong'] += int(not any(capped) and all(s == 0 for s in scores))
-            decision = 'constant'
-            accepted[route].append(group)
-            if usable:
-                decision = 'accepted'
-            m[decision] += 1
-            if event:
-                event(route, job, group, decision)
+        batch = []
+        for route, quota in quotas.items():
+            padding = constant[route][:quota - len(informative[route])]
+            metrics[route]['padding'] = len(padding)
+            batch.extend(informative[route] + padding)
         for m in metrics.values():
             m['raw_reward_mean'] = m['score_sum'] / max(1, m['responses'])
             m['acceptance_rate'] = m['accepted'] / max(1, m['attempted'])
             m['cap_rate'] = m['capped'] / max(1, m['responses'])
             m['collection_seconds'] = time.monotonic() - started
-        return [g for r in quotas for g in accepted[r]], metrics
+        return batch, metrics
 
     return await asyncio.wait_for(run(), timeout)

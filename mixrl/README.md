@@ -58,6 +58,18 @@ Training won't start, and says why, when a task needs a judge that is down, the 
 service can't grade a task, the data doesn't match `tasks.json`, or GPUs and paths
 don't line up.
 
+### Recipe settings (MiMo-V2.6 public recipes)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MIXRL_TRUNCATION` | `zero` | A response with no finished answer (cut off at its cap, or `<think>` never closed) scores 0 and counts in its group like any wrong answer. `mask` leaves it out of the loss instead. Capped responses are never sent to the reward service. |
+| `MIXRL_LENGTH_PENALTY` | `1` | MiMo's group-relative length penalty: in groups where most answers pass, a correct answer more than 30% longer than the median correct one loses up to 0.1 (full at twice the median). Advantages only; logged scores stay raw. |
+| `MIXRL_REFILL_ROUNDS` | `2` | Replace groups without reward spread by new prompts of the same task, up to (1 + N) x `prompts_per_step` per task per step, then continue with what there is. `0` = off. |
+| `ROLLOUT_TEMPERATURE`, `ROLLOUT_TOP_P`, `ROLLOUT_TOP_K` | `1.0`, `0.95`, `20` | Rollout and eval sampling (MiMo's code recipe; top-k 20 is also Qwen3's default). Top-p < 1 replays each token's candidate set in the loss (MiMo); top-k caps that set at 20 ids and needs top-p < 1. |
+| `LR_WARMUP_STEPS` | `10` | Linear LR warmup, then constant (DAPO's recipe at LR 1e-6). Adam starts without optimizer state; the first step only initializes its moments (LR 0). |
+
+These are part of the recipe: `resume` refuses a changed value.
+
 ### Rollout log-probs (`USE_ROLLOUT_LOGPROBS`)
 
 The MiMo loss weights each token by the ratio of two log-probs: the actor's, from the
@@ -98,10 +110,12 @@ terminal shows; its MIXRL_* lines are one JSON object each:
 
 | Line | When | Contents |
 |---|---|---|
-| `MIXRL_COLLECTION` | each step | per task: groups `attempted`, informative (`accepted`, `acceptance_rate`), `all_correct`, `all_wrong`, `constant`; `raw_reward_mean`, `cap_rate`; pool `pass`, `deferred`; `think_rate` |
-| `MIXRL_GROUP` | each prompt group | its responses' rewards, lengths and cap flags |
+| `MIXRL_COLLECTION` | each step | per task: groups `attempted`, informative (`accepted`, `acceptance_rate`), `all_correct`, `all_wrong`, `constant`; refill: `refilled` (replacement prompts), `padding` (constant groups used to fill the batch); `raw_reward_mean`, `cap_rate`; `length_penalized`, `length_penalty_mean`; `top_p_set_mean`; pool `pass`, `deferred`; `think_rate` |
+| `MIXRL_GROUP` | each prompt group | decision (`accepted`, `constant`, or `replaced` by a refill), its responses' rewards, lengths and cap flags |
 | `MIXRL_TRAIN` | each optimizer step | loss, `grad_norm`, `lr-pg_*`, entropy, importance ratio and clip fractions per direction, `train_rollout_logprob_abs_diff` (`active/*`: per contributing token) |
 | `MIXRL_ROUTER` | each optimizer step | expert load per MoE layer, whole batch over all ranks (MiMo section 5.4): `cv`, `peak` (max/mean), `cold` (share of experts under 0.1x mean), and token counts |
+| `MIXRL_CONSISTENCY` | each optimizer step | rollout (SGLang) vs training (Megatron) agreement: per-token KL `kl_k3`, mean/max \|log-prob\| and \|prob\| gap, tokens over 0.1 / 1; `routes_overridden_by_replay` = share of expert choices Megatron would have made differently (replay uses the rollout's). Healthy: KL flat around 1e-4 |
+| `MIXRL_WORST_TOKENS` | each optimizer step | the eight largest gaps with position, token id and both log-probs |
 | `MIXRL_SKIP` | step with no reward spread | no group was informative; optimizer and LR schedule untouched |
 | `MIXRL_EVAL` | each eval | per task and domain: `mean_score`, `pass@k`, `cap_rate`, `incomplete_rate`, `think_rate`; `equal_domain_mean` |
 | `MIXRL_TIMING` | each step | generation and grading times, tokens per second |

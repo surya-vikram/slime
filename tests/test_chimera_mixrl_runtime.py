@@ -8,6 +8,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -38,7 +39,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return await original(*args)
         with patch.object(sglang_rollout, 'generate', generate), patch.object(runtime, 'reward', delayed_reward):
             await runtime._rollout(self.args, 0, self.source)
-        self.assertEqual(self.judged, 6)
+        self.assertEqual(self.judged, 4)  # the 2 truncated responses are scored 0 without a request
 
     async def test_eval_seeds_stable_but_policy_cache_identity_changes(self):
         from slime.rollout import sglang_rollout
@@ -187,7 +188,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                   'routes': {'mcqa': {'domain': 'knowledge', 'verifier': 'choice', 'judge': 'none',
                                       'reward': 'binary'}},
                   'scorer_protocol': 'fixture', 'scorer_url': 'http://fixture', 'truncation': 'mask',
-                  'inflight_groups': 2, 'response_concurrency': 4, 'max_attempts': 8,
+                  'inflight_groups': 2, 'response_concurrency': 4, 'refill_rounds': 0,
                   'collection_timeout': 5, 'reward_timeout': 1, 'reward_attempts': 1, 'eval_samples': 2}
         self.args = types.SimpleNamespace(hf_checkpoint='fixture', save=str(self.root / 'ckpt'), load=None,
                   n_samples_per_prompt=3, rollout_batch_size=2, grpo_std_normalization=True,
@@ -322,6 +323,117 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             # A truncated response never reached the stop; its text is graded as generated.
             self.assertTrue(group[2].metadata['grading_text'].endswith('<end_of_turn>'))
 
+    async def test_keep_train_samples_zero_drops_finished_steps_response_files_but_keeps_summaries(self):
+        old = Path(self.c['run_dir']) / 'rollouts' / 'train-0'
+        old.mkdir(parents=True)
+        for name in ('3.json', 'metrics.json', 'timing.json', 'collection.jsonl'):
+            (old / name).write_text('{}')
+        with patch.dict(os.environ, {'MIXRL_KEEP_TRAIN_SAMPLES': '0'}):
+            await runtime._rollout(self.args, 1, self.source)
+        self.assertEqual(sorted(p.name for p in old.iterdir()), ['collection.jsonl', 'metrics.json', 'timing.json'])
+        current = Path(self.c['run_dir']) / 'rollouts' / 'train-1'
+        self.assertTrue(any(p.stem.isdigit() for p in current.glob('*.json')))  # this step's retry files stay
+        (old / '3.json').write_text('{}')
+        with patch.dict(os.environ):
+            os.environ.pop('MIXRL_KEEP_TRAIN_SAMPLES', None)  # default: keep
+            await runtime._rollout(self.args, 2, self.source)
+        self.assertTrue((old / '3.json').exists())
+
+    async def test_truncated_responses_score_zero_without_a_request(self):
+        output = await runtime._rollout(self.args, 0, self.source)
+        self.assertEqual(self.judged, 4)
+        for group in output.samples:
+            truncated = group[2]
+            self.assertEqual(truncated.reward, 0.)
+            self.assertEqual(truncated.metadata['grade']['passed'], False)
+            self.assertEqual(truncated.metadata['grade']['components']['failure'], 'candidate_truncated')
+
+    async def test_zero_policy_trains_on_unfinished_responses_as_wrong_answers(self):
+        self.c['truncation'] = 'zero'
+        output = await runtime._rollout(self.args, 0, self.source)
+        flat = [s for g in output.samples for s in g]
+        self.assertTrue(all(s.loss_mask == [1, 1] for s in flat))
+        _, advantages = runtime.post_process_rewards(self.args, flat)
+        self.assertGreater(advantages[0], 0)
+        self.assertLess(advantages[2], 0)  # the truncated response is pushed down like any wrong answer
+
+    async def test_length_penalty_from_collection_reaches_the_advantages(self):
+        from slime.rollout import sglang_rollout
+        from slime.utils.types import Sample
+        from slime_plugins.chimera_mixrl.core import MIMO_LENGTH_PENALTY
+        self.c.update(truncation='zero', length_penalty=dict(MIMO_LENGTH_PENALTY))
+        async def generate(args, sample, params):
+            # Two correct answers of 2 and 8 tokens and one wrong 2-token answer.
+            number = sample.metadata['mixrl']['sample']
+            length = 8 if number == 1 else 2
+            sample.response = 'A' if number == 2 else 'B'
+            sample.response_length = length
+            sample.tokens += [9] * length
+            sample.rollout_log_probs = [-.5] * length
+            sample.loss_mask = [1] * length
+            sample.status = Sample.Status.COMPLETED
+            return sample
+        with patch.object(sglang_rollout, 'generate', generate):
+            output = await runtime._rollout(self.args, 0, self.source)
+        expected = -.1 * ((.6 - .3) / .7) ** 1.5  # anchor 5 tokens, +60%
+        for group in output.samples:
+            self.assertEqual([s.reward for s in group], [1., 1., 0.])  # logged scores stay raw
+            penalties = [s.metadata['length_penalty'] for s in group]
+            self.assertEqual(penalties[0], 0.)
+            self.assertAlmostEqual(penalties[1], expected)
+        self.assertEqual(output.metrics['mixrl/mcqa/length_penalized'], 2)
+        self.assertAlmostEqual(output.metrics['mixrl/mcqa/length_penalty_mean'], expected)
+        flat = [s for g in output.samples for s in g]
+        _, advantages = runtime.post_process_rewards(self.args, flat)
+        self.assertGreater(advantages[0], advantages[1])
+        self.assertGreater(advantages[1], 0)
+
+    async def test_top_p_replay_requires_candidate_sets_and_eval_does_not_request_them(self):
+        import torch
+        from slime.rollout import sglang_rollout
+        self.c['rollout_top_p'] = self.args.rollout_top_p = .95
+        state_params = {'custom_params': {'return_top_p_token_ids': True}, 'top_p': .95}
+        self.stack.enter_context(patch.dict(sglang_rollout.GenerateState(self.args).sampling_params, state_params))
+        original = sglang_rollout.generate
+        requested = []
+        async def with_sets(args, sample, params):
+            requested.append('custom_params' in params)
+            sample = await original(args, sample, params)
+            sample.rollout_top_p_token_ids = torch.tensor([9, 4, 10], dtype=torch.int32)
+            sample.rollout_top_p_token_offsets = torch.tensor([0, 2, 3], dtype=torch.int32)
+            return sample
+        with patch.object(sglang_rollout, 'generate', with_sets):
+            output = await runtime._rollout(self.args, 0, self.source)
+            self.assertEqual(output.metrics['mixrl/mcqa/top_p_set_mean'], 1.5)
+            self.assertTrue(all(requested))
+            requested.clear()
+            await runtime._rollout(self.args, 0, self.source, evaluation=True)
+            self.assertFalse(any(requested))
+        with self.assertRaisesRegex(RuntimeError, 'top-p candidate sets'):
+            await runtime._rollout(self.args, 1, self.source)
+        self.args.rollout_top_p = 1.
+        with self.assertRaisesRegex(ValueError, 'Rollout sampling differs'):
+            await runtime._rollout(self.args, 1, self.source)
+
+    async def test_top_k_is_allowed_only_with_top_p_replay_and_must_match_config(self):
+        import torch
+        from slime.rollout import sglang_rollout
+        original = sglang_rollout.generate
+        async def with_sets(args, sample, params):
+            sample = await original(args, sample, params)
+            sample.rollout_top_p_token_ids = torch.tensor([9, 10], dtype=torch.int32)
+            sample.rollout_top_p_token_offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
+            return sample
+        self.c.update(rollout_top_p=.95, rollout_top_k=20)
+        self.args.rollout_top_p, self.args.rollout_top_k = .95, 20
+        with patch.object(sglang_rollout, 'generate', with_sets):
+            await runtime._rollout(self.args, 0, self.source)
+        for top_p, top_k in ((.95, 40), (1., 20)):
+            self.c.update(rollout_top_p=top_p, rollout_top_k=20)
+            self.args.rollout_top_p, self.args.rollout_top_k = top_p, top_k
+            with self.subTest(top_p=top_p, top_k=top_k), self.assertRaisesRegex(ValueError, 'Rollout sampling differs'):
+                await runtime._rollout(self.args, 1, self.source)
+
     async def test_reward_concurrency_is_independent_and_bounded(self):
         self.c['reward_concurrency'] = 1
         original = runtime.request
@@ -343,7 +455,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(runtime, 'request', side_effect=slow_request):
             await runtime._rollout(self.args, 0, self.source)
         self.assertEqual(maximum, 1)
-        self.assertEqual(self.judged, 6)
+        self.assertEqual(self.judged, 4)
 
     async def test_failed_batch_reuses_persisted_completions(self):
         before = self.source.sampler.snapshot()

@@ -25,7 +25,7 @@ export CHIMERA_MODEL_SIZE=${CHIMERA_MODEL_SIZE:-full} # tiny: canonical 8-layer 
 DEFAULT_CHIMERA=0
 if [[ "$MODEL_PROFILE" == chimera ]]; then DEFAULT_CHIMERA=1; fi
 export CHIMERA_FP32_LM_HEAD=${CHIMERA_FP32_LM_HEAD:-$DEFAULT_CHIMERA} # Matched FP32 projection on actor AND rollout.
-export CHIMERA_MATCH_RMSNORM=${CHIMERA_MATCH_RMSNORM:-0} # Opt-in SGLang rounding aligned with TE RMSNorm.
+export CHIMERA_MATCH_RMSNORM=${CHIMERA_MATCH_RMSNORM:-$DEFAULT_CHIMERA} # SGLang RMSNorm rounding aligned with TE (rollout/train KL 3.0e-4 -> 1.8e-4).
 export CHIMERA_MATCH_DENSE_SWIGLU=${CHIMERA_MATCH_DENSE_SWIGLU:-0} # Experimental rollout dense SwiGLU kernel; Tiny-qualified only.
 export CHIMERA_SGLANG_FULL_BF16_REDUCTION=${CHIMERA_SGLANG_FULL_BF16_REDUCTION:-0} # Rollout PyTorch BF16 reduction only.
 CHIMERA_ROUTING_REPLAY=${CHIMERA_ROUTING_REPLAY:-$DEFAULT_CHIMERA} # Baseline requires R3; 0 is an explicit diagnostic control.
@@ -47,7 +47,7 @@ RESUME=${RESUME:-0}
 MIXRL_EXTEND_CONSTANT_HORIZON=${MIXRL_EXTEND_CONSTANT_HORIZON:-0} # Explicit resume-only extension; LR/WD schedule stays frozen.
 GPU_METRICS_INTERVAL=${GPU_METRICS_INTERVAL:-5} # Seconds; 0 disables nvidia-smi CSV sidecar.
 # Opt-in budget starts before model initialization. Reserve includes final eval/save.
-export MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE
+export MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE MIXRL_KEEP_TRAIN_SAMPLES
 export MIXRL_FINAL_RESERVE_SECONDS=${MIXRL_FINAL_RESERVE_SECONDS:-1200}
 export MIXRL_INITIAL_UPDATE_SECONDS=${MIXRL_INITIAL_UPDATE_SECONDS:-300}
 OFFLOAD_TRAIN=${OFFLOAD_TRAIN:-1} # Small-reference-model residency experiment only.
@@ -61,7 +61,6 @@ if [[ -n "${MODEL_CONTEXT_LENGTH:-}" && "$MODEL_CONTEXT_LENGTH" != "$TRAIN_SEQUE
     echo "MODEL_CONTEXT_LENGTH and TRAIN_SEQUENCE_LENGTH disagree" >&2; exit 1
 fi
 MODEL_CONTEXT_LENGTH=$TRAIN_SEQUENCE_LENGTH
-MIXRL_MAX_ATTEMPTS=${MIXRL_MAX_ATTEMPTS:-100} # Legacy compatibility only; fixed batches never refill.
 MIXRL_REWARD_TIMEOUT=${MIXRL_REWARD_TIMEOUT:-600}
 MIXRL_REWARD_ATTEMPTS=${MIXRL_REWARD_ATTEMPTS:-3}
 export MIXRL_ROUTER_METRICS=${MIXRL_ROUTER_METRICS:-1} # Per-step expert-load balance over all ranks (MIXRL_ROUTER).
@@ -162,7 +161,8 @@ read -r RESOLVED_CONTEXT_PHASE MODEL_MAX_CONTEXT TRAIN_SEQUENCE_LENGTH <<< "$CON
 # Preflight: task file, data, reward service and checkpoints, before any GPU work.
 export CHIMERA_MIXRL_CONFIG="$MANIFEST_DIR/mixrl_config.json"
 export MIXRL_DATA_DIR MIXRL_SCORER_URL MIXRL_TASKS_CONFIG MIXRL_TRUNCATION MIXRL_CODE_AUDIT_DIR
-export MIXRL_SEED MIXRL_INFLIGHT_GROUPS MIXRL_RESPONSE_CONCURRENCY MIXRL_MAX_ATTEMPTS MIXRL_CONTEXT_HEADROOM
+export MIXRL_SEED MIXRL_INFLIGHT_GROUPS MIXRL_RESPONSE_CONCURRENCY MIXRL_REFILL_ROUNDS MIXRL_CONTEXT_HEADROOM
+export MIXRL_LENGTH_PENALTY ROLLOUT_TEMPERATURE ROLLOUT_TOP_P ROLLOUT_TOP_K LR_WARMUP_STEPS
 export MIXRL_COLLECTION_TIMEOUT MIXRL_REWARD_TIMEOUT MIXRL_REWARD_ATTEMPTS MIXRL_REWARD_CONCURRENCY
 export MODEL_CONTEXT_LENGTH POLICY_GPUS EXPERT_MODEL_PARALLEL_SIZE N_SAMPLES_PER_PROMPT RUN_DIR
 export MODEL_PROFILE CHAT_TEMPLATE_KWARGS HF_CHECKPOINT MCORE_CHECKPOINT LR MAX_TOKENS_PER_GPU
@@ -310,8 +310,9 @@ ROLLOUT_ARGS=(
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE"
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT"
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN"
-    --rollout-temperature 1.0
-    --rollout-top-p 1.0
+    --rollout-temperature "$ROLLOUT_TEMPERATURE"
+    --rollout-top-p "$ROLLOUT_TOP_P"
+    --rollout-top-k "$ROLLOUT_TOP_K"
     --num-steps-per-rollout 1
     --global-batch-size "$GLOBAL_BATCH_SIZE"
     --balance-data
@@ -329,6 +330,7 @@ fi
 # enabled tasks' prompts from this frozen rl_val split, never from main_test.
 EVAL_ARGS=(--eval-interval "$EVAL_INTERVAL" --eval-prompt-data mixrl "$EVAL_DATA"
     --n-samples-per-eval-prompt "$MIXRL_EVAL_SAMPLES")
+if [[ "$EVAL_BEFORE_TRAIN" == 0 ]]; then EVAL_ARGS+=(--skip-eval-before-train); fi
 
 if [[ "$MIXRL_OBJECTIVE" == mimo ]]; then
     OBJECTIVE_ARGS=(--advantage-estimator grpo --disable-grpo-std-normalization
@@ -360,6 +362,7 @@ PARALLEL_ARGS=(
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr "$LR"
+    --lr-warmup-iters "$LR_WARMUP_STEPS"
     --lr-decay-style constant
     --weight-decay "$WEIGHT_DECAY"
     --clip-grad "$CLIP_GRAD"
@@ -528,6 +531,7 @@ keys = (
     "MIXRL_FINAL_RESERVE_SECONDS",
     "MIXRL_INITIAL_UPDATE_SECONDS",
     "MIXRL_STOP_FILE",
+    "MIXRL_KEEP_TRAIN_SAMPLES",
     "CHIMERA_MATCH_DENSE_SWIGLU",
     "CHIMERA_SGLANG_FULL_BF16_REDUCTION",
 )

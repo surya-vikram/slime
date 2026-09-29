@@ -10,7 +10,7 @@
     "about.judge: none = never calls the judge; on_miss = only when the exact check fails;",
     "  to_pass = deterministic checks can only fail an answer, passing needs the judge; always = every answer.",
     "Reasoning inside <think>...</think> is not graded; the answer after it is. A response whose reasoning",
-    "  never reaches an answer is unfinished, like a truncated one: masked in training, 0 in eval.",
+    "  never reaches an answer is unfinished, like a truncated one: scored 0 in training and in eval.",
     "Training will not start if an enabled task needs the judge and the judge is unreachable, or if the reward",
     "  service cannot grade a task (for example a missing package).",
     "Preview: python3 -m slime_plugins.chimera_mixrl.tasks --samples-per-prompt 8"
@@ -310,8 +310,8 @@
         "verifier": "structure",
         "judge": "to_pass",
         "reward": "binary",
-        "train_pool": 5946,
-        "val_pool": 57
+        "train_pool": 5050,
+        "val_pool": 56
       }
     },
     "reasoning_gym": {
@@ -369,8 +369,8 @@
         "verifier": "apps",
         "judge": "none",
         "reward": "binary",
-        "train_pool": 1319,
-        "val_pool": 57
+        "train_pool": 1127,
+        "val_pool": 52
       }
     }
   }

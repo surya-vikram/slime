@@ -16,6 +16,59 @@ def active_diagnostics(metrics, prefix='train/'):
                          'train_rollout_logprob_abs_diff') if prefix + name in metrics}
 
 
+# Train/rollout log-prob gap over loss-active response tokens, accumulated across this
+# rank's microbatches; routing.after_train_step reduces it over ranks and prints it.
+GAP = {}
+
+
+def record_gap(current, behavior, masks, lengths=None, totals=None, tokens=None, worst=8):
+    """Per-token |log-prob| and |prob| gap over loss-active tokens; with lengths, also the max gap
+    by response position (first/middle/last token) and by likelihood (behaviour log-prob below -5
+    is a tail token), and the worst tokens with their context."""
+    import torch
+    with torch.no_grad():
+        active = torch.cat([m.to(current.device) for m in masks]).bool()
+        full = (current.detach().float() - behavior.detach().float()).abs()
+        diff = full[active]
+        if not diff.numel():
+            return
+        prob = (current.detach().float().exp() - behavior.detach().float().exp())[active].abs()
+        def keep_max(key, value):
+            GAP[key] = torch.maximum(GAP[key], value) if key in GAP else value
+        keep_max('logprob_max', diff.max())
+        keep_max('prob_max', prob.max())
+        # Per-token KL(rollout || train) estimators over tokens sampled by the rollout engine,
+        # as reported in the literature (e.g. R3): k1 = log mu - log pi, k3 = r - 1 - log r, r = pi / mu.
+        log_ratio = (current.detach().float() - behavior.detach().float())[active]
+        for key, value in (('logprob_sum', diff.sum()), ('tokens', float(diff.numel())),
+                           ('over_0.1', (diff > .1).sum().float()), ('over_1', (diff > 1).sum().float()),
+                           ('k1_sum', (-log_ratio).sum()), ('k3_sum', (log_ratio.exp() - 1 - log_ratio).sum())):
+            GAP[key] = GAP.get(key, 0.) + value
+        if lengths is None:
+            return
+        device = current.device
+        position = torch.cat([torch.arange(n, device=device) for n in lengths])
+        last = torch.cat([torch.arange(n, device=device) == n - 1 for n in lengths])
+        tail = behavior.detach().float() < -5
+        zero = torch.zeros((), device=device)
+        for key, selected in (('max_first', position == 0), ('max_last', last), ('max_middle', (position > 0) & ~last),
+                              ('max_tail', tail), ('max_likely', ~tail)):
+            chosen = full[active & selected]
+            keep_max(key, chosen.max() if chosen.numel() else zero)
+        values, index = full.masked_fill(~active, -1.).topk(min(worst, int(active.sum())))
+        ends = torch.cumsum(torch.tensor(list(lengths), device=device), 0)
+        for value, i in zip(values.tolist(), index.tolist()):
+            sample = int(torch.searchsorted(ends, torch.tensor(i, device=device), right=True))
+            pos = int(position[i])
+            prompt = int(totals[sample]) - int(lengths[sample])
+            GAP.setdefault('worst', []).append({
+                'abs_logprob_diff': round(value, 5), 'rollout_logprob': round(float(behavior[i]), 5),
+                'train_logprob': round(float(current[i]), 5), 'response_position': pos,
+                'response_length': int(lengths[sample]), 'prompt_length': prompt,
+                'token_id': int(tokens[sample][prompt + pos]) if tokens is not None and sample < len(tokens) else None})
+        GAP['worst'] = sorted(GAP['worst'], key=lambda w: -w['abs_logprob_diff'])[:worst]
+
+
 def group_length_scales(lengths, eligible):
     """Compensate native per-response mean + response-count outer normalization.
 
@@ -55,7 +108,7 @@ def masked_terms(current, behavior, advantages, positive=(.2, 5.), negative=(.2,
 def loss(args, batch, logits, sum_of_sample_mean):
     import torch
 
-    from slime.backends.megatron_utils.loss import get_log_probs_and_entropy
+    from slime.backends.megatron_utils.loss import get_log_probs_and_entropy, get_rollout_top_p_logprob_kwargs
     from .runtime import config
 
     c = config()
@@ -63,13 +116,17 @@ def loss(args, batch, logits, sum_of_sample_mean):
         raise ValueError('MiMo fixed objective requires per-response reduction, zero KL/entropy loss')
     if args.context_parallel_size != 1:
         raise ValueError('CP objective qualification is not yet complete')
+    # With top-p < 1, renormalize each token's log-prob over the candidate set recorded at
+    # rollout, as SGLang did for the behaviour log-prob (MiMo's top-p candidate-set replay).
     _, values = get_log_probs_and_entropy(
         logits, args=args, unconcat_tokens=batch['unconcat_tokens'],
         total_lengths=batch['total_lengths'], response_lengths=batch['response_lengths'],
-        with_entropy=True)
+        with_entropy=True, **get_rollout_top_p_logprob_kwargs(args, batch))
     current = torch.cat(values['log_probs'])
     behavior = torch.cat(batch['rollout_log_probs'])
     advantages = torch.cat(batch['advantages'])
+    record_gap(current, behavior, batch['loss_masks'], batch['response_lengths'],
+               batch['total_lengths'], batch['unconcat_tokens'])
     terms, ratio, keep = masked_terms(current, behavior, advantages,
                                      c['is_positive_bounds'], c['is_negative_bounds'])
     value = sum_of_sample_mean(terms)

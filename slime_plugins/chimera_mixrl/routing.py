@@ -7,6 +7,8 @@ _loads = {}
 def before_train_step(args, rollout_id, step_id, model, optimizer, opt_param_scheduler):
     check_frozen(args, model)
     import os
+    from slime.utils import routing_replay
+    routing_replay.ROUTE_AGREEMENT['active'] = True
     if os.environ.get('MIXRL_ROUTER_METRICS', '0') != '1':
         return
     for chunk, module in enumerate(model):
@@ -58,10 +60,60 @@ def load_summary(layers):
             'worst_layer': worst, 'layers': per_layer, 'counts': counts}
 
 
+def report_consistency(args, rollout_id, step_id):
+    """One line per optimizer step on train/rollout agreement, over every rank's tokens:
+    per-token |log-prob| and |prob| gap between the actor and SGLang's behaviour log-probs
+    (after top-p replay), and how often the training router would have chosen experts other
+    than the replayed rollout routes: the share of expert choices replay overrode (the routes
+    actually used are always the rollout's; 0 without routing replay)."""
+    import json
+    import torch
+    from slime.utils import routing_replay
+    from .objective import GAP
+    agreement = routing_replay.ROUTE_AGREEMENT
+    device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    def value(x):
+        return torch.as_tensor(x, dtype=torch.float64, device=device).reshape(())
+    by_kind = ('max_first', 'max_middle', 'max_last', 'max_likely', 'max_tail')
+    maxes = torch.stack([value(GAP.get(k, 0.)) for k in ('logprob_max', 'prob_max', *by_kind)])
+    worst = GAP.get('worst', [])
+    sums = torch.stack([value(GAP.get(k, 0.)) for k in ('logprob_sum', 'tokens', 'over_0.1', 'over_1', 'k1_sum', 'k3_sum')]
+                       + [value(agreement['sets']), value(agreement['mismatched'])])
+    GAP.clear()
+    agreement.update(sets=0, mismatched=0, active=False)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(maxes, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(sums)
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, worst)
+        worst = [w for rank in gathered for w in rank]
+        if torch.distributed.get_rank() != 0:
+            return
+    worst = sorted(worst, key=lambda w: -w['abs_logprob_diff'])[:8]
+    logprob_sum, tokens, over_small, over_large, k1_sum, k3_sum, sets, mismatched = sums.tolist()
+    if not tokens:
+        return
+    line = {'tokens': int(tokens), 'kl_k1': k1_sum / tokens, 'kl_k3': k3_sum / tokens,
+            'logprob_abs_diff_mean': logprob_sum / tokens,
+            'logprob_abs_diff_max': maxes[0].item(), 'prob_abs_diff_max': maxes[1].item(),
+            'tokens_over_0.1': int(over_small), 'tokens_over_1': int(over_large),
+            'route_sets': int(sets), 'routes_overridden_by_replay': mismatched / sets if sets else 0.,
+            **{f'logprob_abs_diff_{k}': v for k, v in zip(by_kind, maxes[2:].tolist())}}
+    print('MIXRL_CONSISTENCY ' + json.dumps({'rollout_id': rollout_id, 'step_id': step_id, **line}), flush=True)
+    if worst:
+        print('MIXRL_WORST_TOKENS ' + json.dumps({'rollout_id': rollout_id, 'step_id': step_id, 'tokens': worst}),
+              flush=True)
+    from slime.observability import logging_utils
+    metrics = {f'consistency/{k}': v for k, v in line.items()}
+    metrics['train/step'] = rollout_id * (getattr(args, 'num_steps_per_rollout', None) or 1) + step_id
+    logging_utils.log(args, metrics, step_key='train/step')
+
+
 def after_train_step(args, rollout_id, step_id, model):
     import json
     import torch
     check_frozen(args, model)
+    report_consistency(args, rollout_id, step_id)
     names, totals = [], []
     for module in model:
         for router in module.modules():

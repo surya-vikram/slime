@@ -18,10 +18,11 @@ The task file's `about` blocks (`summary`, `grading`, `answer_format`, `requires
 
 1. Row -> chat template -> prompt tokens. Admitted only if
    prompt + `max_response_tokens` + 1,024 headroom <= 16,384; no prompt truncation.
-2. Generation at temperature 1, top-p 1, up to `max_response_tokens`.
-3. Grading text = response minus the terminal EOS. A response that hits the cap
-   scores 0 without grading; in training it is masked (no gradient), in eval it
-   counts as 0 and appears in `cap_rate`.
+2. Generation at temperature 1, top-p 0.95 (candidate sets replayed in the loss),
+   up to `max_response_tokens`.
+3. Grading text = response minus the stop marker (`<end_of_turn>` or EOS). A
+   response that hits the cap scores 0 without grading, in training (a wrong
+   answer in its group, `MIXRL_TRUNCATION=zero`) and in eval (`cap_rate`).
 4. Reward service grades from its own copy of the row (gold never travels);
    invalid or failed grading is an error, never a zero.
 5. Eval: same caps and sampling, fixed rl_val panel, mean score per task, equal
@@ -43,9 +44,9 @@ enforcing it. Each task evaluates all of its validation prompts by default.
 | quality | cascade_chat 19, cascade_lists 19, cascade_plans 19 | 57 | 390: biggen |
 | multiturn | nvidia_multichallenge 29, _advanced 28 | 57 | 400: multichallenge 200, multi_if 200 |
 | instruction | nemotron_if 57 | 57 | 400: ifeval 200, ifbench 200 |
-| structure | structured_train 57 | 57 | 194: structeval |
+| structure | structured_train 56 | 56 | 194: structeval |
 | logic | reasoning_gym 28, calendar 28 | 56 | 360: bbh (12 x 30) |
-| python | apps 57 | 57 | 163: humanevalplus |
+| python | apps 52 | 52 | 163: humanevalplus |
 
 main_test also has 435 long-context prompts with no training task. Its response
 budgets (8,192-16,384) are at or above every training cap, so a long correct
@@ -54,7 +55,7 @@ answer is not cut off at test time.
 Eval cost: the recovered run's steps took 340-460 s for 384 samples (rollout
 224-349 s, actor update ~27 s); an eval of 48 samples took 32-45 s. The launch
 rule therefore compares generated tokens (prompts x samples x cap): with the
-default 16-task mix and every task on "all", an eval is 512 prompts x 4 samples,
+default 16-task mix and every task on "all", an eval is 506 prompts x 4 samples,
 0.52 of a step; gsm8k alone at 64 prompts/step evaluates 29 prompts at 0.23 of a step.
 
 ## Per task
@@ -116,14 +117,15 @@ Notes by task (answer formats and requirements are also in the task file):
   of strings, so 1,190 of 1,332 CSV rows could never pass (object schemas,
   integer or nested fields) and 138 TOML rows asked for a top-level array TOML
   cannot express. CSV cells are now converted to schema types (640 CSV rows
-  passable) and the remaining 830 impossible rows are quarantined. 263 rows could
+  passable); the remaining 830 impossible rows, and 67 self-contradictory schemas, were
+  quarantined and are removed in dataset v5. 263 rows could
   overflow a 16K judge context. Formats: JSON, YAML, TOML, CSV.
 - **reasoning_gym**: seven allow-listed exact-answer generators; misses go to the
   judge with the whole response, so verbose correct answers pass when the judge is up.
 - **calendar**: any prose around the JSON list used to score 0; the last JSON value
   given is now checked.
-- **apps**: 122 of 1,376 rows fail the reference audit and 75 more are excluded
-  as possibly non-unique output (197 total); stdout compared token by token,
+- **apps**: 122 of 1,376 rows failed the reference audit and 75 more were excluded
+  as possibly non-unique output (197 total, removed in dataset v5, which keeps 1,179); stdout compared token by token,
   15 s per test, Docker sandbox required.
 
 ## Cross-cutting finding: reasoning tags from a non-thinking model (handled)
@@ -149,9 +151,12 @@ in training (`mixrl/<task>/think_rate`) and eval (`evaluation.json`) to watch it
 - Judge context default 32,768 (`JUDGE_CONTEXT` in `mixrl/config.env`).
 - rl_val grown to 512 (v4, published on Hugging Face; seeds and targets recorded in
   the manifest's `val_growth`); domains and a single eval tier.
+- Dataset v5 (2026-09-29): 1,094 rows no response can pass removed (already excluded by
+  training): structured 5,946 -> 5,050 train, 57 -> 56 val; apps 1,319 -> 1,127 train,
+  57 -> 52 val. rl_val 506. Science references lost leftover `**` markdown.
 - `think_rate` per task in training metrics and eval summaries.
 - Reasoning tags never cost reward; reasoning with no answer is unfinished and
-  masked like truncation. mcqa partial credit (0.5) for the other explicit format.
+  scored 0 like truncation (2026-09-29, following MiMo/DAPO; previously masked). mcqa partial credit (0.5) for the other explicit format.
   Structured data and calendar JSON inside explanation count (last answer given),
   CSV type conversion, 830 impossible structure rows quarantined. Multichallenge
   judge reads the completed conversation once, without the expected verdict.

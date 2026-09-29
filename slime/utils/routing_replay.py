@@ -6,6 +6,10 @@ from slime.utils import accelerator
 
 ROUTING_REPLAY = None
 ORDERED_TOPK_CAPTURE_ROUTER = None
+# MixRL diagnostic (MIXRL_ROUTER_METRICS=1): token-layer expert sets replayed in the training
+# forward, and how many of them the training router would have chosen differently on its own.
+# "active" is set by the MixRL step hooks, so the separate log-prob pass is not counted.
+ROUTE_AGREEMENT = {"sets": 0, "mismatched": 0, "active": False}
 
 
 def set_routing_replay(replay):
@@ -195,12 +199,22 @@ def get_routing_replay_compute_topk(old_compute_topk):
                     top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk
                 ), f"[{torch.distributed.get_rank()}] top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
                 probs = scores.gather(1, top_indices)
+                if ROUTE_AGREEMENT["active"] and os.environ.get("MIXRL_ROUTER_METRICS") == "1":
+                    # The training forward replays in this stage (replay_backward is only recompute).
+                    with torch.no_grad():
+                        natural = _compute_topk_for_current_router(
+                            old_compute_topk, scores.detach(), topk, num_groups=num_groups, group_topk=group_topk
+                        )[1]
+                        differs = (natural.sort(dim=-1).values != top_indices.sort(dim=-1).values).any(dim=-1)
+                        ROUTE_AGREEMENT["sets"] += differs.numel()
+                        ROUTE_AGREEMENT["mismatched"] = ROUTE_AGREEMENT["mismatched"] + differs.sum()
             elif routing_replay_stage == "replay_backward":
                 top_indices = ROUTING_REPLAY.pop_backward()
                 assert (
                     top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk
                 ), f"top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
                 probs = scores.gather(1, top_indices)
+
         else:
             probs, top_indices = _compute_topk_for_current_router(
                 old_compute_topk,

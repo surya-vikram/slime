@@ -201,17 +201,23 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
     schedule_rollouts = args.num_rollout
-    if os.environ.get('CHIMERA_MIXRL_CONFIG'):
+    mixrl = bool(os.environ.get('CHIMERA_MIXRL_CONFIG'))
+    if mixrl:
         from slime_plugins.chimera_mixrl.runtime import config as mixrl_config
         schedule_rollouts = mixrl_config()['optimizer_schedule_rollouts']
+        # A warmup counted in steps does not depend on the horizon; a warmup fraction does.
         if schedule_rollouts != args.num_rollout and (
             args.lr_decay_style != 'constant' or args.weight_decay_incr_style != 'constant'
-            or args.lr_warmup_iters or args.lr_warmup_fraction
+            or args.lr_warmup_fraction
         ):
-            raise ValueError('MixRL horizon extension requires constant LR/WD and no warmup')
+            raise ValueError('MixRL horizon extension requires constant LR/WD and no warmup fraction')
     args.train_iters = schedule_rollouts * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
+        if mixrl and args.lr_decay_style == 'constant':
+            # Constant LR after warmup: the decay length only has to exceed the warmup, which
+            # Megatron asserts, so a run shorter than its warmup still starts (and never reaches full LR).
+            args.lr_decay_iters = max(args.train_iters, args.lr_warmup_iters + 1)
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
     wd_incr_steps = args.train_iters * args.global_batch_size
     wsd_decay_steps = None

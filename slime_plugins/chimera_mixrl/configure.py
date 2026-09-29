@@ -8,7 +8,7 @@ from pathlib import Path
 from slime_plugins.models.chimera_context import resolve_context
 from slime_plugins.models.chimera_geometry import validate_geometry, validate_mcore_geometry
 
-from .core import digest, load_split, write_json
+from .core import MIMO_LENGTH_PENALTY, digest, load_split, write_json
 from .runtime import request
 from .routes import validate_route
 from . import tasks as task_file
@@ -45,7 +45,7 @@ def resolve():
         'context': int(env['MODEL_CONTEXT_LENGTH']),
         'inflight_groups': int(env['MIXRL_INFLIGHT_GROUPS']),
         'response_concurrency': int(env['MIXRL_RESPONSE_CONCURRENCY']),
-        'max_attempts': int(env['MIXRL_MAX_ATTEMPTS']),
+        'refill_rounds': int(env['MIXRL_REFILL_ROUNDS']),
         'collection_timeout': int(env['MIXRL_COLLECTION_TIMEOUT']),
         'reward_timeout': int(env['MIXRL_REWARD_TIMEOUT']),
         'reward_attempts': int(env['MIXRL_REWARD_ATTEMPTS']),
@@ -111,7 +111,7 @@ def resolve():
     c['max_tokens_per_gpu'] = int(env['MAX_TOKENS_PER_GPU'])
     if not math.isfinite(c['lr']) or c['lr'] <= 0 or c['max_tokens_per_gpu'] < 1:
         raise ValueError('Invalid optimizer LR or token microbatch budget')
-    for key in ('context', 'inflight_groups', 'response_concurrency', 'max_attempts',
+    for key in ('context', 'inflight_groups', 'response_concurrency',
                 'collection_timeout', 'reward_timeout', 'reward_attempts', 'reward_concurrency', 'eval_samples', 'policy_gpus'):
         if c[key] < 1:
             raise ValueError(f'{key} must be positive')
@@ -120,6 +120,28 @@ def resolve():
         raise ValueError('EXPERT_MODEL_PARALLEL_SIZE must positively divide POLICY_GPUS')
     if c['samples_per_prompt'] < 2 or c['truncation'] not in ('mask', 'zero'):
         raise ValueError('Invalid group size or truncation policy')
+    if c['refill_rounds'] < 0:
+        raise ValueError('MIXRL_REFILL_ROUNDS must be 0 (off) or a positive number of rounds')
+    length_penalty = env.get('MIXRL_LENGTH_PENALTY', '0')
+    if length_penalty not in ('0', '1'):
+        raise ValueError('MIXRL_LENGTH_PENALTY must be 0 or 1')
+    # MiMo-V2.6 group-relative length penalty with its public recipe values.
+    c['length_penalty'] = dict(MIMO_LENGTH_PENALTY) if length_penalty == '1' else None
+    c['rollout_temperature'] = float(env.get('ROLLOUT_TEMPERATURE', '1.0'))
+    c['rollout_top_p'] = float(env.get('ROLLOUT_TOP_P', '1.0'))
+    if not (math.isfinite(c['rollout_temperature']) and c['rollout_temperature'] > 0
+            and math.isfinite(c['rollout_top_p']) and 0 < c['rollout_top_p'] <= 1):
+        raise ValueError('ROLLOUT_TEMPERATURE must be positive and ROLLOUT_TOP_P in (0, 1]')
+    c['rollout_top_k'] = int(env.get('ROLLOUT_TOP_K', '-1'))
+    if c['rollout_top_k'] == 0 or c['rollout_top_k'] < -1:
+        raise ValueError('ROLLOUT_TOP_K must be -1 (off) or a positive number of tokens')
+    if c['rollout_top_k'] > 0 and c['rollout_top_p'] == 1:
+        # Slime records and replays candidate sets only when top-p < 1; top-k alone would leave the
+        # loss renormalizing over the full vocabulary while SGLang sampled from the top k.
+        raise ValueError('ROLLOUT_TOP_K needs ROLLOUT_TOP_P < 1, which turns on candidate-set replay')
+    c['lr_warmup_steps'] = int(env.get('LR_WARMUP_STEPS', '0'))
+    if c['lr_warmup_steps'] < 0:
+        raise ValueError('LR_WARMUP_STEPS must be 0 or positive')
     if c['rollout_batch_size'] * c['samples_per_prompt'] % c['policy_gpus']:
         raise ValueError('v0 requires response batch divisible by policy DP; do not silently round')
     if max(caps.values()) >= c['context']:
