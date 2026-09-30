@@ -77,7 +77,7 @@ class CheckpointMetadataTests(unittest.TestCase):
             document['model'].update(num_layers=8, hidden_size=512, ffn_hidden_size=2048,
                 num_attention_heads=8, num_query_groups=2, kv_channels=64,
                 num_moe_experts=8, moe_router_topk=2, moe_ffn_hidden_size=256,
-                vocab_size=50176, layernorm_epsilon=1e-5)
+                vocab_size=50176, layernorm_epsilon=1e-5, moe_z_loss_coeff=0.001)
             source_yaml = source / 'run_config.yaml'
             source_yaml.write_text(yaml.safe_dump(document))
             original = source_yaml.read_bytes()
@@ -94,7 +94,8 @@ class CheckpointMetadataTests(unittest.TestCase):
             actual = yaml.safe_load((iteration / 'run_config.yaml').read_text())['model']
             self.assertEqual(actual['seq_length'], 32768)
             self.assertEqual(actual['yarn_rotary_scaling_factor'], 4.)
-            self.assertEqual(actual['moe_z_loss_coeff'], 0.)
+            self.assertEqual(actual['moe_z_loss_coeff'], 0.001)  # source value, as Megatron's export requires
+            self.assertEqual(actual['moe_aux_loss_coeff'], 0.)
             self.assertEqual(actual['moe_router_load_balancing_type'], 'none')
             self.assertEqual(actual['expert_model_parallel_size'], 2)
             self.assertTrue((iteration / 'chimera_mixrl_identity.json').is_file())

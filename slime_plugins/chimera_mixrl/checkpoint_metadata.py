@@ -85,6 +85,8 @@ def write_metadata(config, save_dir, iteration):
     document = copy.deepcopy(document)
     model = document['model']
     validate_mcore_geometry(model, config['chimera_model_size'])
+    # moe_z_loss_coeff keeps the source checkpoint's value: RL runs without z-loss (the run's own
+    # manifests record that), but Megatron's export contract requires the architecture value.
     yarn = context['yarn']
     model.update(chimera_context_phase=context['phase'], position_embedding_type='yarn',
                  seq_length=context['model_max_context'], rotary_base=yarn['rotary_base'],
@@ -95,7 +97,7 @@ def write_metadata(config, save_dir, iteration):
                  yarn_mscale=yarn['mscale'], yarn_mscale_all_dim=yarn['mscale_all_dim'],
                  yarn_correction_range_round_to_int=yarn['correction_range_round_to_int'],
                  moe_router_load_balancing_type='none', moe_router_bias_update_rate=0.,
-                 moe_aux_loss_coeff=0., moe_z_loss_coeff=0.,
+                 moe_aux_loss_coeff=0.,
                  tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
                  expert_model_parallel_size=config.get('expert_model_parallel_size', 1),
                  expert_tensor_parallel_size=1,
