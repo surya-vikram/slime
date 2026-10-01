@@ -17,11 +17,29 @@ from .objective import group_length_scales
 from .records import load_sample, save_sample
 
 
+class ServiceHTTPError(RuntimeError):
+    """HTTP error status with the service's response body. urllib's HTTPError keeps an open
+    socket reader, so Ray cannot pickle it and the real reason was lost ('cannot pickle
+    BufferedReader instances'); this one pickles."""
+
+    def __init__(self, url, code, body):
+        super().__init__(url, code, body)
+        self.url, self.code, self.body = url, code, body
+
+    def __str__(self):
+        return f'HTTP {self.code} from {self.url}: {self.body}'
+
+
 def request(url, payload=None, timeout=600):
     data = None if payload is None else json.dumps(payload, allow_nan=False).encode()
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        body = exc.read(4096).decode(errors='replace')
+        exc.close()
+        raise ServiceHTTPError(url, exc.code, body) from None
 
 
 def config():
@@ -168,9 +186,10 @@ async def reward(args, sample, **kwargs):
             result = await asyncio.get_running_loop().run_in_executor(
                 scoring_pool(c.get('reward_concurrency', 8)), request, c['scorer_url'] + '/score', payload, c['reward_timeout'])
             break
-        except urllib.error.HTTPError as exc:
+        except ServiceHTTPError as exc:
             if exc.code not in (408, 429, 500, 502, 503, 504) or attempt + 1 == c['reward_attempts']:
                 raise
+            print(f'MIXRL_REWARD_RETRY attempt {attempt + 1}/{c["reward_attempts"]}: {exc}', flush=True)
         except (OSError, TimeoutError):
             if attempt + 1 == c['reward_attempts']:
                 raise
