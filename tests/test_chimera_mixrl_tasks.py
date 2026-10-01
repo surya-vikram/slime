@@ -45,7 +45,7 @@ class TaskFileTests(unittest.TestCase):
         spec = tasks.load()
         self.assertEqual((len(spec['tasks']), len(spec['domains'])), (16, 9))
         resolved = tasks.resolved(spec)
-        self.assertEqual(resolved['rollout_batch_size'], 512)
+        self.assertEqual(resolved['rollout_batch_size'], 1008)
         self.assertEqual({n for n, t in spec['tasks'].items() if t['about']['judge'] == 'none'}, JUDGE_FREE)
         # "all": every validation prompt; 506 in total (v5), 52-57 per domain.
         self.assertEqual(sum(resolved['eval_quotas'].values()), 506)
@@ -119,10 +119,10 @@ class TaskFileTests(unittest.TestCase):
                                  str(self.write(self.only(*JUDGE_FREE, prompts=64))), '--samples-per-prompt', '8'],
                                 cwd=REPO, capture_output=True, text=True, check=True)
         self.assertIn('5 of 16 tasks enabled; 320 prompts per step x 8 responses = 2560 samples', result.stdout)
-        self.assertIn('eval: 185 prompts x 4 samples = 740 per eval; up to 0.29 training steps of tokens\n', result.stdout)
+        self.assertIn('eval: 185 prompts x 4 samples = 740 per eval; up to 0.32 training steps of tokens\n', result.stdout)
         self.assertIn('judge: not needed', result.stdout)
         self.assertRegex(result.stdout, r'math\s+1/2\s+64\s+29\s+29\s+no')
-        self.assertRegex(result.stdout, r'gsm8k_train\s+math\s+yes\s+64\s+4984\s+29\s+29\s+8192')
+        self.assertRegex(result.stdout, r'gsm8k_train\s+math\s+yes\s+64\s+4984\s+29\s+29\s+1024')
         self.assertRegex(result.stdout, r'grounding\s+0/1\s+0\s+-\s+-\s+-')
         bad = subprocess.run([sys.executable, '-m', 'slime_plugins.chimera_mixrl.tasks',
                               str(self.write(lambda s: s['tasks']['mcqa'].update(enabled=1)))],

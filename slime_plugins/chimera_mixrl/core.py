@@ -202,10 +202,11 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     pending = {r: 0 for r in quotas}
     informative = {r: [] for r in quotas}
     constant = {r: [] for r in quotas}
+    failed = {r: [] for r in quotas}
     budget = {r: quotas[r] * (1 + refill_rounds) for r in quotas}
     routes = deque(quotas)
     metrics = {r: {'attempted': 0, 'accepted': 0, 'constant': 0, 'refilled': 0, 'padding': 0,
-                   'all_correct': 0, 'all_wrong': 0,
+                   'all_correct': 0, 'all_wrong': 0, 'grade_failed': 0,
                    'score_sum': 0., 'responses': 0, 'capped': 0} for r in quotas}
 
     async def run():
@@ -236,9 +237,24 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
                 index += 1
                 group = await task
                 pending[route] -= 1
-                usable, scores, capped = assess(group)
+                outcome = assess(group)
+                usable, scores, capped = outcome[:3]
                 m = metrics[route]
                 m['attempted'] += 1
+                if len(outcome) > 3 and outcome[3]:
+                    # Some response could not be graded: no scores to count or train on.
+                    # Replace it like a constant group; use it only as zero-loss padding.
+                    failed[route].append(group)
+                    m['grade_failed'] += 1
+                    decision = 'grade_failed'
+                    if (len(informative[route]) + pending[route] < quotas[route]
+                            and attempts[route] < budget[route]):
+                        dispatch(route)
+                        m['refilled'] += 1
+                        decision = 'grade_failed_replaced'
+                    if event:
+                        event(route, job, group, decision)
+                    continue
                 m['score_sum'] += sum(scores)
                 m['responses'] += len(scores)
                 m['capped'] += sum(capped)
@@ -266,7 +282,7 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
             raise
         batch = []
         for route, quota in quotas.items():
-            padding = constant[route][:quota - len(informative[route])]
+            padding = (constant[route] + failed[route])[:quota - len(informative[route])]
             metrics[route]['padding'] = len(padding)
             batch.extend(informative[route] + padding)
         for m in metrics.values():

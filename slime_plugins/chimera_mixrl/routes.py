@@ -29,11 +29,16 @@ def evaluation_summary(groups):
     Each item is (frozen row, completed Samples); no dynamic filtering. pass@k
     here is observed any-pass among all k draws, only for binary routes.
     """
-    tasks, domains = {}, {}
+    tasks, domains, ungraded = {}, {}, {}
     for row, samples in groups:
         if not samples:
             raise ValueError('Missing evaluation responses')
         grades = [s.metadata['grade'] for s in samples]
+        if any(g.get('status') == 'grade_failed' for g in grades):
+            # The reward service could not grade a response after every retry: leave the
+            # prompt out of the score (never a zero) and report how many were left out.
+            ungraded[row['task']] = ungraded.get(row['task'], 0) + 1
+            continue
         if any(g.get('status') != 'valid' for g in grades):
             raise ValueError('Evaluation cannot aggregate failed grading')
         item = {'mean_score': statistics.mean(g['score'] for g in grades),
@@ -52,7 +57,12 @@ def evaluation_summary(groups):
                 for k in sorted(set().union(*(x.keys() for x in items)))} | {'prompts': len(items)}
 
     task_scores = {k: aggregate(v) for k, v in tasks.items()}
+    for task, count in ungraded.items():
+        task_scores.setdefault(task, {'prompts': 0})['ungraded_prompts'] = count
     domain_scores = {k: aggregate(v) for k, v in domains.items()}
     return {'tasks': task_scores, 'domains': domain_scores,
-            'equal_domain_mean': statistics.mean(x['mean_score'] for x in domain_scores.values()),
-            'aggregation': 'prompt mean within each domain, equal mean across enabled domains; no pass@k quality score'}
+            'equal_domain_mean': (statistics.mean(x['mean_score'] for x in domain_scores.values())
+                                  if domain_scores else 0.),
+            'ungraded_prompts': sum(ungraded.values()),
+            'aggregation': 'prompt mean within each domain, equal mean across enabled domains; no pass@k quality score; '
+                           'prompts with an ungradable response are left out'}
