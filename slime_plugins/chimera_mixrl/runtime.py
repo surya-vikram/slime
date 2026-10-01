@@ -193,7 +193,7 @@ async def reward(args, sample, **kwargs):
         except (OSError, TimeoutError):
             if attempt + 1 == c['reward_attempts']:
                 raise
-        await asyncio.sleep(min(2 ** attempt, 8))
+        await asyncio.sleep(min(2 ** attempt, int(os.environ.get('MIXRL_REWARD_BACKOFF_MAX', '8'))))
     if result['protocol_id'] != c['scorer_protocol'] or result['request_id'] != payload['request_id']:
         raise RuntimeError('Mismatched reward response identity')
     grade = result['grade']
@@ -314,15 +314,25 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 for path in old.glob('*.json'):
                     if path.stem.isdigit():
                         path.unlink()
-    health = await asyncio.to_thread(request, c['scorer_url'] + '/health')
-    if health['protocol_id'] != c['scorer_protocol']:
-        raise RuntimeError('Scorer protocol mismatch before rollout')
     # Checked before every batch: the judge can go down mid-run, and that must stop
     # training before generation, never turn judge-graded answers into zeros.
-    reasons = blocked(c['routes'], health)
+    # A judge or reward service that is restarting gets MIXRL_HEALTH_WAIT_SECONDS to return.
+    deadline = time.monotonic() + float(os.environ.get('MIXRL_HEALTH_WAIT_SECONDS', '0'))
+    while True:
+        try:
+            health = await asyncio.to_thread(request, c['scorer_url'] + '/health')
+            reasons = blocked(c['routes'], health)
+        except (OSError, ServiceHTTPError, ValueError) as exc:
+            health, reasons = None, {'reward service': f'{type(exc).__name__}: {exc}'}
+        if not reasons or time.monotonic() >= deadline:
+            break
+        print('MIXRL_HEALTH_WAIT ' + json.dumps(reasons), flush=True)
+        await asyncio.sleep(30)
     if reasons:
         raise RuntimeError('Reward service cannot grade enabled tasks: '
                            + '; '.join(f'{task}: {reason}' for task, reason in reasons.items()))
+    if health['protocol_id'] != c['scorer_protocol']:
+        raise RuntimeError('Scorer protocol mismatch before rollout')
     slots = asyncio.Semaphore(c['response_concurrency'])
     scoring_slots = asyncio.Semaphore(c.get('reward_concurrency', 8))
 
