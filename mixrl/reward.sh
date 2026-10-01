@@ -39,7 +39,7 @@ docker run -d --name "$CONTAINER" --net=host --ipc=host --restart=unless-stopped
     -e JUDGE_URL="$JUDGE_URL" -e JUDGE_NAME="$JUDGE_NAME" \
     -e JUDGE_CONTEXT="$JUDGE_CONTEXT" -e JUDGE_MAX_TOKENS="$JUDGE_MAX_TOKENS" \
     -e JUDGE_MAX_RETRY_TOKENS="$JUDGE_MAX_RETRY_TOKENS" -e JUDGE_CONCURRENCY="$JUDGE_CONCURRENCY" \
-    -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' -e CODE_IMAGE="$EVAL_IMAGE" \
+    -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' -e CODE_IMAGE="$EVAL_IMAGE" -e CODE_CONCURRENCY="$CODE_CONCURRENCY" \
     "$EVAL_IMAGE" -m eval_stack.reward_service \
     --data-dir "/data/datasets/$DATASET_NAME" --cache-dir /data/cache/scorer_cache \
     --host 127.0.0.1 --port "$REWARD_PORT" --workers "$REWARD_WORKERS" --judge-revision "$JUDGE_NAME" >/dev/null

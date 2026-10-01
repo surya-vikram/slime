@@ -1,5 +1,6 @@
 """Narrow Slime hooks. Imports GPU-stack modules only inside runtime functions."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 import math
@@ -25,6 +26,18 @@ def request(url, payload=None, timeout=600):
 
 def config():
     return json.loads(Path(os.environ['CHIMERA_MIXRL_CONFIG']).read_text())
+
+
+_scoring_pool = None
+
+
+def scoring_pool(size):
+    # asyncio.to_thread uses the loop's default executor: min(32, cpu_count + 4) threads,
+    # which silently capped reward-service requests (and so the judge) at 32 in flight.
+    global _scoring_pool
+    if _scoring_pool is None or _scoring_pool._max_workers < size:
+        _scoring_pool = ThreadPoolExecutor(max_workers=size, thread_name_prefix='mixrl-score')
+    return _scoring_pool
 
 
 class DataSource:
@@ -152,7 +165,8 @@ async def reward(args, sample, **kwargs):
     # Same immutable response/identity on retry, never generate a replacement answer.
     for attempt in range(c['reward_attempts']):
         try:
-            result = await asyncio.to_thread(request, c['scorer_url'] + '/score', payload, c['reward_timeout'])
+            result = await asyncio.get_running_loop().run_in_executor(
+                scoring_pool(c.get('reward_concurrency', 8)), request, c['scorer_url'] + '/score', payload, c['reward_timeout'])
             break
         except urllib.error.HTTPError as exc:
             if exc.code not in (408, 429, 500, 502, 503, 504) or attempt + 1 == c['reward_attempts']:

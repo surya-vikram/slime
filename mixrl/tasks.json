@@ -52,7 +52,7 @@
       "enabled": true,
       "prompts_per_step": 48,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 1024,
       "about": {
         "summary": "Grade-school math word problems (openai/gsm8k) with the final answer in \\boxed{}.",
         "grading": "math_verify checks the boxed answer against the gold number.",
@@ -72,7 +72,7 @@
       "enabled": true,
       "prompts_per_step": 48,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 3072,
       "about": {
         "summary": "Harder competition-style math with free-form answers (nvidia/Nemotron-RL-Math-v2).",
         "grading": "The judge decides whether the extracted final answer is equivalent to the reference.",
@@ -90,9 +90,9 @@
     },
     "mcqa": {
       "enabled": true,
-      "prompts_per_step": 32,
+      "prompts_per_step": 112,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Multiple-choice knowledge questions with up to ten options (nvidia/Nemotron-RL-knowledge-mcqa).",
         "grading": "The chosen label must equal the answer key: 1.0 in the format the prompt asks for, 0.5 in the other explicit format, 0 otherwise. pass@k counts only the requested format.",
@@ -110,9 +110,9 @@
     },
     "openqa": {
       "enabled": true,
-      "prompts_per_step": 32,
+      "prompts_per_step": 64,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 1024,
       "about": {
         "summary": "Open-ended knowledge questions answered in \\boxed{} (nvidia/Nemotron-RL-knowledge-openqa).",
         "grading": "The judge decides whether the boxed answer is equivalent to the reference.",
@@ -131,9 +131,9 @@
     },
     "science": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 32,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Open science questions; each prompt names its own final-answer format (nvidia/Nemotron-RL-Science-v1).",
         "grading": "The judge decides whether the extracted final answer is equivalent to the reference.",
@@ -152,9 +152,9 @@
     },
     "hotpot_train": {
       "enabled": true,
-      "prompts_per_step": 96,
+      "prompts_per_step": 128,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 1024,
       "about": {
         "summary": "Multi-hop questions answered only from supplied Wikipedia passages (hotpotqa, distractor setting).",
         "grading": "The judge checks the answer matches a reference alias and every claim is supported by the passages.",
@@ -172,9 +172,9 @@
     },
     "cascade_chat": {
       "enabled": true,
-      "prompts_per_step": 64,
+      "prompts_per_step": 128,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 4096,
       "about": {
         "summary": "General assistant requests (nvidia/Nemotron-Cascade-RL-RLHF, not list or plan prompts).",
         "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
@@ -194,7 +194,7 @@
       "enabled": true,
       "prompts_per_step": 16,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 4096,
       "about": {
         "summary": "Assistant requests that ask for a list or enumeration (nvidia/Nemotron-Cascade-RL-RLHF).",
         "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
@@ -212,9 +212,9 @@
     },
     "cascade_plans": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 8,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 4096,
       "about": {
         "summary": "Assistant requests that ask for a plan, itinerary or schedule (nvidia/Nemotron-Cascade-RL-RLHF).",
         "grading": "The judge scores 1-5 against a rubric, mapped to 0-1; failing an essential check scores 0.",
@@ -232,9 +232,9 @@
     },
     "nvidia_multichallenge": {
       "enabled": true,
-      "prompts_per_step": 32,
+      "prompts_per_step": 24,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Final turn of a multi-turn chat that tests memory of earlier instructions (Nemotron-RL-Multichallenge, vanilla).",
         "grading": "The judge answers each rubric check against the completed conversation, the response as its final turn; every check must pass.",
@@ -255,7 +255,7 @@
       "enabled": true,
       "prompts_per_step": 16,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Harder multi-turn chats with system personas and longer histories (Nemotron-RL-Multichallenge, advanced).",
         "grading": "The judge answers each rubric check against the completed conversation, the response as its final turn; every check must pass.",
@@ -274,9 +274,9 @@
     },
     "nemotron_if": {
       "enabled": true,
-      "prompts_per_step": 32,
+      "prompts_per_step": 144,
       "eval_prompts": "all",
-      "max_response_tokens": 4096,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Requests with verifiable format constraints such as case, length or punctuation (nvidia/Nemotron-RL-instruction_following).",
         "grading": "IFBench checkers test each constraint; all must pass.",
@@ -294,9 +294,9 @@
     },
     "structured_train": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 112,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Produce JSON, YAML, TOML or CSV that matches a given schema (Nemotron-RL-Instruction-Following-Structured-Outputs-v2).",
         "grading": "Data that parses and matches the schema goes to the judge, which must confirm the content; CSV cells are converted to the schema's types.",
@@ -316,9 +316,9 @@
     },
     "reasoning_gym": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 24,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Procedurally generated logic puzzles (nvidia/Nemotron-RL-ReasoningGym-v1).",
         "grading": "Exact match on the final answer; the judge re-checks only answers that miss.",
@@ -336,9 +336,9 @@
     },
     "calendar": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 72,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 2048,
       "about": {
         "summary": "Multi-turn scheduling: return a JSON calendar that satisfies every time constraint (Nemotron-RL-Instruction-Following-Calendar-v2).",
         "grading": "A deterministic checker validates the final calendar against every constraint.",
@@ -354,9 +354,9 @@
     },
     "apps": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 32,
       "eval_prompts": "all",
-      "max_response_tokens": 8192,
+      "max_response_tokens": 4096,
       "about": {
         "summary": "Competitive programming problems solved in Python (codeparrot/apps).",
         "grading": "The last Python code block runs against the problem's tests in a Docker sandbox; needs the APPS audit (MIXRL_CODE_AUDIT_DIR).",
