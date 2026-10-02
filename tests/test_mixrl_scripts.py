@@ -222,7 +222,7 @@ class ScriptTests(unittest.TestCase):
             self.assertIn(flag, run)
         self.assertNotIn('--max-num-seqs', run)  # no cap unless JUDGE_MAX_NUM_SEQS is set
         result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_DP='1',
-                                 JUDGE_MAX_NUM_SEQS='512')
+                                 JUDGE_MAX_NUM_SEQS='512', JUDGE_SPECULATIVE='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         run = [c for c in self.calls('docker') if c[0] == 'run'][-1]
         self.assertEqual(run[run.index('--max-num-seqs') + 1], '512')
@@ -241,7 +241,7 @@ class ScriptTests(unittest.TestCase):
                             ('--served-model-name', 'mixrl-judge'), ('--host', '127.0.0.1')):
             self.assertEqual(call[call.index(flag) + 1], value)
         (self.base / 'models/judge-assistant').mkdir()
-        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2')
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_SPECULATIVE='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         run = next(c for c in self.calls('docker') if c[0] == 'run')
         self.assertEqual(run[run.index('--gpus') + 1], '"device=2,3"')
