@@ -31,6 +31,10 @@ that are already running are reused; after changing their settings restart one w
 `mixrl/judge.sh` or `mixrl/reward.sh` (`stop` stops it). Their startup output goes to the
 run's `logs/` folder (`judge_start.log`, `reward_start.log`, `preflight.log`, `tasks.txt`).
 
+`resume` needs checkpoints with optimizer state: start runs you may resume with
+`NO_SAVE_OPTIM=0` (the default `1` saves weights only, and `resume` refuses such a run).
+It also needs the settings the run started with; a refused resume names what differs.
+
 The run name only names the output folder, `$BASE_DIR/runs/chimera/mixrl/<name>/`
 (checkpoints, logs, evals, and a frozen copy of the settings and tasks it ran with).
 `start` refuses a name that already has rollouts or checkpoints (a start that failed
@@ -57,6 +61,12 @@ Edit `config.env`, or override for one command:
 ```bash
 LR=2e-6 NUM_ROLLOUT=200 mixrl/run.sh start run-b
 ```
+
+Launcher switches that have no `config.env` entry (in `mixrl/internal/launch.sh`, e.g.
+`MIXRL_PIPELINE_SECONDS`) can be set the same way. A `MIXRL_`/`CHIMERA_`/`SGLANG_`/`JUDGE_`/`REWARD_`
+variable that is no setting at all gets a warning, so a typo does not pass silently. Each run's
+terminal shows a `settings` line with what its processes actually use (from the resolved config
+and the train command).
 
 Defaults are set for 6 training H200s (`TRAIN_GPUS=0,1,2,3,4,5`) and a judge on GPUs 6,7.
 Training won't start, and says why, when a task needs a judge that is down, the reward
@@ -122,6 +132,7 @@ Megatron-LM style of `key: value` fields:
 
 ```
 [2026-10-02 10:47:48] MixRL run mix-16r (new) | model: zoro2 | training GPUs: 6 (EP 1) | SGLang engines: 6 | batch: 1008 prompts x 16 = 16128 samples | steps: 1000 | eval every 10 | save every 20
+[2026-10-02 10:47:48] settings | tasks: mixrl/tasks.json | rollout: temperature 1.0, top-p 0.95, top-k 20 | R3 replay: on | refill rounds: 2 | oversample: 0.3 | in flight: 3200 responses, 1400 grading, 100000 groups | reward services: 4 | SGLang per engine: 1024 running, request cap 534, CUDA graphs to 1024, memory 0.80 | distributed post: on | keep train responses: 0 | lr: 1e-06 | max tokens/GPU: 16384
 [2026-10-02 10:53:40] ready | startup: 5m52s | models loaded, weights in SGLang
 [2026-10-02 10:54:40] step 1 rollout | 1m00s | done: 911 | generating: 2332 | grading: 373 | gen: 2.2k tok/s | sglang: 2047 running, 286 waiting, KV 16% | judge: 415 running, KV 6%
 [2026-10-02 11:13:22] step    1/1000 | step time: 20m02s | ETA: 13d21h | reward: 0.412 | loss: -6.6485E-02 | grad norm: 0.154 | entropy: 0.655 | lr: 5.00E-08 | logprob diff: 0.0050 | rollout KL: 1.20E-04 | IS masked: 0% | router cv: 1.04
