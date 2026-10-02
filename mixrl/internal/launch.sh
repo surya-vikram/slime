@@ -143,7 +143,8 @@ MEGATRON_ROOT=${MEGATRON_ROOT:-/root/Megatron-LM}
 # logs/metrics.jsonl. MIXRL_CONSOLE=full shows every line. If the view stops, train.log carries on.
 # Cleanup steps registered below run first; then the log is flushed.
 mkdir -p "$LOG_DIR"
-LOG_OFFSET=$(wc -l < "$LOG_DIR/train.log" 2>/dev/null || echo 0)
+LOG_OFFSET=0  # lines already in train.log (retry/resume), so the view can point at train.log line numbers
+if [[ -f "$LOG_DIR/train.log" ]]; then LOG_OFFSET=$(wc -l < "$LOG_DIR/train.log"); fi
 export MIXRL_CONSOLE MIXRL_CONSOLE_PROGRESS_SECONDS
 if [[ "$DRY_RUN" == 1 || "$PREFLIGHT_ONLY" == 1 ]]; then MIXRL_CONSOLE=full; fi  # checks print everything
 exec > >(tee -a --output-error=warn-nopipe "$LOG_DIR/train.log" \

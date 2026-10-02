@@ -203,7 +203,8 @@ class Console:
         # Tokens count when a response finishes, so one heartbeat's rate jumps; average since the last line.
         self.rates.append(p.get('gen_tokens_per_s', 0))
         now = self.clock()
-        if self.last_progress is not None and now - self.last_progress < self.progress_seconds:
+        # Heartbeats come every MIXRL_PIPELINE_SECONDS with some jitter: allow 10% so a line is not skipped.
+        if self.last_progress is not None and now - self.last_progress < 0.9 * self.progress_seconds:
             return
         self.last_progress, gen_rate, self.rates = now, statistics.mean(self.rates), []
         what = f'eval after {self.updates(rid)} steps' if evaluating else f'step {rid + 1} rollout'
