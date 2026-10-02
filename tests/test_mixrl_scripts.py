@@ -172,6 +172,49 @@ class ScriptTests(unittest.TestCase):
                          '--judge-revision', 'mixrl-judge', self.env['REWARD_PORT']):
             self.assertIn(expected, run)
 
+    def test_reward_service_several_processes(self):
+        # Two stub reward services on consecutive ports.
+        while True:
+            first = ThreadingHTTPServer(('127.0.0.1', 0), Services)
+            try:
+                second = ThreadingHTTPServer(('127.0.0.1', first.server_port + 1), Services)
+                break
+            except OSError:
+                first.server_close()
+        for server in (first, second):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        port = first.server_port
+        result = self.run_script('reward.sh', REWARD_PROCESSES='2', REWARD_PORT=str(port), JUDGE_CONCURRENCY='256',
+                                 REWARD_WORKERS='768', CODE_CONCURRENCY='16')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Reward service ready (2 processes)', result.stdout)
+        runs = [c for c in self.calls('docker') if c[0] == 'run']
+        self.assertEqual(len(runs), 2)
+        for i, run in enumerate(runs):
+            self.assertEqual(run[run.index('--name') + 1], f'mixrl-reward-service-{i}')
+            self.assertEqual(run[run.index('--port') + 1], str(port + i))
+            self.assertIn(f'{self.base}/cache/scorer_cache/w{i}:/data/cache/scorer_cache', run)
+            # Totals are split across the processes.
+            for expected in ('JUDGE_CONCURRENCY=128', 'CODE_CONCURRENCY=8'):
+                self.assertIn(expected, run)
+            self.assertEqual(run[run.index('--workers') + 1], '384')
+
+    def test_judge_replicas_and_speculative_switch(self):
+        (self.base / 'models/judge-assistant').mkdir()
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='1', JUDGE_DP='2',
+                                 JUDGE_SPECULATIVE='0', JUDGE_MAX_NUM_BATCHED_TOKENS='65536', JUDGE_API_SERVERS='4')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = next(c for c in self.calls('docker') if c[0] == 'run')
+        for flag, value in (('--tensor-parallel-size', '1'), ('--data-parallel-size', '2'),
+                            ('--max-num-batched-tokens', '65536'), ('--api-server-count', '4')):
+            self.assertEqual(run[run.index(flag) + 1], value)
+        self.assertNotIn('--speculative-config', run)
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='1', JUDGE_DP='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('JUDGE_TP x JUDGE_DP = 1 x 1', result.stderr)
+
     def test_judge_native_and_docker(self):
         result = self.run_script('judge.sh')
         self.assertEqual(result.returncode, 0, result.stderr)

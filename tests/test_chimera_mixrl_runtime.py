@@ -323,21 +323,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             # A truncated response never reached the stop; its text is graded as generated.
             self.assertTrue(group[2].metadata['grading_text'].endswith('<end_of_turn>'))
 
-    async def test_keep_train_samples_zero_drops_finished_steps_response_files_but_keeps_summaries(self):
-        old = Path(self.c['run_dir']) / 'rollouts' / 'train-0'
-        old.mkdir(parents=True)
-        for name in ('3.json', 'metrics.json', 'timing.json', 'collection.jsonl'):
-            (old / name).write_text('{}')
-        with patch.dict(os.environ, {'MIXRL_KEEP_TRAIN_SAMPLES': '0'}):
-            await runtime._rollout(self.args, 1, self.source)
-        self.assertEqual(sorted(p.name for p in old.iterdir()), ['collection.jsonl', 'metrics.json', 'timing.json'])
-        current = Path(self.c['run_dir']) / 'rollouts' / 'train-1'
-        self.assertTrue(any(p.stem.isdigit() for p in current.glob('*.json')))  # this step's retry files stay
-        (old / '3.json').write_text('{}')
+    async def test_training_responses_are_written_only_when_kept_and_eval_always_without_routes(self):
+        rollouts = Path(self.c['run_dir']) / 'rollouts'
         with patch.dict(os.environ):
-            os.environ.pop('MIXRL_KEEP_TRAIN_SAMPLES', None)  # default: keep
-            await runtime._rollout(self.args, 2, self.source)
-        self.assertTrue((old / '3.json').exists())
+            os.environ.pop('MIXRL_KEEP_TRAIN_SAMPLES', None)  # default: summaries only
+            await runtime._rollout(self.args, 0, self.source)
+        names = sorted(p.name for p in (rollouts / 'train-0').iterdir())
+        self.assertFalse([n for n in names if n.split('.')[0].isdigit()], names)
+        self.assertIn('collection.jsonl', names)
+        with patch.dict(os.environ, {'MIXRL_KEEP_TRAIN_SAMPLES': '1'}):
+            await runtime._rollout(self.args, 1, self.source)
+        self.assertTrue(any(p.stem.isdigit() for p in (rollouts / 'train-1').glob('*.json')))
+        await runtime._rollout(self.args, 1, self.source, evaluation=True)
+        saved = [json.loads(p.read_text()) for p in next(rollouts.glob('eval-*')).glob('[0-9]*.json')]
+        self.assertTrue(saved)
+        self.assertTrue(all(r.get('rollout_routed_experts') is None for r in saved))
+        self.assertTrue(all(r.get('reward') is not None for r in saved))
 
     async def test_truncated_responses_score_zero_without_a_request(self):
         output = await runtime._rollout(self.args, 0, self.source)
@@ -457,6 +458,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(maximum, 1)
         self.assertEqual(self.judged, 4)
 
+    @patch.dict(os.environ, {'MIXRL_KEEP_TRAIN_SAMPLES': '1'})
     async def test_failed_batch_reuses_persisted_completions(self):
         before = self.source.sampler.snapshot()
         self.fail_judge = True
@@ -491,6 +493,49 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.fail_judge = False
         await runtime._rollout(self.args, 0, self.source, evaluation=True)
         self.assertFalse(saved_ids & set(self.started))
+
+
+
+class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def test_each_request_and_its_retries_go_to_one_reward_process(self):
+        from slime_plugins.chimera_mixrl.core import digest
+        c = {'scorer_url': 'http://a', 'scorer_urls': ['http://a', 'http://b', 'http://c']}
+        ids = [digest(['run', i]) for i in range(300)]
+        chosen = [runtime.scorer_url(c, i) for i in ids]
+        self.assertEqual(chosen, [runtime.scorer_url(c, i) for i in ids])  # stable across retries
+        counts = {u: chosen.count(u) for u in c['scorer_urls']}
+        self.assertTrue(all(70 < n < 130 for n in counts.values()), counts)  # spread evenly
+        self.assertEqual(runtime.scorer_url({'scorer_url': 'http://a'}, ids[0]), 'http://a')
+
+    async def test_pipeline_line_reports_flow_and_loop_lag(self):
+        import contextlib, io
+        flow = {'gen_queued': 3, 'generating': 5, 'grade_queued': 1, 'grading': 2, 'done': 7, 'gen_tokens': 0}
+        args = types.SimpleNamespace(sglang_router_ip='127.0.0.1', sglang_router_port=1)
+        out = io.StringIO()
+        with patch.dict(os.environ, {'MIXRL_JUDGE_METRICS_URL': 'http://127.0.0.1:1/metrics'}), contextlib.redirect_stdout(out):
+            task = asyncio.create_task(runtime.pipeline_heartbeat(args, 4, 'train', flow, .05))
+            flow['gen_tokens'] = 50
+            await asyncio.sleep(.2)
+            task.cancel()
+        line = json.loads(next(l for l in out.getvalue().splitlines() if l.startswith('MIXRL_PIPELINE ')).split(' ', 1)[1])
+        self.assertEqual((line['rollout_id'], line['phase'], line['generating'], line['grading']), (4, 'train', 5, 2))
+        self.assertGreaterEqual(line['loop_lag_ms'], 0)
+        self.assertNotIn('sglang', line)  # unreachable endpoints are left out, never fatal
+        self.assertNotIn('judge', line)
+
+    def test_judge_metrics_parsing(self):
+        text = """# HELP vllm:num_requests_running x
+vllm:num_requests_running{engine="0",model_name="j"} 12.0
+vllm:num_requests_running{engine="1",model_name="j"} 8.0
+vllm:num_requests_waiting{engine="0",model_name="j"} 3.0
+vllm:kv_cache_usage_perc{engine="0",model_name="j"} 0.5
+vllm:kv_cache_usage_perc{engine="1",model_name="j"} 0.7
+"""
+        class Response(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        with patch.object(runtime.urllib.request, 'urlopen', lambda url, timeout: Response(text.encode())):
+            self.assertEqual(runtime._judge_load('http://j/metrics'), {'running': 20.0, 'waiting': 3.0, 'kv_usage': 0.6})
 
 
 if __name__ == '__main__':

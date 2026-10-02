@@ -190,9 +190,13 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     per task per step. A task that stays short fills its remaining slots with its
     constant groups (zero loss), so every step has the same batch shape.
 
-    Groups are resolved in proposal order, not completion order, so the sequence of
-    replacement proposals depends only on outcomes: a retried step proposes the same
-    prompts and can reuse its saved responses. Informative groups never exceed the quota.
+    Groups are assessed as soon as they finish, and a replacement is dispatched at once, so
+    a slow group no longer holds back refills for groups proposed after it. The refill rule
+    (informative + pending < quota, i.e. attempts < quota + uniform groups so far) depends only
+    on how many groups turned out uniform, not on their order, so the same replacement prompts
+    are proposed as with in-order resolution. The batch is still taken in proposal order, so
+    it depends only on outcomes: a retried step proposes and selects the same prompts.
+    Informative groups never exceed the quota.
     """
     if not quotas or any(type(v) is not int or v < 1 for v in quotas.values()):
         raise ValueError('Quotas must be positive integer sampled-group counts')
@@ -212,7 +216,8 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     async def run():
         started = time.monotonic()
         slots = asyncio.Semaphore(inflight)
-        jobs = []
+        jobs = []      # (route, job, task) in proposal order
+        running = {}   # task -> proposal index
 
         async def bounded(job):
             async with slots:
@@ -220,9 +225,50 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
 
         def dispatch(route):
             job = propose(route)
-            jobs.append((route, job, asyncio.create_task(bounded(job))))
+            task = asyncio.create_task(bounded(job))
+            running[task] = len(jobs)
+            jobs.append((route, job, task))
             attempts[route] += 1
             pending[route] += 1
+
+        def short(route):
+            # Still short even if every pending group turns out informative.
+            return len(informative[route]) + pending[route] < quotas[route] and attempts[route] < budget[route]
+
+        def resolve(index, route, job, group):
+            outcome = assess(group)
+            usable, scores, capped = outcome[:3]
+            m = metrics[route]
+            m['attempted'] += 1
+            if len(outcome) > 3 and outcome[3]:
+                # Some response could not be graded: no scores to count or train on.
+                # Replace it like a constant group; use it only as zero-loss padding.
+                failed[route].append((index, group))
+                m['grade_failed'] += 1
+                decision = 'grade_failed'
+                if short(route):
+                    dispatch(route)
+                    m['refilled'] += 1
+                    decision = 'grade_failed_replaced'
+            else:
+                m['score_sum'] += sum(scores)
+                m['responses'] += len(scores)
+                m['capped'] += sum(capped)
+                m['all_correct'] += int(not any(capped) and all(s == 1 for s in scores))
+                m['all_wrong'] += int(not any(capped) and all(s == 0 for s in scores))
+                if usable:
+                    informative[route].append((index, group))
+                    decision = 'accepted'
+                else:
+                    constant[route].append((index, group))
+                    decision = 'constant'
+                    if short(route):
+                        dispatch(route)
+                        m['refilled'] += 1
+                        decision = 'replaced'
+                m['accepted' if usable else 'constant'] += 1
+            if event:
+                event(route, job, group, decision)
 
         try:
             while any(attempts[r] < quotas[r] for r in quotas):
@@ -231,60 +277,28 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
                     routes.rotate(-1)
                 routes.rotate(-1)
                 dispatch(route)
-            index = 0
-            while index < len(jobs):
-                route, job, task = jobs[index]
-                index += 1
-                group = await task
-                pending[route] -= 1
-                outcome = assess(group)
-                usable, scores, capped = outcome[:3]
-                m = metrics[route]
-                m['attempted'] += 1
-                if len(outcome) > 3 and outcome[3]:
-                    # Some response could not be graded: no scores to count or train on.
-                    # Replace it like a constant group; use it only as zero-loss padding.
-                    failed[route].append(group)
-                    m['grade_failed'] += 1
-                    decision = 'grade_failed'
-                    if (len(informative[route]) + pending[route] < quotas[route]
-                            and attempts[route] < budget[route]):
-                        dispatch(route)
-                        m['refilled'] += 1
-                        decision = 'grade_failed_replaced'
-                    if event:
-                        event(route, job, group, decision)
-                    continue
-                m['score_sum'] += sum(scores)
-                m['responses'] += len(scores)
-                m['capped'] += sum(capped)
-                m['all_correct'] += int(not any(capped) and all(s == 1 for s in scores))
-                m['all_wrong'] += int(not any(capped) and all(s == 0 for s in scores))
-                if usable:
-                    informative[route].append(group)
-                    decision = 'accepted'
-                else:
-                    constant[route].append(group)
-                    decision = 'constant'
-                    if (len(informative[route]) + pending[route] < quotas[route]
-                            and attempts[route] < budget[route]):
-                        dispatch(route)
-                        m['refilled'] += 1
-                        decision = 'replaced'
-                m['accepted' if usable else 'constant'] += 1
-                if event:
-                    event(route, job, group, decision)
+            while running:
+                done, _ = await asyncio.wait(list(running), return_when=asyncio.FIRST_COMPLETED)
+                # Groups that finish together are handled in proposal order.
+                for task in sorted(done, key=running.get):
+                    index = running.pop(task)
+                    route, job, _ = jobs[index]
+                    group = task.result()
+                    pending[route] -= 1
+                    resolve(index, route, job, group)
         except BaseException:
             tasks = [task for _, _, task in jobs]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        ordered = lambda pairs: [group for _, group in sorted(pairs, key=lambda pair: pair[0])]
         batch = []
         for route, quota in quotas.items():
-            padding = (constant[route] + failed[route])[:quota - len(informative[route])]
+            chosen = ordered(informative[route])
+            padding = (ordered(constant[route]) + ordered(failed[route]))[:quota - len(chosen)]
             metrics[route]['padding'] = len(padding)
-            batch.extend(informative[route] + padding)
+            batch.extend(chosen + padding)
         for m in metrics.values():
             m['raw_reward_mean'] = m['score_sum'] / max(1, m['responses'])
             m['acceptance_rate'] = m['accepted'] / max(1, m['attempted'])

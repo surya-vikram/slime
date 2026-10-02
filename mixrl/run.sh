@@ -91,7 +91,13 @@ else
     # The reward service's and Docker judge's output during this run, next to train.log.
     mkdir -p "$run_dir/logs" 2>/dev/null || true
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    for service in mixrl-reward-service:reward_service mixrl-judge-server:judge; do
+    # Several reward-service processes (REWARD_PROCESSES > 1) log to reward_service-<i>.log.
+    services=()
+    for container in $(docker ps --format '{{.Names}}' --filter 'name=^mixrl-reward-service(-[0-9]+)?$' | sort); do
+        services+=("$container:reward_service${container#mixrl-reward-service}")
+    done
+    services+=(mixrl-judge-server:judge)
+    for service in "${services[@]}"; do
         container=${service%%:*}
         if ! docker ps -q --filter "name=^$container$" | grep -q .; then continue; fi
         if [[ ! -w "$run_dir/logs" ]]; then

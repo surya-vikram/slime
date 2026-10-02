@@ -238,7 +238,9 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         for result in (first, second):
             for metrics in result[1].values():
                 self.assertGreater(metrics.pop('collection_seconds'), 0)
-        self.assertEqual(first, second)
+        # Same batch and counts; events are logged as groups finish, so only their set matches.
+        self.assertEqual(first[:2], second[:2])
+        self.assertEqual(sorted(first[2]), sorted(second[2]))
 
     async def test_constant_groups_do_not_trigger_replacement(self):
         async def execute(job):
@@ -295,7 +297,44 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         for groups, metrics, events in (slow_first, slow_second):
             self.assertEqual(groups, [('a', 2), ('a', 3)])
             self.assertEqual(metrics['a']['attempted'], 3)
-        self.assertEqual(slow_first[2], slow_second[2])
+        self.assertEqual(sorted(slow_first[2]), sorted(slow_second[2]))
+
+    async def test_refill_starts_before_a_slow_earlier_group_finishes(self):
+        # Proposal 1 is a straggler; proposal 2 is uniform and fast. Its replacement must start
+        # right away, not after the straggler (which in-order resolution waited for).
+        timeline = []
+        proposals = {'a': 0}
+        def propose(route):
+            proposals[route] += 1
+            timeline.append(('proposed', proposals[route]))
+            return route, proposals[route]
+        async def execute(job):
+            await asyncio.sleep(.05 if job[1] == 1 else .001)
+            timeline.append(('finished', job[1]))
+            return job
+        def assess(job):
+            usable = job[1] != 2
+            return usable, [1., 0.] if usable else [0., 0.], [False, False]
+        groups, metrics = await collect({'a': 2}, propose, execute, assess, inflight=4, refill_rounds=1)
+        self.assertEqual(groups, [('a', 1), ('a', 3)])
+        self.assertLess(timeline.index(('proposed', 3)), timeline.index(('finished', 1)))
+
+    async def test_batch_and_proposals_do_not_depend_on_finishing_order(self):
+        import random
+        outcomes = {'a': [False, True, False, False, True, True, False, True, True, True],
+                    'b': [False, False, False, True, False, True, True, True, True, True]}
+        reference = None
+        for seed in range(20):
+            rng = random.Random(seed)
+            delays = {(r, k): rng.choice([.0001, .001, .004]) for r in outcomes for k in range(1, 11)}
+            groups, metrics, events = await self.refill(outcomes, {'a': 3, 'b': 2}, 2, delays=delays)
+            for m in metrics.values():
+                m.pop('collection_seconds')
+            proposed = sorted(j for j, _ in events)
+            result = (groups, metrics, proposed)
+            if reference is None:
+                reference = result
+            self.assertEqual(result, reference)
 
     async def test_timeout_cancels_work(self):
         stopped = []

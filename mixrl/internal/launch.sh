@@ -37,7 +37,12 @@ MCORE_CHECKPOINT=${MCORE_CHECKPOINT:-$DATA_ROOT/models/$MODEL_NAME/mcore}
 CHIMERA_TRANSFORMERS_ROOT=${CHIMERA_TRANSFORMERS_ROOT:-/workspace/transformers}
 MIXRL_DATA_DIR=${MIXRL_DATA_DIR:-$DATA_ROOT/datasets/$DATASET_NAME}
 MIXRL_CODE_AUDIT_DIR=${MIXRL_CODE_AUDIT_DIR:-$MIXRL_DATA_DIR/audits/apps} # Reference+negative sandbox report.
-MIXRL_SCORER_URL=${MIXRL_SCORER_URL:-http://127.0.0.1:$REWARD_PORT}
+if [[ -z "${MIXRL_SCORER_URL:-}" ]]; then
+    # One URL per reward-service process (mixrl/reward.sh starts them on consecutive ports).
+    scorer_urls=()
+    for ((i = 0; i < ${REWARD_PROCESSES:-1}; i++)); do scorer_urls+=("http://127.0.0.1:$((REWARD_PORT + i))"); done
+    MIXRL_SCORER_URL=$(IFS=,; echo "${scorer_urls[*]}")
+fi
 MIXRL_TASKS_CONFIG=${MIXRL_TASKS_CONFIG:-$MIXRL_DIR/tasks.json}
 INITIAL_ACTOR_CHECKPOINT=${INITIAL_ACTOR_CHECKPOINT:-} # Fresh RL from other MCore weights (not optimizer).
 SAVE_HF=${SAVE_HF:-0} # Opt-in native HF export beside MCore saves; Qwen validation only.
@@ -49,7 +54,10 @@ GPU_METRICS_INTERVAL=${GPU_METRICS_INTERVAL:-5} # Seconds; 0 disables nvidia-smi
 # Opt-in budget starts before model initialization. Reserve includes final eval/save.
 MIXRL_HEALTH_WAIT_SECONDS=${MIXRL_HEALTH_WAIT_SECONDS:-0} # >0: before a batch, wait this long for an unreachable judge/reward service instead of stopping.
 MIXRL_REWARD_BACKOFF_MAX=${MIXRL_REWARD_BACKOFF_MAX:-8}   # Longest sleep (s) between /score retries.
+MIXRL_PIPELINE_SECONDS=${MIXRL_PIPELINE_SECONDS:-30} # MIXRL_PIPELINE line interval during collection; 0 turns it off.
+MIXRL_JUDGE_METRICS_URL=${MIXRL_JUDGE_METRICS_URL:-http://${JUDGE_HOST:-127.0.0.1}:${JUDGE_PORT:-8025}/metrics} # Judge load in that line.
 export MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE MIXRL_KEEP_TRAIN_SAMPLES MIXRL_HEALTH_WAIT_SECONDS MIXRL_REWARD_BACKOFF_MAX
+export MIXRL_PIPELINE_SECONDS MIXRL_JUDGE_METRICS_URL
 export MIXRL_FINAL_RESERVE_SECONDS=${MIXRL_FINAL_RESERVE_SECONDS:-1200}
 export MIXRL_INITIAL_UPDATE_SECONDS=${MIXRL_INITIAL_UPDATE_SECONDS:-300}
 OFFLOAD_TRAIN=${OFFLOAD_TRAIN:-1} # Small-reference-model residency experiment only.
@@ -536,6 +544,8 @@ keys = (
     "MIXRL_KEEP_TRAIN_SAMPLES",
     "MIXRL_HEALTH_WAIT_SECONDS",
     "MIXRL_REWARD_BACKOFF_MAX",
+    "MIXRL_PIPELINE_SECONDS",
+    "MIXRL_JUDGE_METRICS_URL",
     "CHIMERA_MATCH_DENSE_SWIGLU",
     "CHIMERA_SGLANG_FULL_BF16_REDUCTION",
 )

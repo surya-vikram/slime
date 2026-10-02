@@ -42,8 +42,27 @@ def request(url, payload=None, timeout=600):
         raise ServiceHTTPError(url, exc.code, body) from None
 
 
+_config_cache = {}
+
+
 def config():
-    return json.loads(Path(os.environ['CHIMERA_MIXRL_CONFIG']).read_text())
+    # Written once at launch and never changed during a run, but read per response and per
+    # microbatch: parse it once per file version instead of on every call.
+    path = os.environ['CHIMERA_MIXRL_CONFIG']
+    stamp = os.stat(path).st_mtime_ns
+    cached = _config_cache.get(path)
+    if cached is None or cached[0] != stamp:
+        cached = _config_cache[path] = (stamp, json.loads(Path(path).read_text()))
+    return cached[1]
+
+
+def scorer_url(c, request_id=None):
+    """Reward-service base URL. With several reward-service processes (each its own cache),
+    a request and every retry of it go to the same process, chosen by its request id."""
+    urls = c.get('scorer_urls') or [c['scorer_url']]
+    if request_id is None or len(urls) == 1:
+        return urls[0]
+    return urls[int(request_id[:8], 16) % len(urls)]
 
 
 # A response the reward service could not grade after every retry. It never gets a score:
@@ -65,6 +84,18 @@ def scoring_pool(size):
     if _scoring_pool is None or _scoring_pool._max_workers < size:
         _scoring_pool = ThreadPoolExecutor(max_workers=size, thread_name_prefix='mixrl-score')
     return _scoring_pool
+
+
+_persist_pool = None
+
+
+def persist_pool():
+    # Response files are written off the event loop: serializing a long response with its
+    # expert routes takes tens to hundreds of milliseconds and would stall every request.
+    global _persist_pool
+    if _persist_pool is None:
+        _persist_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='mixrl-save')
+    return _persist_pool
 
 
 class DataSource:
@@ -194,7 +225,8 @@ async def reward(args, sample, **kwargs):
     for attempt in range(c['reward_attempts']):
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                scoring_pool(c.get('reward_concurrency', 8)), request, c['scorer_url'] + '/score', payload, c['reward_timeout'])
+                scoring_pool(c.get('reward_concurrency', 8)), request, scorer_url(c, payload['request_id']) + '/score',
+                payload, c['reward_timeout'])
             break
         except ServiceHTTPError as exc:
             if exc.code not in (408, 429, 500, 502, 503, 504):
@@ -285,6 +317,79 @@ def validate_group(group, n):
         raise ValueError('Mixed/duplicate/out-of-order response identities')
 
 
+def _load_numbers(load, out):
+    # SGLang /v1/loads payloads differ across versions: collect the fields wherever they sit.
+    if isinstance(load, list):
+        for item in load:
+            _load_numbers(item, out)
+    elif isinstance(load, dict):
+        for key, value in load.items():
+            if key in ('num_running_reqs', 'num_waiting_reqs') and isinstance(value, (int, float)):
+                out[key] = out.get(key, 0) + value
+            elif key == 'token_usage' and isinstance(value, (int, float)):
+                out.setdefault('token_usage', []).append(value)
+            elif isinstance(value, (dict, list)):
+                _load_numbers(value, out)
+
+
+async def _sglang_load(args):
+    from slime.utils.http_utils import get
+    workers = await get(f'http://{args.sglang_router_ip}:{args.sglang_router_port}/workers')
+    out = {}
+    for worker in workers.get('workers', []):
+        _load_numbers(await get(f"{worker['url']}/v1/loads?include=core"), out)
+    usage = out.pop('token_usage', None)
+    return {'running': out.get('num_running_reqs'), 'waiting': out.get('num_waiting_reqs'),
+            'kv_usage': round(sum(usage) / len(usage), 3) if usage else None}
+
+
+def _judge_load(url):
+    # vLLM Prometheus text: sum running/waiting over engines, mean KV-cache usage.
+    with urllib.request.urlopen(url, timeout=5) as response:
+        text = response.read().decode()
+    sums, kv = {}, []
+    for line in text.splitlines():
+        if line.startswith('#') or ' ' not in line:
+            continue
+        name, value = line.split('{', 1)[0].split(' ', 1)[0], line.rsplit(' ', 1)[1]
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        if name in ('vllm:num_requests_running', 'vllm:num_requests_waiting'):
+            sums[name.split('_')[-1]] = sums.get(name.split('_')[-1], 0) + number
+        elif name in ('vllm:kv_cache_usage_perc', 'vllm:gpu_cache_usage_perc'):
+            kv.append(number)
+    return {'running': sums.get('running'), 'waiting': sums.get('waiting'),
+            'kv_usage': round(sum(kv) / len(kv), 3) if kv else None}
+
+
+async def pipeline_heartbeat(args, rollout_id, phase, flow, interval):
+    """Every `interval` seconds: where the responses are, how late the event loop runs, and how
+    busy SGLang and the judge are. A large loop lag means this process, not the GPUs, is the
+    bottleneck; few running requests with a long grade queue means grading is."""
+    loop, started, tokens = asyncio.get_running_loop(), time.monotonic(), 0
+    judge_url = os.environ.get('MIXRL_JUDGE_METRICS_URL', '')
+    while True:
+        tick = loop.time()
+        await asyncio.sleep(interval)
+        lag = loop.time() - tick - interval
+        line = {'rollout_id': rollout_id, 'phase': phase, 'seconds': round(time.monotonic() - started),
+                **{k: v for k, v in flow.items() if k != 'gen_tokens'},
+                'gen_tokens_per_s': round((flow['gen_tokens'] - tokens) / interval), 'loop_lag_ms': round(lag * 1000)}
+        tokens = flow['gen_tokens']
+        try:
+            line['sglang'] = await asyncio.wait_for(_sglang_load(args), 5)
+        except Exception:
+            pass
+        if judge_url:
+            try:
+                line['judge'] = await asyncio.wait_for(asyncio.to_thread(_judge_load, judge_url), 6)
+            except Exception:
+                pass
+        print('MIXRL_PIPELINE ' + json.dumps(line), flush=True)
+
+
 async def gather_cancel(coros):
     tasks = [asyncio.create_task(c) for c in coros]
     try:
@@ -325,25 +430,25 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         version = rollout_id
     directory = source.run_dir / 'rollouts' / f'{phase}-{version}'
     directory.mkdir(parents=True, exist_ok=True)
-    if not evaluation and os.environ.get('MIXRL_KEEP_TRAIN_SAMPLES', '1') == '0':
-        # A finished step's per-response files (tokens, log-probs, expert routes, top-p sets:
-        # up to MBs each) only serve a retry of that step. Keep its summaries and collection log.
-        for old in (source.run_dir / 'rollouts').glob('train-*'):
-            step = old.name.split('-', 1)[1]
-            if step.isdigit() and int(step) < rollout_id:
-                for path in old.glob('*.json'):
-                    if path.stem.isdigit():
-                        path.unlink()
+    # Per-response files: always for eval (few, and the ones worth reading); for training only
+    # with MIXRL_KEEP_TRAIN_SAMPLES=1. A training response with its expert routes and top-p sets
+    # is MBs and tens to hundreds of ms to serialize; the batch itself is passed in memory.
+    keep_files = evaluation or os.environ.get('MIXRL_KEEP_TRAIN_SAMPLES', '0') == '1'
     # Checked before every batch: the judge can go down mid-run, and that must stop
     # training before generation, never turn judge-graded answers into zeros.
     # A judge or reward service that is restarting gets MIXRL_HEALTH_WAIT_SECONDS to return.
     deadline = time.monotonic() + float(os.environ.get('MIXRL_HEALTH_WAIT_SECONDS', '0'))
+    urls = c.get('scorer_urls') or [c['scorer_url']]
     while True:
-        try:
-            health = await asyncio.to_thread(request, c['scorer_url'] + '/health')
-            reasons = blocked(c['routes'], health)
-        except (OSError, ServiceHTTPError, ValueError) as exc:
-            health, reasons = None, {'reward service': f'{type(exc).__name__}: {exc}'}
+        reasons, protocols = {}, set()
+        for url in urls:
+            try:
+                health = await asyncio.to_thread(request, url + '/health')
+                protocols.add(health['protocol_id'])
+                reasons.update({f'{task} ({url})' if len(urls) > 1 else task: reason
+                                for task, reason in blocked(c['routes'], health).items()})
+            except (OSError, ServiceHTTPError, ValueError, KeyError) as exc:
+                reasons[f'reward service {url}'] = f'{type(exc).__name__}: {exc}'
         if not reasons or time.monotonic() >= deadline:
             break
         print('MIXRL_HEALTH_WAIT ' + json.dumps(reasons), flush=True)
@@ -351,10 +456,12 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     if reasons:
         raise RuntimeError('Reward service cannot grade enabled tasks: '
                            + '; '.join(f'{task}: {reason}' for task, reason in reasons.items()))
-    if health['protocol_id'] != c['scorer_protocol']:
+    if protocols != {c['scorer_protocol']}:
         raise RuntimeError('Scorer protocol mismatch before rollout')
     slots = asyncio.Semaphore(c['response_concurrency'])
     scoring_slots = asyncio.Semaphore(c.get('reward_concurrency', 8))
+    # Where every response is right now, for the MIXRL_PIPELINE line.
+    flow = {'gen_queued': 0, 'generating': 0, 'grade_queued': 0, 'grading': 0, 'done': 0, 'gen_tokens': 0}
 
     async def score(sample):
         # Slime retains the stop marker in decoded response text for token/logprob
@@ -372,16 +479,24 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 text = text[:-len(eos)]
         sample.metadata['grading_text'] = text
         sample.metadata['reward_queued_at'] = time.time()
+        flow['grade_queued'] += 1
         async with scoring_slots:
-            return await reward(args, sample)
+            flow['grade_queued'] -= 1
+            flow['grading'] += 1
+            try:
+                return await reward(args, sample)
+            finally:
+                flow['grading'] -= 1
 
     async def generate_one(sample):
         meta = sample.metadata['mixrl']
         path = directory / f'{sample.index}.json'
         sample.metadata['generation_queued_at'] = time.time()
+        flow['gen_queued'] += 1
         async with slots:
+            flow['gen_queued'] -= 1
             # Retry completed generations without rerolling after judge/network failure.
-            if path.exists():
+            if keep_files and path.exists():
                 saved = load_sample(path, num_layers=getattr(args, 'num_layers', 25),
                                     router_topk=getattr(args, 'moe_router_topk', 4))
                 if saved.metadata['mixrl'] != meta:
@@ -401,10 +516,15 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             sample.metadata['generation_started_at'] = time.time()
             # Separate generation from RM to persist tokens/logprobs before grading.
             from slime.rollout.sglang_rollout import generate
-            async with state.semaphore:
-                with state.dp_rank_context():
-                    sample = await generate(args, sample, params)
+            flow['generating'] += 1
+            try:
+                async with state.semaphore:
+                    with state.dp_rank_context():
+                        sample = await generate(args, sample, params)
+            finally:
+                flow['generating'] -= 1
             sample.metadata['generation_finished_at'] = time.time()
+            flow['gen_tokens'] += sample.response_length
             if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
                 raise RuntimeError('Generation did not terminate normally')
             if sample.response_length < 1 or len(sample.rollout_log_probs or []) != sample.response_length:
@@ -430,8 +550,18 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 # Dense decoder columns have no routes; clear unused capture
                 # buffer bytes before persistence, never alter actual MoE IDs.
                 experts[:, :2, :] = 0
-            save_sample(path, sample)
+            if keep_files:
+                # Persist before grading so a step that fails while grading regrades, not rerolls.
+                await asyncio.get_running_loop().run_in_executor(persist_pool(), write_record, path, sample)
             return sample
+
+    def write_record(path, sample):
+        if evaluation:
+            # Eval responses are kept to be read (text, grade, lengths); no routes or top-p sets.
+            sample = copy.copy(sample)
+            sample.rollout_routed_experts = None
+            sample.rollout_top_p_token_ids = sample.rollout_top_p_token_offsets = None
+        save_sample(path, sample)
 
     async def one(sample):
         # Group concurrency bounds the pending judge backlog. Generation slots
@@ -439,12 +569,18 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         sample = await generate_one(sample)
         if sample.reward is None:
             sample.reward = await score(sample)
-        save_sample(directory / f'{sample.index}.json', sample)
+        if keep_files:
+            await asyncio.get_running_loop().run_in_executor(
+                persist_pool(), write_record, directory / f'{sample.index}.json', sample)
+        flow['done'] += 1
         return sample
 
     async def execute(group):
         return await gather_cancel(one(s) for s in group)
 
+    interval = float(os.environ.get('MIXRL_PIPELINE_SECONDS', '30'))
+    heartbeat = (asyncio.create_task(pipeline_heartbeat(args, rollout_id, phase, flow, interval))
+                 if interval > 0 else None)
     try:
         if evaluation:
             data = {}
@@ -554,6 +690,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             write_json(directory / 'abort_error.json', {'error': str(cleanup_error)})
         raise
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
         state.reset()
 
 

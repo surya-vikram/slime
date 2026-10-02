@@ -15,6 +15,14 @@ from . import tasks as task_file
 from .code_admission import code_exclusions
 
 
+def scorer_urls(env):
+    """MIXRL_SCORER_URL: one reward-service URL, or several separated by commas."""
+    urls = [u.strip().rstrip('/') for u in env['MIXRL_SCORER_URL'].split(',') if u.strip()]
+    if not urls:
+        raise ValueError('MIXRL_SCORER_URL is empty')
+    return urls
+
+
 def checkpoint_identity(root):
     """Pin bytes, not just paths; deliberately read once during preflight."""
     root = Path(root).resolve()
@@ -40,7 +48,7 @@ def resolve():
     c = {'tasks_file': str(tasks_path), **task_file.resolved(spec)}
     quotas, caps = c['quotas'], c['caps']
     c.update({'data_dir': env['MIXRL_DATA_DIR'],
-        'run_dir': env['RUN_DIR'], 'scorer_url': env['MIXRL_SCORER_URL'].rstrip('/'),
+        'run_dir': env['RUN_DIR'], 'scorer_url': scorer_urls(env)[0],
         'truncation': env['MIXRL_TRUNCATION'], 'seed': int(env['MIXRL_SEED']),
         'context': int(env['MODEL_CONTEXT_LENGTH']),
         'inflight_groups': int(env['MIXRL_INFLIGHT_GROUPS']),
@@ -198,11 +206,19 @@ def resolve():
             validate_route(row, c['routes'])
     if {r['family_id'] for r in rows} & {r['family_id'] for r in val}:
         raise ValueError('Train/validation overlap')
-    health = request(c['scorer_url'] + '/health', timeout=30)
+    urls = scorer_urls(env)
+    if len(urls) > 1:
+        c['scorer_urls'] = urls  # several reward-service processes; one URL keeps the old config
+    health = request(urls[0] + '/health', timeout=30)
     task_file.check_scorer(spec, health)
     c['scorer_protocol'] = health['protocol_id']
     c['judge'] = health['judge']['model']
-    admission = request(c['scorer_url'] + '/admission', timeout=30)
+    admission = request(urls[0] + '/admission', timeout=30)
+    for url in urls[1:]:
+        # Every process must grade identically: same data, settings and judge.
+        other = request(url + '/health', timeout=30)
+        if other['protocol_id'] != c['scorer_protocol'] or request(url + '/admission', timeout=30) != admission:
+            raise ValueError(f'Reward service {url} differs from {urls[0]}; restart them together with mixrl/reward.sh')
     if admission['protocol_id'] != c['scorer_protocol']:
         raise ValueError('Scoring service changed during preflight')
     c['excluded_row_ids'] = sorted(admission['excluded_rows'])

@@ -20,24 +20,27 @@ MODEL_PATH=$BASE_DIR/models/$JUDGE_MODEL_DIR
 DRAFTER_PATH=$BASE_DIR/models/$JUDGE_MODEL_DIR-assistant
 [[ -d "$MODEL_PATH" ]] || { echo "error: judge model not found at $MODEL_PATH (JUDGE_MODEL_DIR)" >&2; exit 1; }
 IFS=, read -ra judge_gpus <<< "$JUDGE_GPUS"
-[[ ${#judge_gpus[@]} -eq $JUDGE_TP ]] || { echo "error: JUDGE_GPUS=$JUDGE_GPUS lists ${#judge_gpus[@]} GPUs but JUDGE_TP=$JUDGE_TP" >&2; exit 1; }
+[[ ${#judge_gpus[@]} -eq $((JUDGE_TP * JUDGE_DP)) ]] || {
+    echo "error: JUDGE_GPUS=$JUDGE_GPUS lists ${#judge_gpus[@]} GPUs but JUDGE_TP x JUDGE_DP = $JUDGE_TP x $JUDGE_DP" >&2; exit 1; }
 (( JUDGE_CONTEXT <= JUDGE_MAX_MODEL_LEN )) || { echo "error: JUDGE_CONTEXT must not exceed JUDGE_MAX_MODEL_LEN" >&2; exit 1; }
 
 # Paths below are as the server sees them: the host path, or /models inside the container.
 serve_args() {
     local models=$1
     args=(--host "$JUDGE_HOST" --port "$JUDGE_PORT" --served-model-name "$JUDGE_NAME" --dtype bfloat16
-        --tensor-parallel-size "$JUDGE_TP" --gpu-memory-utilization "$JUDGE_GPU_MEMORY_UTILIZATION"
+        --tensor-parallel-size "$JUDGE_TP" --data-parallel-size "$JUDGE_DP"
+        --gpu-memory-utilization "$JUDGE_GPU_MEMORY_UTILIZATION"
         --max-model-len "$JUDGE_MAX_MODEL_LEN" --max-num-seqs "$JUDGE_MAX_NUM_SEQS"
-        --max-num-batched-tokens 32768 --enable-prefix-caching --enable-auto-tool-choice
+        --max-num-batched-tokens "$JUDGE_MAX_NUM_BATCHED_TOKENS" --api-server-count "$JUDGE_API_SERVERS"
+        --enable-prefix-caching --enable-auto-tool-choice
         --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer)
-    if [[ -d "$DRAFTER_PATH" ]]; then
+    if [[ "$JUDGE_SPECULATIVE" == 1 && -d "$DRAFTER_PATH" ]]; then
         # DFlash speculative decoding when the drafter model is present.
         args+=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$models/$JUDGE_MODEL_DIR-assistant\",\"num_speculative_tokens\":15}")
     fi
 }
 
-echo "Judge $JUDGE_NAME on GPUs $JUDGE_GPUS (TP=$JUDGE_TP) at http://$JUDGE_HOST:$JUDGE_PORT/v1, context $JUDGE_MAX_MODEL_LEN"
+echo "Judge $JUDGE_NAME on GPUs $JUDGE_GPUS (TP=$JUDGE_TP, DP=$JUDGE_DP) at http://$JUDGE_HOST:$JUDGE_PORT/v1, context $JUDGE_MAX_MODEL_LEN"
 if [[ "$JUDGE_USE_DOCKER" == 1 ]]; then
     serve_args /models
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
