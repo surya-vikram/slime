@@ -88,6 +88,10 @@ class ConsoleTests(unittest.TestCase):
         c.feed('MIXRL_COLLECTION ' + json.dumps({'rollout_id': 0, 'routes': {}}) + '\n')
         c.feed(evaluation)  # after step 1, trained or skipped
         self.assertEqual(lines(out)[-1], 'eval after step 1 | score: 0.500 | math 0.600 | logic 0.400')
+        # Ray forwards the rollout worker's eval line later than the driver's step line.
+        c.feed('MIXRL_STEP ' + json.dumps({'rollout_id': 0, 'num_rollout': 2, 'seconds': 60.0}) + '\n')
+        c.feed(evaluation)
+        self.assertEqual(lines(out)[-1], 'eval after step 1 | score: 0.500 | math 0.600 | logic 0.400')
 
     def test_errors_warnings_and_launcher_lines(self):
         c, out, _, clock = make()

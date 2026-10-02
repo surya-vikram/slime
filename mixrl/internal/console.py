@@ -64,6 +64,7 @@ class Console:
         self.line_number, self.full, self.progress_seconds, self.clock = offset, full, progress_seconds, clock
         self.started = clock()
         self.steps = {}           # rollout_id -> records gathered for its step lines
+        self.collected = set()    # rollout ids whose rollout finished (eval lines may arrive after the step line)
         self.step_seconds = []    # for the ETA
         self.last_progress, self.rates = None, []
         self.traceback = None     # train.log line where the current traceback began
@@ -174,6 +175,8 @@ class Console:
             self.progress(value)
         elif kind in ('TIMING', 'COLLECTION', 'ROUTER', 'CONSISTENCY'):
             self.steps.setdefault(value['rollout_id'], {})[kind.lower()] = value
+            if kind == 'COLLECTION':
+                self.collected.add(value['rollout_id'])
         elif kind == 'TRAIN':
             self.steps.setdefault(value['rollout_id'], {})['train'] = value
         elif kind == 'STEP':
@@ -283,7 +286,7 @@ class Console:
 
     def eval_label(self, rid):
         """An evaluation tagged rollout_id runs before that step's rollout (the baseline) or after the step."""
-        return f'eval after step {rid + 1}' if 'collection' in self.steps.get(rid, {}) else f'eval before step {rid + 1}'
+        return f'eval after step {rid + 1}' if rid in self.collected else f'eval before step {rid + 1}'
 
     def evaluation(self, e):
         domains = e.get('domains') or {}
