@@ -12,6 +12,7 @@ import slime.utils.eval_config
 from slime.observability.logging_utils import configure_logger
 from slime.ray.ray_actor import RayActor
 from slime.utils import accelerator
+from slime.utils.cpu_budget import available_cpus, threads_per_rank
 from slime.utils.distributed_utils import init_gloo_group
 from slime.utils.memory_utils import clear_memory, print_memory
 
@@ -54,6 +55,13 @@ class TrainRayActor(RayActor):
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         accelerator.set_device(local_rank)
+        # Each trainer rank uses its share of the container's CPUs, not torch's default of half the visible
+        # cores in every process (see slime/utils/cpu_budget.py).
+        threads = threads_per_rank(args.actor_num_gpus_per_node)
+        if threads < torch.get_num_threads():
+            torch.set_num_threads(threads)
+        logger.info(f"[Rank {self._rank}] torch CPU threads: {torch.get_num_threads()} "
+                    f"({available_cpus():g} CPUs available, {args.actor_num_gpus_per_node} trainer ranks per node)")
         if accelerator.set_allocator_expandable_segments():
             logger.info(
                 f"[Rank {self._rank}] Enabled {accelerator.device_type().upper()} memory allocator "
