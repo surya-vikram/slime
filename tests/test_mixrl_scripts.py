@@ -200,7 +200,7 @@ class ScriptTests(unittest.TestCase):
             (('run.sh', 'preflight'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
             (('run.sh', 'start'), {'MODEL_NAME': 'missing'}, 'check BASE_DIR, MODEL_NAME'),
             (('run.sh', 'start', 'bad/name'), {}, "use letters, digits"),
-            (('judge.sh',), {'JUDGE_GPUS': '2,3', 'JUDGE_TP': '1'}, 'lists 2 GPUs but JUDGE_TP x JUDGE_DP = 1 x 1'),
+            (('judge.sh',), {'JUDGE_GPUS': '2,3', 'JUDGE_TP': '1', 'JUDGE_DP': '1'}, 'lists 2 GPUs but JUDGE_TP x JUDGE_DP = 1 x 1'),
             (('judge.sh',), {'JUDGE_CONTEXT': '65536'}, 'must not exceed JUDGE_MAX_MODEL_LEN'),
         )
         for args, env, message in cases:
@@ -268,7 +268,10 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(run[run.index(flag) + 1], value)
         for flag in ('--language-model-only', '--aggregate-engine-logging'):
             self.assertIn(flag, run)
-        self.assertNotIn('--max-num-seqs', run)  # no cap unless JUDGE_MAX_NUM_SEQS is set
+        self.assertEqual(run[run.index('--max-num-seqs') + 1], '1024')  # vLLM 0.28 would stop at 512
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_MAX_NUM_SEQS='0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('--max-num-seqs', [c for c in self.calls('docker') if c[0] == 'run'][-1])  # 0: vLLM's own
         result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_DP='1',
                                  JUDGE_MAX_NUM_SEQS='512', JUDGE_SPECULATIVE='1')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -285,11 +288,15 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         (call,) = self.calls('vllm')
         self.assertEqual(call[:2], ['serve', f'{self.base}/models/judge'])
-        for flag, value in (('--tensor-parallel-size', '2'), ('--max-model-len', '32768'),
+        # Default layout: two replicas of the 30B judge, one per GPU, two front-end processes.
+        for flag, value in (('--tensor-parallel-size', '1'), ('--data-parallel-size', '2'), ('--max-num-seqs', '1024'),
+                            ('--api-server-count', '2'), ('--max-model-len', '32768'),
                             ('--served-model-name', 'mixrl-judge'), ('--host', '127.0.0.1')):
             self.assertEqual(call[call.index(flag) + 1], value)
+        self.assertNotIn('--speculative-config', call)
         (self.base / 'models/judge-assistant').mkdir()
-        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_SPECULATIVE='1')
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_DP='1',
+                                 JUDGE_SPECULATIVE='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         run = next(c for c in self.calls('docker') if c[0] == 'run')
         self.assertEqual(run[run.index('--gpus') + 1], '"device=2,3"')

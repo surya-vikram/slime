@@ -13,9 +13,9 @@ Three services, all talking over `127.0.0.1` on the same machine:
 
 | Service | Started by | Default GPUs | Port |
 |---|---|---|---|
-| Judge (vLLM, Muse-Glimmer-30B) | `mixrl/judge.sh` | `JUDGE_GPUS=2`, TP 1 | `JUDGE_PORT=8025` |
-| Reward service (chimera-eval container) | `mixrl/reward.sh` | none (CPU) | `REWARD_PORT=18020` |
-| Training (slime container: Megatron + SGLang) | `mixrl/run.sh start` | `TRAIN_GPUS=0,1` | none |
+| Judge (vLLM, Muse-Glimmer-30B) | `mixrl/judge.sh` (or `mixrl/run.sh start`) | `JUDGE_GPUS=6,7`: two replicas (TP 1, DP 2) | `JUDGE_PORT=8025` |
+| Reward service (chimera-eval container) | `mixrl/reward.sh` (or `mixrl/run.sh start`) | none (CPU) | `REWARD_PORT=18020` (+1, ... per process) |
+| Training (slime container: Megatron + SGLang) | `mixrl/run.sh start` | `TRAIN_GPUS=0,1,2,3,4,5` | none |
 
 ```mermaid
 flowchart LR

@@ -34,9 +34,9 @@ serve_args() {
         --max-num-batched-tokens "$JUDGE_MAX_NUM_BATCHED_TOKENS" --api-server-count "$JUDGE_API_SERVERS"
         --enable-prefix-caching --enable-auto-tool-choice
         --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer)
-    # Like chimera-eval serve_gemma.sh: throughput mode and no request cap unless one is set;
-    # the reward service's KV-token budget (JUDGE_KV_CACHE_NUM_TOKENS) bounds the load.
-    [[ -n "$JUDGE_MAX_NUM_SEQS" ]] && args+=(--max-num-seqs "$JUDGE_MAX_NUM_SEQS")
+    # Like chimera-eval serve_gemma.sh: throughput mode; JUDGE_MAX_NUM_SEQS raises vLLM's request cap and the
+    # reward service's KV-token budget (JUDGE_KV_CACHE_NUM_TOKENS) bounds the load.
+    [[ -n "$JUDGE_MAX_NUM_SEQS" && "$JUDGE_MAX_NUM_SEQS" != 0 ]] && args+=(--max-num-seqs "$JUDGE_MAX_NUM_SEQS")
     [[ -n "$JUDGE_PERFORMANCE_MODE" ]] && args+=(--performance-mode "$JUDGE_PERFORMANCE_MODE")
     [[ "$JUDGE_LANGUAGE_MODEL_ONLY" == 1 ]] && args+=(--language-model-only)  # skip the vision encoder
     (( JUDGE_DP > 1 )) && args+=(--aggregate-engine-logging)
