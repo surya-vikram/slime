@@ -507,7 +507,7 @@ fi
 EXIT_STEPS+=('if [[ -n "$GPU_METRICS_PID" ]]; then kill "$GPU_METRICS_PID" 2>/dev/null; fi'
     'ray stop --force >/dev/null 2>&1'
     # Ray's own logs (raylet, GCS, workers) die with the container; keep them with the run.
-    'tar -czf "$LOG_DIR/ray_logs-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /tmp/ray/session_latest logs 2>/dev/null')
+    'tar -czf "$LOG_DIR/ray_logs-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C "${RAY_TMPDIR:-/tmp}/ray/session_latest" logs 2>/dev/null')
 # Ray's own services and the submit client do not need Chimera. Without the runtime
 # sitecustomize each would import torch and Transformers (~0.8 GB apiece); job
 # processes still get the full PYTHONPATH from the runtime env below.
