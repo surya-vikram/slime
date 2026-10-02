@@ -336,6 +336,66 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
                 reference = result
             self.assertEqual(result, reference)
 
+    async def test_oversampling_keeps_the_batch_and_cancels_unneeded_spares(self):
+        import random
+        outcomes = {'a': [True, False, True, False, True, True, True, True, True, True, True, True],
+                    'b': [False, True, True, False, True, True, True, True, True, True, True, True]}
+        quotas = {'a': 3, 'b': 2}
+        base, _, _ = await self.refill(outcomes, quotas, 2)
+        for seed in range(15):
+            rng = random.Random(seed)
+            delays = {(r, k): rng.choice([.0001, .001, .004]) for r in outcomes for k in range(1, 13)}
+            proposals = {r: 0 for r in quotas}
+            def propose(route):
+                proposals[route] += 1
+                return route, proposals[route]
+            async def execute(job):
+                await asyncio.sleep(delays.get(job, .0001))
+                return job
+            def assess(job):
+                usable = outcomes[job[0]][job[1] - 1]
+                return usable, [1., 0.] if usable else [0., 0.], [False, False]
+            groups, metrics = await collect(quotas, propose, execute, assess, inflight=100, refill_rounds=2,
+                                            spares={'a': 2, 'b': 2})
+            self.assertEqual(groups, base, seed)  # same batch as without spares
+            for r in quotas:
+                self.assertLessEqual(metrics[r]['attempted'] + metrics[r]['cancelled'], quotas[r] * 3)
+
+    async def test_spare_is_already_running_when_a_group_turns_out_uniform(self):
+        timeline = []
+        proposals = {'a': 0}
+        def propose(route):
+            proposals[route] += 1
+            timeline.append(('proposed', proposals[route]))
+            return route, proposals[route]
+        async def execute(job):
+            await asyncio.sleep(.03 if job[1] == 1 else .002)
+            timeline.append(('finished', job[1]))
+            return job
+        def assess(job):
+            usable = job[1] != 1  # the slow first group is uniform
+            return usable, [1., 0.] if usable else [0., 0.], [False, False]
+        groups, metrics = await collect({'a': 2}, propose, execute, assess, inflight=10, refill_rounds=1,
+                                        spares={'a': 1})
+        self.assertEqual(groups, [('a', 2), ('a', 3)])
+        self.assertLess(timeline.index(('proposed', 3)), timeline.index(('finished', 1)))
+
+    async def test_priority_gate_serves_lowest_priority_first_and_survives_cancellation(self):
+        from slime_plugins.chimera_mixrl.core import PriorityGate
+        gate, order = PriorityGate(1), []
+        await gate.acquire()
+        async def wait(priority):
+            async with gate.slot(priority):
+                order.append(priority)
+        tasks = [asyncio.create_task(wait(p)) for p in (5, 1, 3)]
+        doomed = asyncio.create_task(wait(0))
+        await asyncio.sleep(0)
+        doomed.cancel()
+        gate.release()
+        await asyncio.gather(*tasks)
+        self.assertEqual(order, [1, 3, 5])
+        self.assertEqual(gate.free, 1)
+
     async def test_timeout_cancels_work(self):
         stopped = []
         async def execute(job):

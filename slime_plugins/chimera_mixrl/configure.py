@@ -128,6 +128,11 @@ def resolve():
         raise ValueError('EXPERT_MODEL_PARALLEL_SIZE must positively divide POLICY_GPUS')
     if c['samples_per_prompt'] < 2 or c['truncation'] not in ('mask', 'zero'):
         raise ValueError('Invalid group size or truncation policy')
+    oversample = float(env.get('MIXRL_OVERSAMPLE', '0'))
+    if not 0 <= oversample <= 2:
+        raise ValueError('MIXRL_OVERSAMPLE must be between 0 (off) and 2 (spares as a fraction of each quota)')
+    if oversample:
+        c['oversample'] = oversample  # 0 keeps the resolved config unchanged
     if c['refill_rounds'] < 0:
         raise ValueError('MIXRL_REFILL_ROUNDS must be 0 (off) or a positive number of rounds')
     length_penalty = env.get('MIXRL_LENGTH_PENALTY', '0')

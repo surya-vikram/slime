@@ -179,8 +179,56 @@ def group_rewards(grades, capped, policy='mask', standardize=True, penalties=Non
     return scores, advantages, eligible, True
 
 
+class PriorityGate:
+    """A semaphore that hands free slots to the lowest priority value first (FIFO among equals).
+
+    Used so responses of earlier-proposed groups are generated and graded first: groups then
+    finish one after another and their keep-or-refill decisions arrive steadily, instead of
+    every group being partly graded until the end of the step."""
+
+    def __init__(self, slots):
+        if slots < 1:
+            raise ValueError('PriorityGate needs at least one slot')
+        self.free, self.waiters, self.count = slots, [], 0
+
+    async def acquire(self, priority=0):
+        import heapq
+        if self.free > 0 and not self.waiters:
+            self.free -= 1
+            return
+        future = asyncio.get_running_loop().create_future()
+        self.count += 1
+        heapq.heappush(self.waiters, (priority, self.count, future))
+        try:
+            await future
+        except asyncio.CancelledError:
+            if future.done() and not future.cancelled():
+                self.release()  # granted just as it was cancelled: pass the slot on
+            raise
+
+    def release(self):
+        import heapq
+        while self.waiters:
+            _, _, future = heapq.heappop(self.waiters)
+            if not future.done():
+                future.set_result(None)
+                return
+        self.free += 1
+
+    def slot(self, priority=0):
+        gate = self
+
+        class _Slot:
+            async def __aenter__(self):
+                await gate.acquire(priority)
+
+            async def __aexit__(self, *exc):
+                gate.release()
+        return _Slot()
+
+
 async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds=0,
-                  timeout=600, event=None):
+                  timeout=600, event=None, spares=None):
     """Per task, collect `quota` groups for the batch, preferring informative ones.
 
     The whole initial batch is proposed up front and generated with bounded rolling
@@ -197,6 +245,12 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     are proposed as with in-order resolution. The batch is still taken in proposal order, so
     it depends only on outcomes: a retried step proposes and selects the same prompts.
     Informative groups never exceed the quota.
+
+    spares[route] > 0 oversamples: that many extra groups stay in flight beyond those still
+    needed, so a uniform group's replacement is already running instead of starting after it
+    is graded. Spares are proposed after the groups they back up, so the batch (the first
+    `quota` informative groups in proposal order) is unchanged; once those are known, groups
+    proposed after them are cancelled. Surplus informative groups are dropped.
     """
     if not quotas or any(type(v) is not int or v < 1 for v in quotas.values()):
         raise ValueError('Quotas must be positive integer sampled-group counts')
@@ -208,9 +262,10 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     constant = {r: [] for r in quotas}
     failed = {r: [] for r in quotas}
     budget = {r: quotas[r] * (1 + refill_rounds) for r in quotas}
+    spares = {r: max(0, int((spares or {}).get(r, 0))) for r in quotas}
     routes = deque(quotas)
     metrics = {r: {'attempted': 0, 'accepted': 0, 'constant': 0, 'refilled': 0, 'padding': 0,
-                   'all_correct': 0, 'all_wrong': 0, 'grade_failed': 0,
+                   'all_correct': 0, 'all_wrong': 0, 'grade_failed': 0, 'cancelled': 0,
                    'score_sum': 0., 'responses': 0, 'capped': 0} for r in quotas}
 
     async def run():
@@ -231,9 +286,30 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
             attempts[route] += 1
             pending[route] += 1
 
+        cancelled = []
+
         def short(route):
-            # Still short even if every pending group turns out informative.
-            return len(informative[route]) + pending[route] < quotas[route] and attempts[route] < budget[route]
+            # Keep the groups still needed (if every pending one turns out informative), plus spares.
+            needed = quotas[route] - len(informative[route])
+            return needed > 0 and pending[route] < needed + spares[route] and attempts[route] < budget[route]
+
+        def prune(route):
+            # Once the first `quota` informative groups in proposal order are known, nothing
+            # proposed after them can enter the batch: cancel those still running.
+            if len(informative[route]) < quotas[route]:
+                return
+            last = sorted(i for i, _ in informative[route])[quotas[route] - 1]
+            mine = [(task, i) for task, i in running.items() if jobs[i][0] == route]
+            if any(i < last for _, i in mine):
+                return
+            for task, i in mine:
+                running.pop(task)
+                pending[route] -= 1
+                task.cancel()
+                cancelled.append(task)
+                metrics[route]['cancelled'] += 1
+                if event:
+                    event(route, jobs[i][1], jobs[i][1], 'cancelled')
 
         def resolve(index, route, job, group):
             outcome = assess(group)
@@ -270,9 +346,10 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
             if event:
                 event(route, job, group, decision)
 
+        initial = {r: min(quotas[r] + spares[r], budget[r]) for r in quotas}
         try:
-            while any(attempts[r] < quotas[r] for r in quotas):
-                route = next(r for r in routes if attempts[r] < quotas[r])
+            while any(attempts[r] < initial[r] for r in quotas):
+                route = next(r for r in routes if attempts[r] < initial[r])
                 while routes[0] != route:
                     routes.rotate(-1)
                 routes.rotate(-1)
@@ -280,12 +357,16 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
             while running:
                 done, _ = await asyncio.wait(list(running), return_when=asyncio.FIRST_COMPLETED)
                 # Groups that finish together are handled in proposal order.
-                for task in sorted(done, key=running.get):
+                for task in sorted(done, key=lambda t: running.get(t, -1)):
+                    if task not in running:
+                        continue  # pruned while this batch of finished groups was handled
                     index = running.pop(task)
                     route, job, _ = jobs[index]
                     group = task.result()
                     pending[route] -= 1
                     resolve(index, route, job, group)
+                    prune(route)
+            await asyncio.gather(*cancelled, return_exceptions=True)
         except BaseException:
             tasks = [task for _, _, task in jobs]
             for task in tasks:
@@ -295,7 +376,7 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
         ordered = lambda pairs: [group for _, group in sorted(pairs, key=lambda pair: pair[0])]
         batch = []
         for route, quota in quotas.items():
-            chosen = ordered(informative[route])
+            chosen = ordered(informative[route])[:quota]
             padding = (ordered(constant[route]) + ordered(failed[route]))[:quota - len(chosen)]
             metrics[route]['padding'] = len(padding)
             batch.extend(chosen + padding)

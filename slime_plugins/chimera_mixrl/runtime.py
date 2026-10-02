@@ -10,7 +10,7 @@ import urllib.request
 import urllib.error
 import time
 
-from .core import RouteSampler, collect, digest, group_rewards, length_penalties, load_split, write_json
+from .core import PriorityGate, RouteSampler, collect, digest, group_rewards, length_penalties, load_split, write_json
 from .routes import THINK_TAG, evaluation_summary, validate_route
 from .tasks import blocked
 from .objective import group_length_scales
@@ -458,8 +458,11 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                            + '; '.join(f'{task}: {reason}' for task, reason in reasons.items()))
     if protocols != {c['scorer_protocol']}:
         raise RuntimeError('Scorer protocol mismatch before rollout')
-    slots = asyncio.Semaphore(c['response_concurrency'])
-    scoring_slots = asyncio.Semaphore(c.get('reward_concurrency', 8))
+    # Earlier-proposed groups are generated and graded first (lower priority value), so groups
+    # finish one after another and keep-or-refill decisions arrive throughout the step.
+    slots = PriorityGate(c['response_concurrency'])
+    scoring_slots = PriorityGate(c.get('reward_concurrency', 8))
+    priority = lambda sample: sample.metadata.get('mixrl_priority', 0)
     # Where every response is right now, for the MIXRL_PIPELINE line.
     flow = {'gen_queued': 0, 'generating': 0, 'grade_queued': 0, 'grading': 0, 'done': 0, 'gen_tokens': 0}
 
@@ -480,7 +483,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         sample.metadata['grading_text'] = text
         sample.metadata['reward_queued_at'] = time.time()
         flow['grade_queued'] += 1
-        async with scoring_slots:
+        async with scoring_slots.slot(priority(sample)):
             flow['grade_queued'] -= 1
             flow['grading'] += 1
             try:
@@ -493,7 +496,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         path = directory / f'{sample.index}.json'
         sample.metadata['generation_queued_at'] = time.time()
         flow['gen_queued'] += 1
-        async with slots:
+        async with slots.slot(priority(sample)):
             flow['gen_queued'] -= 1
             # Retry completed generations without rerolling after judge/network failure.
             if keep_files and path.exists():
@@ -593,6 +596,9 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                     return await execute(group)
             groups = [source.samples(r, i, version, 'rl_val', eval_samples)
                       for i, r in enumerate(panel)]
+            for i, group in enumerate(groups):
+                for sample in group:
+                    sample.metadata['mixrl_priority'] = i
             completed = await asyncio.wait_for(
                 gather_cancel(evaluate_group(g) for g in groups), c['collection_timeout'])
             for row, group in zip(panel, completed):
@@ -617,9 +623,13 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             write_json(eval_counter_path, counter + 1)
             return RolloutFnEvalOutput(data=data)
         seen = set()
+        proposals = iter(range(10**9))
         def propose(route):
             row, index = source.sampler.take(route, seen)
-            return source.samples(row, index, version)
+            group, order = source.samples(row, index, version), next(proposals)
+            for sample in group:
+                sample.metadata['mixrl_priority'] = order
+            return group
         def assess(group):
             validate_group(group, args.n_samples_per_prompt)
             capped = [unfinished(s) for s in group]
@@ -636,9 +646,10 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             with (directory / 'collection.jsonl').open('a') as stream:
                 stream.write(json.dumps({'route': route, 'group': group[0].group_index,
                                          'row': group[0].metadata['mixrl']['row_id'], 'decision': decision}) + '\n')
+        spares = {r: math.ceil(q * c.get('oversample', 0)) for r, q in c['quotas'].items()}
         groups, metrics = await collect(c['quotas'], propose, execute, assess,
                                         inflight=c['inflight_groups'], refill_rounds=c.get('refill_rounds', 0),
-                                        timeout=c['collection_timeout'], event=event)
+                                        timeout=c['collection_timeout'], event=event, spares=spares)
         # Length penalties and loss masks are fixed here, before conversion and logging,
         # so reward normalization reads exactly what the logs report.
         for group in groups:
