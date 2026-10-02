@@ -8,7 +8,7 @@ mixrl/
 ├── tasks.json        which tasks train, prompts per step, eval size, and what each task is
 ├── judge.sh          start the judge (vLLM)
 ├── reward.sh         start the reward service
-├── run.sh            tasks | preflight | start | resume
+├── run.sh            start | resume (starts judge and reward service as needed) | preflight | tasks
 ├── internal/launch.sh   runs inside the training container; never run by hand
 └── docs/             AIRGAPPED.md (setup and transfer), RUNBOOK.md (how it works), TASK_AUDIT.md, GSM8K.md (GSM8K-only run on 8×H200)
 ```
@@ -18,13 +18,18 @@ mixrl/
 From the slime checkout (first-time setup and data download: [docs/AIRGAPPED.md](docs/AIRGAPPED.md)):
 
 ```bash
-mixrl/judge.sh                  # only if an enabled task needs the judge
-mixrl/reward.sh                 # reward service; says if the judge is reachable
-mixrl/run.sh tasks              # preview: tasks, prompts per step, eval size, judge use
-mixrl/run.sh preflight          # check everything without GPUs
-mixrl/run.sh start gsm8k-01     # new run named gsm8k-01 (name optional)
-mixrl/run.sh resume gsm8k-01    # continue it from its latest checkpoint
+mixrl/run.sh start gsm8k-01     # new run named gsm8k-01 (name optional): see below
+mixrl/run.sh resume gsm8k-01    # continue it from its latest checkpoint (no preflight)
+mixrl/run.sh tasks              # preview only: tasks, prompts per step, eval size, judge use
+mixrl/run.sh preflight          # checks only, no GPUs (start runs them too)
 ```
+
+`start` does every step in order, one terminal line each, and stops at the first that fails:
+start the judge if an enabled task needs it and it is not already up, start the reward
+service if it is not up, show the task summary, run the preflight, then train. Services
+that are already running are reused; after changing their settings restart one with
+`mixrl/judge.sh` or `mixrl/reward.sh` (`stop` stops it). Their startup output goes to the
+run's `logs/` folder (`judge_start.log`, `reward_start.log`, `preflight.log`, `tasks.txt`).
 
 The run name only names the output folder, `$BASE_DIR/runs/chimera/mixrl/<name>/`
 (checkpoints, logs, evals, and a frozen copy of the settings and tasks it ran with).
@@ -53,7 +58,7 @@ Edit `config.env`, or override for one command:
 LR=2e-6 NUM_ROLLOUT=200 mixrl/run.sh start run-b
 ```
 
-Defaults are set for 2 training H200s (`TRAIN_GPUS=0,1`) and a judge on GPU 2.
+Defaults are set for 6 training H200s (`TRAIN_GPUS=0,1,2,3,4,5`) and a judge on GPUs 6,7.
 Training won't start, and says why, when a task needs a judge that is down, the reward
 service can't grade a task, the data doesn't match `tasks.json`, or GPUs and paths
 don't line up.
@@ -98,15 +103,39 @@ was not consumed exactly once") and that `MIXRL_TRAIN` loss and
 All logs for a run are in `$BASE_DIR/runs/chimera/mixrl/<name>/logs/`:
 
 ```
-train.log            everything the run printed: launcher, Ray, Megatron, SGLang and the MIXRL_* lines
-reward_service.log   the reward service's output during the run
-judge.log            the judge's output during the run (Docker judge; a native judge logs in its terminal)
-gpu_metrics.csv      GPU utilization, memory and power every 5 s
-ray_logs-*.tar.gz    Ray's internal logs (raylet, GCS, workers), saved when the run exits
+train.log              everything the run printed: launcher, Ray, Megatron, SGLang and the MIXRL_* lines
+console.log            what the terminal showed (the concise view below)
+metrics.jsonl          every MIXRL_* record, one JSON object per line with its time and kind, plus the trainer's timings
+reward_service.log     the reward service: its settings, a stats line a minute, every failed request
+                       (reward_service-<i>.log per process with REWARD_PROCESSES > 1)
+judge.log              the judge's output during the run
+judge_start.log, reward_start.log, preflight.log, tasks.txt   what start did before training
+gpu_metrics.csv        GPU utilization, memory and power every 5 s
+ray_logs-*.tar.gz      Ray's internal logs (raylet, GCS, every worker in full), saved when the run exits
 ```
 
-Resume and retried starts append to the same files. `train.log` is also what the
-terminal shows; its MIXRL_* lines are one JSON object each:
+Each reward-service process also keeps its whole log, across runs, in its cache folder
+(`$BASE_DIR/scorer_cache/.../reward_service.log`).
+
+The terminal shows a concise view (`MIXRL_CONSOLE=full` shows every line instead), in the
+Megatron-LM style of `key: value` fields:
+
+```
+[2026-10-02 10:47:48] MixRL run mix-16r (new) | model: zoro2 | training GPUs: 6 (EP 1) | SGLang engines: 6 | batch: 1008 prompts x 16 = 16128 samples | steps: 1000 | eval every 10 | save every 20
+[2026-10-02 10:53:40] ready | startup: 5m52s | models loaded, weights in SGLang
+[2026-10-02 10:54:40] step 1 rollout | 1m00s | done: 911 | generating: 2332 | grading: 373 | gen: 2.2k tok/s | sglang: 2047 running, 286 waiting, KV 16% | judge: 415 running, KV 6%
+[2026-10-02 11:13:22] step    1/1000 | step time: 20m02s | ETA: 13d21h | reward: 0.412 | loss: -6.6485E-02 | grad norm: 0.154 | entropy: 0.655 | lr: 5.00E-08 | logprob diff: 0.0050 | rollout KL: 1.20E-04 | IS masked: 0% | router cv: 1.04
+[2026-10-02 11:13:22]                 | rollout: 10m44s | train: 4m11s (12.3k tok/s) | sync: 24s | save: 52s | groups: 90/167 informative, 77 padded | refills: 240 | responses: 7248 | resp len: 264 | capped: 3.1% | gen: 3.0k tok/s | peak KV: sglang 48%, judge 11%
+[2026-10-02 11:13:22]                  reward by task (informative/quota) | gsm8k_train 0.62 48/48 | nemotron_math 0.31 40/48 | ...
+[2026-10-02 12:40:00] eval after 10 steps | score: 0.553 | math 0.710 | knowledge 0.480 | ...
+[2026-10-02 11:10:00] WARNING reward service request failed, retrying: attempt 2/12: ...
+[2026-10-02 11:20:00] ERROR RuntimeError: CUDA out of memory ... | traceback: train.log line 18234
+```
+
+`step time` is the wall clock of the whole step (rollout, training, weight sync, and
+save and eval when they happen) and `ETA` the mean of the last ten steps times the steps
+left. Resume and retried starts append to the same files. The MIXRL_* lines in
+`train.log` (and `metrics.jsonl`) are one JSON object each:
 
 | Line | When | Contents |
 |---|---|---|
@@ -119,6 +148,10 @@ terminal shows; its MIXRL_* lines are one JSON object each:
 | `MIXRL_SKIP` | step with no reward spread | no group was informative; optimizer and LR schedule untouched |
 | `MIXRL_EVAL` | each eval | per task and domain: `mean_score`, `pass@k`, `cap_rate`, `incomplete_rate`, `think_rate`; `equal_domain_mean` |
 | `MIXRL_TIMING` | each step | generation and grading times, tokens per second |
+| `MIXRL_STEP` | each step | wall-clock seconds of the step and of its phases: `rollout`, `train`, `sync` (weights to SGLang), `save`, `eval` |
+| `MIXRL_PIPELINE` | every 30 s of a rollout | responses waiting to generate, generating, waiting to grade, grading, done; tokens/s; SGLang and judge running requests and KV use |
+| `MIXRL_READY` | once | startup finished (models loaded, first weights in SGLang) |
+| `MIXRL_GRADE_FAILED` / `MIXRL_REWARD_RETRY` / `MIXRL_HEALTH_WAIT` | when they happen | a response dropped as ungradable / a reward-service request retried / waiting for a service before a step |
 | `MIXRL_PASS` / `MIXRL_FAILURE` / `MIXRL_STOP` | when they happen | a task reshuffled its pool / a rollout failed (with the error) / a clean stop |
 
 Slime also prints `rollout N: {...}`, `eval N: {...}` and `perf N: {...}` summaries;

@@ -3,8 +3,10 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
+import logging
 import math
 import os
+import re
 from pathlib import Path
 import urllib.request
 import urllib.error
@@ -15,6 +17,18 @@ from .routes import THINK_TAG, evaluation_summary, validate_route
 from .tasks import blocked
 from .objective import group_length_scales
 from .records import load_sample, save_sample
+
+
+class QuietHttpx(logging.Filter):
+    """slime's HTTP client logs every request at INFO, thousands per step (1,728 of 4,328 lines in one
+    step's train.log); keep only the requests that did not get a 2xx answer."""
+    SUCCESS = re.compile(r'"HTTP/[0-9.]+ 2[0-9][0-9]\b')
+
+    def filter(self, record):
+        return record.levelno > logging.INFO or not self.SUCCESS.search(record.getMessage())
+
+
+logging.getLogger('httpx').addFilter(QuietHttpx())
 
 
 class ServiceHTTPError(RuntimeError):

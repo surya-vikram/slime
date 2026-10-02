@@ -68,13 +68,11 @@ GSM8K's entry is 48 prompts per step, an 8,192-token cap, and eval on all 29 val
 cd $BASE_DIR/repos/slime
 mixrl/judge.sh stop                  # only if an old judge container is holding a GPU
 mixrl/run.sh tasks                   # expect "1 of 16 tasks enabled" and "judge: not needed"
-mixrl/reward.sh                      # "Judge not reachable" is expected and fine;
-                                     # it must NOT print "cannot grade gsm8k_train"
-mixrl/run.sh preflight gsm8k-01
-mixrl/run.sh start gsm8k-01
+mixrl/run.sh start gsm8k-01          # reward service, preflight, training; its log (logs/reward_start.log)
+                                     # must NOT say "cannot grade gsm8k_train"
 ```
 
-Don't run `mixrl/judge.sh`. The log is at `$BASE_DIR/runs/chimera/mixrl/gsm8k-01/logs/train.log`.
+GSM8K needs no judge, so `start` does not start one. The full log is at `$BASE_DIR/runs/chimera/mixrl/gsm8k-01/logs/train.log`.
 
 ### What to check in the log
 

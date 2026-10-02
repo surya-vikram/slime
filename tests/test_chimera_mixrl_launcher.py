@@ -61,14 +61,22 @@ echo "to stderr" >&2
 exit 3
 '''
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, LOG_DIR=f'{directory}/logs', RUN_NAME='r', RESUME='0', DRY_RUN='0')
+            env = dict(os.environ, LOG_DIR=f'{directory}/logs', RUN_NAME='r', RESUME='0', DRY_RUN='0',
+                       PREFLIGHT_ONLY='0', SCRIPT_DIR=str(LAUNCHER.parent))
             for attempt in (1, 2):
                 result = subprocess.run(['bash', '-Eeuo', 'pipefail', '-c', script], env=env,
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 3, result.stderr)
             log = (Path(directory) / 'logs/train.log').read_text()
-            for line in ('RUN_NAME=r', 'to stdout', 'to stderr', 'cleanup ran'):
+            for line in ('RUN_NAME=r', 'to stdout', 'to stderr', 'cleanup ran', 'launcher exited with status 3'):
                 self.assertEqual(log.count(line), 2, log)  # appended, not overwritten, on the second launch
+            # The terminal (and console.log) get the concise view: the exit line, not every line.
+            self.assertIn('launcher exited with status 3', result.stdout)
+            self.assertNotIn('to stdout', result.stdout)
+            self.assertEqual((Path(directory) / 'logs/console.log').read_text().count('launcher exited'), 2)
+            # MIXRL_CONSOLE=full shows every line.
+            result = subprocess.run(['bash', '-Eeuo', 'pipefail', '-c', script], env=dict(env, MIXRL_CONSOLE='full'),
+                                    capture_output=True, text=True)
             self.assertIn('cleanup ran', result.stdout)
 
     def test_commit_recording_accepts_a_copy_without_git(self):

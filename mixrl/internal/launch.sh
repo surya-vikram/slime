@@ -137,11 +137,20 @@ TRAIN_DATA=$MIXRL_DATA_DIR/splits/rl_train.jsonl
 EVAL_DATA=$MIXRL_DATA_DIR/splits/rl_val.jsonl
 MEGATRON_ROOT=${MEGATRON_ROOT:-/root/Megatron-LM}
 
-# Everything printed from here to exit also goes to logs/train.log (appended on retry and
-# resume). Cleanup steps registered below run first; then the log is flushed.
+# Everything printed from here to exit goes to logs/train.log (appended on retry and resume).
+# The terminal shows a concise view of it (mixrl/internal/console.py: one line per step, progress,
+# evaluations, warnings, errors), also kept as logs/console.log, with every MIXRL_* record in
+# logs/metrics.jsonl. MIXRL_CONSOLE=full shows every line. If the view stops, train.log carries on.
+# Cleanup steps registered below run first; then the log is flushed.
 mkdir -p "$LOG_DIR"
-exec > >(tee -a "$LOG_DIR/train.log") 2>&1
+LOG_OFFSET=$(wc -l < "$LOG_DIR/train.log" 2>/dev/null || echo 0)
+export MIXRL_CONSOLE MIXRL_CONSOLE_PROGRESS_SECONDS
+if [[ "$DRY_RUN" == 1 || "$PREFLIGHT_ONLY" == 1 ]]; then MIXRL_CONSOLE=full; fi  # checks print everything
+exec > >(tee -a --output-error=warn-nopipe "$LOG_DIR/train.log" \
+    | python3 -u "$SCRIPT_DIR/console.py" --log-dir "$LOG_DIR" --offset "$LOG_OFFSET") 2>&1
 LOG_TEE_PID=$!
+# A line for the terminal view (it shows only these, MIXRL_* records and errors).
+say() { echo "MIXRL_SAY $*"; }
 echo "=== $(date -u +%FT%TZ) mixrl/internal/launch.sh RUN_NAME=$RUN_NAME RESUME=$RESUME DRY_RUN=$DRY_RUN"
 # Thousands of concurrent generation and grading connections: the usual soft limit of 1024 open
 # files fails them with "Too many open files". Ray, SGLang and the rollout process inherit this.
@@ -150,6 +159,7 @@ EXIT_STEPS=()
 on_exit() {
     local status=$? step
     for step in "${EXIT_STEPS[@]}"; do eval "$step" || true; done
+    say "launcher exited with status $status | logs: $LOG_DIR"
     exec >&- 2>&-
     wait "$LOG_TEE_PID" 2>/dev/null || true
     exit "$status"
@@ -396,6 +406,8 @@ SGLANG_ARGS=(
     --sglang-cuda-graph-max-bs-decode "$SGLANG_CUDA_GRAPH_MAX_BS"
     --sglang-enable-metrics
     --sglang-context-length "$TRAIN_SEQUENCE_LENGTH"
+    # No access-log line per HTTP request (thousands per step); SGLang still logs errors.
+    --sglang-log-level-http warning
 )
 # Slime also caps in-flight requests at --sglang-server-concurrency (default 512) per engine;
 # derive it from MIXRL_RESPONSE_CONCURRENCY so that setting is the real limit.
@@ -498,6 +510,11 @@ echo "Checkpoint context: $RESOLVED_CONTEXT_PHASE maximum=$MODEL_MAX_CONTEXT; ru
 echo "Megatron actor: dense-DP=$POLICY_GPUS, expert-DP=$((POLICY_GPUS / EXPERT_MODEL_PARALLEL_SIZE)), TP=PP=CP=ETP=1, EP=$EXPERT_MODEL_PARALLEL_SIZE, distributed optimizer"
 echo "SGLang rollout: $ROLLOUT_GPUS independent TP=1 engines, mode=$EXECUTION_MODE colocate=$COLOCATE"
 echo "Batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT responses = $GLOBAL_BATCH_SIZE samples"
+say "MixRL run $RUN_NAME ($([[ "$RESUME" == 1 ]] && echo resume || echo new)) | model: $MODEL_NAME |" \
+    "training GPUs: $POLICY_GPUS (EP $EXPERT_MODEL_PARALLEL_SIZE) | SGLang engines: $ROLLOUT_GPUS |" \
+    "batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT = $GLOBAL_BATCH_SIZE samples | steps: $NUM_ROLLOUT |" \
+    "eval every $EVAL_INTERVAL | save every $SAVE_INTERVAL"
+say "logs: $LOG_DIR | train.log: full output | console.log: this view | metrics.jsonl: all records"
 if [[ "$DRY_RUN" == 1 ]]; then
     echo "Dry run only: command/manifests written; no Ray services or training started."
     exit 0
@@ -568,6 +585,7 @@ print(json.dumps({"env_vars": values}))
 PY
 )
 
+say "starting Ray and the training job: loading Megatron and SGLang takes a few minutes"
 PYTHONPATH="$RAY_SERVICE_PYTHONPATH" ray job submit \
     --log-color false \
     --address="http://${MASTER_ADDR:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}" \

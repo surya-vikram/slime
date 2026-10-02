@@ -219,13 +219,15 @@ GitHub "Download ZIP" copies also work: unzip them into `repos/` and rename
 
 ```bash
 cd $BASE_DIR/repos/slime
-mixrl/judge.sh                 # only if an enabled task needs the judge; with JUDGE_USE_DOCKER=1 it waits until the judge serves
-mixrl/reward.sh                # prints whether the judge is reachable and any task it cannot grade
-mixrl/run.sh tasks             # task table: prompts per step, eval size, judge use
-mixrl/run.sh preflight         # everything except the GPUs, in the real container (~minutes: hashes checkpoints)
-mixrl/run.sh start gsm8k-01
-mixrl/run.sh resume gsm8k-01   # after an interruption
+mixrl/run.sh tasks             # optional preview: prompts per step, eval size, judge use
+mixrl/run.sh start gsm8k-01    # judge (if needed and not up) -> reward service (if not up) -> tasks -> preflight -> training
+mixrl/run.sh resume gsm8k-01   # after an interruption (reuses running services, no preflight)
 ```
+
+`start` prints one line per step and stops at the first failure with the end of that step's
+log; the preflight checks everything except the GPUs in the real container (~minutes: it
+hashes checkpoints). Running services are reused: after changing judge or reward settings,
+restart them with `mixrl/judge.sh` / `mixrl/reward.sh` (or stop them with `... stop`).
 
 Choose tasks in `mixrl/tasks.json` and settings in `mixrl/config.env` (or on the command
 line: `LR=2e-6 mixrl/run.sh start run-b`). Stop cleanly at a step boundary with
@@ -239,11 +241,13 @@ Everything for a run is in `$BASE_DIR/runs/chimera/mixrl/<RUN_NAME>/`:
 
 | Path | Contents |
 |---|---|
-| `logs/train.log` | everything the run printed (same as the terminal), from launch to exit; search `MIXRL_COLLECTION` (rewards), `MIXRL_TRAIN` (loss, grad norm), `MIXRL_ROUTER` (expert load), `MIXRL_EVAL`, `MIXRL_FAILURE`; all lines in [`mixrl/README.md`](../README.md#watching-a-run) |
-| `logs/reward_service.log`, `logs/judge.log` | the reward service's and Docker judge's output during the run |
+| `logs/train.log` | everything the run printed, from launch to exit; search `MIXRL_STEP` (step time), `MIXRL_COLLECTION` (rewards), `MIXRL_TRAIN` (loss, grad norm), `MIXRL_ROUTER` (expert load), `MIXRL_EVAL`, `MIXRL_FAILURE`; all lines in [`mixrl/README.md`](../README.md#watching-a-run) |
+| `logs/console.log`, `logs/metrics.jsonl` | the concise terminal view (one line per step with step time and ETA, rollout progress, evals, warnings, errors) and every MIXRL_* record as JSON lines |
+| `logs/reward_service.log`, `logs/judge.log` | the reward service (settings, a stats line a minute, failed requests) and judge output during the run |
+| `logs/judge_start.log`, `logs/reward_start.log`, `logs/preflight.log`, `logs/tasks.txt` | what `start` did before training |
 | `logs/ray_logs-*.tar.gz` | Ray's internal logs, saved at exit (worker kills, raylet errors) |
 | `logs/gpu_metrics.csv` | GPU utilization, memory and power every 5 s |
-| `rollouts/train-N/` | per-step `metrics.json`, `timing.json`, `collection.jsonl`; each response's file (tokens, log-probs, expert routes, top-p sets; MBs each), kept by default (`MIXRL_KEEP_TRAIN_SAMPLES=0` drops a step's files once the next step starts) |
+| `rollouts/train-N/` | per-step `metrics.json`, `timing.json`, `collection.jsonl`; each response's file (tokens, log-probs, expert routes, top-p sets; MBs each) only with `MIXRL_KEEP_TRAIN_SAMPLES=1` |
 | `rollouts/eval-*/evaluation.json` | per-task and per-domain eval scores |
 | `checkpoints/` | Megatron checkpoints (every `SAVE_INTERVAL` steps and at the end) |
 | `manifests/` | exactly what ran: `config.env`, `tasks.json`, resolved `mixrl_config.json`, source snapshot, command |

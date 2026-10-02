@@ -24,8 +24,10 @@ if [[ "$(basename "$0")" == docker ]]; then
         if [[ "$prev" == --env-file ]]; then cp "$arg" "$STUB_LOG/env_file"; fi
         prev=$arg
     done
-    # `docker ps --format {{.Names}}` lists the running reward-service containers; other `ps` calls only test for a match.
-    if [[ "$1" == ps && " $* " == *"{{.Names}}"* ]]; then echo mixrl-reward-service
+    # `docker ps --format {{.Names}}` lists the running reward-service containers; other `ps` calls only test for
+    # a match. STUB_NO_CONTAINERS=1: every started container has already died.
+    if [[ "$1" == ps && -n "${STUB_NO_CONTAINERS:-}" ]]; then :
+    elif [[ "$1" == ps && " $* " == *"{{.Names}}"* ]]; then echo mixrl-reward-service
     elif [[ "$1" == ps ]]; then echo running; fi
     if [[ "$1" == inspect ]]; then echo "${STUB_RESTARTS:-0}"; fi
     # A real `docker run` lasts the whole run; give background log followers time to start.
@@ -118,8 +120,14 @@ class ScriptTests(unittest.TestCase):
     def test_start_and_resume(self):
         result = self.run_script('run.sh', 'start', 'gsm8k-01')
         self.assertEqual(result.returncode, 0, result.stderr)
+        # Both services answer, so start reuses them, then runs the preflight (no GPUs) and the training.
+        for line in ('tasks: 16 of 16 tasks enabled', 'judge: already running', 'reward service: already running',
+                     'preflight: ok', 'training: start run gsm8k-01'):
+            self.assertIn(line, result.stdout)
         calls = self.calls('docker')
-        (call,) = [c for c in calls if c[0] == 'run']
+        preflight, call = [c for c in calls if c[0] == 'run']
+        self.assertIn('DRY_RUN=1', preflight)
+        self.assertNotIn('--gpus', preflight)
         self.assertIn('"device=0,1,2,3,4,5"', call)
         self.assertIn(f'{self.base}/runs:/data/runs', call)
         self.assertNotIn('DRY_RUN=1', call)
@@ -142,14 +150,34 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('no checkpoint to resume', result.stderr)
         (run_dir / 'checkpoints').mkdir()
         (run_dir / 'checkpoints/latest_checkpointed_iteration.txt').write_text('10')
+        before = len([c for c in self.calls('docker') if c[0] == 'run'])
         result = self.run_script('run.sh', 'resume', 'gsm8k-01')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.env_file()['RESUME'], self.env_file()['RUN_NAME']), ('1', 'gsm8k-01'))
+        self.assertEqual(len([c for c in self.calls('docker') if c[0] == 'run']), before + 1)  # no preflight
+
+    def test_start_brings_up_missing_services_and_stops_when_one_fails(self):
+        # Judge down and needed by the enabled tasks: start runs judge.sh, whose container dies at once.
+        result = self.run_script('run.sh', 'start', 'run-a', JUDGE_PORT=str(free_port()), STUB_NO_CONTAINERS='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('judge: starting on GPUs 6,7', result.stdout)
+        self.assertIn('the judge did not start', result.stderr)
+        runs = [c for c in self.calls('docker') if c[0] == 'run']
+        self.assertEqual([c[c.index('--name') + 1] for c in runs], ['mixrl-judge-server'])
+        # Judge up, reward service down: reward.sh runs; its container dies, so nothing trains.
+        result = self.run_script('run.sh', 'start', 'run-b', REWARD_PORT=str(free_port()), STUB_NO_CONTAINERS='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('reward service: starting 1 process(es)', result.stdout)
+        self.assertIn('the reward service did not start', result.stderr)
+        runs = [c for c in self.calls('docker') if c[0] == 'run']
+        self.assertFalse(any('mixrl/internal/launch.sh' in c for c in runs))  # neither preflight nor training
+        log = self.base / 'runs/chimera/mixrl/run-b/logs/reward_start.log'
+        self.assertIn('reward service did not become ready', log.read_text())
 
     def test_clear_errors_before_any_container(self):
         cases = (
             (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=6'),
-            (('run.sh', 'start'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
+            (('run.sh', 'preflight'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
             (('run.sh', 'start'), {'MODEL_NAME': 'missing'}, 'check BASE_DIR, MODEL_NAME'),
             (('run.sh', 'start', 'bad/name'), {}, "use letters, digits"),
             (('judge.sh',), {'JUDGE_GPUS': '2,3', 'JUDGE_TP': '1'}, 'lists 2 GPUs but JUDGE_TP x JUDGE_DP = 1 x 1'),
