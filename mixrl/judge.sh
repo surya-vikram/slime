@@ -50,6 +50,9 @@ echo "Judge $JUDGE_NAME on GPUs $JUDGE_GPUS (TP=$JUDGE_TP, DP=$JUDGE_DP) at http
 if [[ "$JUDGE_USE_DOCKER" == 1 ]]; then
     serve_args /models
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    # Docker would create a missing mount folder as root, and then reward.sh (run as you) could not
+    # create its cache next to it in $BASE_DIR/cache.
+    mkdir -p "$BASE_DIR/cache/vllm_cache"
     # Inner quotes keep a comma-separated device list as one value for Docker.
     docker run -d --name "$CONTAINER" --gpus "\"device=$JUDGE_GPUS\"" --ipc=host --net=host --restart=unless-stopped \
         -v "$BASE_DIR/models:/models:ro" -v "$BASE_DIR/cache/vllm_cache:/root/.cache/vllm" \

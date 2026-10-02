@@ -273,6 +273,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         run = next(c for c in self.calls('docker') if c[0] == 'run')
         self.assertEqual(run[run.index('--gpus') + 1], '"device=2,3"')
+        self.assertTrue((self.base / 'cache/vllm_cache').is_dir())  # made by us, not by Docker as root
         self.assertIn('/models/judge', run)
         spec = json.loads(run[run.index('--speculative-config') + 1])
         self.assertEqual(spec['model'], '/models/judge-assistant')
