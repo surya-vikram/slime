@@ -516,6 +516,8 @@ say "MixRL run $RUN_NAME ($([[ "$RESUME" == 1 ]] && echo resume || echo new)) | 
     "batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT = $GLOBAL_BATCH_SIZE samples | steps: $NUM_ROLLOUT |" \
     "eval every $EVAL_INTERVAL | save every $SAVE_INTERVAL"
 say "logs: $LOG_DIR | train.log: full output | console.log: this view | metrics.jsonl: all records"
+# What the run's processes will actually read (resolved config and train command), not what was asked for.
+say "$(python3 "$SCRIPT_DIR/console.py" --settings "$CHIMERA_MIXRL_CONFIG" "$MANIFEST_DIR/train_command.sh" 2>&1 | tail -1)"
 if [[ "$DRY_RUN" == 1 ]]; then
     echo "Dry run only: command/manifests written; no Ray services or training started."
     exit 0

@@ -117,6 +117,21 @@ while IFS= read -r name; do
 done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$env_file"
 printf 'RUN_NAME=%s\nRESUME=%s\nDATA_ROOT=/data\nCHIMERA_TRANSFORMERS_ROOT=/workspace/transformers\n' \
     "$RUN_NAME" "$RESUME" >> "$env_file"
+# Launcher switches with no config.env entry (defaults in mixrl/internal/launch.sh) reach the container too
+# when set for this command, e.g. MIXRL_PIPELINE_SECONDS=15 mixrl/run.sh start. Container paths and the
+# run's identity are set above, never taken from the host.
+container_owned=" DATA_ROOT CHIMERA_TRANSFORMERS_ROOT HF_CHECKPOINT MCORE_CHECKPOINT MEGATRON_ROOT MIXRL_DATA_DIR "
+container_owned+="MIXRL_CODE_AUDIT_DIR MIXRL_TASKS_CONFIG MIXRL_RUNS_ROOT RUN_NAME RESUME DRY_RUN PREFLIGHT_ONLY "
+known=" $(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d = | tr '\n' ' ') "
+for name in $(sed -nE 's/^(export )?([A-Z_][A-Z0-9_]*)=\$\{\2:-.*/\2/p' "$MIXRL_DIR/internal/launch.sh" | sort -u); do
+    [[ "$container_owned" == *" $name "* || "$known" == *" $name "* ]] && continue
+    known+="$name "
+    if [[ -n "${!name+set}" ]]; then printf '%s=%s\n' "$name" "${!name}" >> "$env_file"; fi
+done
+# A MixRL-looking variable that is not a setting anywhere is most likely a typo: say so instead of ignoring it.
+for name in $(compgen -e | grep -E '^(MIXRL|CHIMERA|SGLANG|JUDGE|REWARD)_' || true); do
+    [[ "$known$container_owned" == *" $name "* ]] || echo "warning: $name is set but is not a MixRL setting; it has no effect" >&2
+done
 
 docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576
     -v "$BASE_DIR/models/$MODEL_NAME:/data/models/$MODEL_NAME:ro"

@@ -243,6 +243,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn('1 of 2 tasks enabled; 1 prompts per step x 16 responses = 16 samples', result.stdout)
         self.assertIn('judge: not needed', result.stdout)
         self.assertIn('mcqa: mcqa fixture', result.stdout)
+        # The same run name with a changed setting is refused, naming what changed.
+        result, _ = self.launch(self.health, LR='3e-6')
+        self.assertEqual(result.returncode, 1)
+        # (each launch here also gets a new reward-service port, so scorer_url differs too)
+        self.assertRegex(result.stdout + result.stderr, r'Existing resolved config differs in [a-z_, ]*\blr\b')
 
     def test_launcher_rejects_removed_task_variables(self):
         for name, value in (('MIXRL_QUOTAS', '{"mcqa":1}'), ('MIXRL_CAPS', '{"mcqa":64}'),

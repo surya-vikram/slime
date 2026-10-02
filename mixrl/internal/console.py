@@ -294,11 +294,44 @@ class Console:
         self.say(' | '.join(parts))
 
 
+def settings_line(config, command, env):
+    """The settings a run actually uses, from what its processes read: the resolved config (rollout workers)
+    and the train command (Megatron, SGLang), not the environment they came from."""
+    def flag(name, absent='-'):
+        if name not in command:
+            return absent
+        value = command[command.index(name) + 1] if command.index(name) + 1 < len(command) else ''
+        return 'on' if not value or value.startswith('--') else value
+    urls = config.get('scorer_urls') or [config.get('scorer_url')]
+    return ' | '.join([
+        'settings', f'tasks: {config.get("tasks_file")}',
+        f'rollout: temperature {config.get("rollout_temperature")}, top-p {config.get("rollout_top_p")}, '
+        f'top-k {config.get("rollout_top_k")}',
+        f'R3 replay: {"on" if config.get("routing_replay") else "OFF"}',
+        f'refill rounds: {config.get("refill_rounds")}', f'oversample: {config.get("oversample", 0)}',
+        f'in flight: {config.get("response_concurrency")} responses, {config.get("reward_concurrency")} grading, '
+        f'{config.get("inflight_groups")} groups',
+        f'reward services: {len(urls)}',
+        f'SGLang per engine: {flag("--sglang-max-running-requests", "auto")} running, request cap '
+        f'{flag("--sglang-server-concurrency")}, CUDA graphs to {flag("--sglang-cuda-graph-max-bs-decode")}, '
+        f'memory {flag("--sglang-mem-fraction-static")}',
+        f'distributed post: {flag("--use-distributed-post", "off")}',
+        f'keep train responses: {env.get("MIXRL_KEEP_TRAIN_SAMPLES", "0")}',
+        f'lr: {config.get("lr")}', f'max tokens/GPU: {config.get("max_tokens_per_gpu")}'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--log-dir', required=True)
+    parser.add_argument('--log-dir')
     parser.add_argument('--offset', type=int, default=0, help='lines already in train.log before this run')
+    parser.add_argument('--settings', nargs=2, metavar=('CONFIG_JSON', 'TRAIN_COMMAND_SH'),
+                        help='print the settings line for a resolved config and train command, then exit')
     a = parser.parse_args()
+    if a.settings:
+        import shlex
+        config, command = json.load(open(a.settings[0])), shlex.split(open(a.settings[1]).read())
+        print(settings_line(config, command, os.environ))
+        return
     full = os.environ.get('MIXRL_CONSOLE', 'concise') == 'full'
     progress = float(os.environ.get('MIXRL_CONSOLE_PROGRESS_SECONDS', '60'))
     with open(os.path.join(a.log_dir, 'console.log'), 'a') as console_log, \

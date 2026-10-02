@@ -156,6 +156,20 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual((self.env_file()['RESUME'], self.env_file()['RUN_NAME']), ('1', 'gsm8k-01'))
         self.assertEqual(len([c for c in self.calls('docker') if c[0] == 'run']), before + 1)  # no preflight
 
+    def test_command_line_settings_reach_the_container_and_typos_are_reported(self):
+        result = self.run_script('run.sh', 'start', 'run-c', LR='3e-6', MIXRL_PIPELINE_SECONDS='15',
+                                 CHIMERA_ROUTING_REPLAY='0', MIXRL_EXTEND_CONSTANT_HORIZON='1',
+                                 DATA_ROOT='/host/path', MIXRL_TASKS_CONFIG='/host/tasks.json', MIXRL_PIPLINE_SECONDS='5')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = self.env_file()
+        # config.env settings and launcher switches alike; container paths stay the container's.
+        self.assertEqual((settings['LR'], settings['MIXRL_PIPELINE_SECONDS'], settings['CHIMERA_ROUTING_REPLAY'],
+                          settings['MIXRL_EXTEND_CONSTANT_HORIZON'], settings['DATA_ROOT']),
+                         ('3e-6', '15', '0', '1', '/data'))
+        self.assertNotIn('MIXRL_TASKS_CONFIG', settings)
+        self.assertIn('warning: MIXRL_PIPLINE_SECONDS is set but is not a MixRL setting', result.stderr)
+        self.assertNotIn('warning: MIXRL_PIPELINE_SECONDS', result.stderr)
+
     def test_start_brings_up_missing_services_and_stops_when_one_fails(self):
         # Judge down and needed by the enabled tasks: start runs judge.sh, whose container dies at once.
         result = self.run_script('run.sh', 'start', 'run-a', JUDGE_PORT=str(free_port()), STUB_NO_CONTAINERS='1')

@@ -133,6 +133,26 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('step  5/10 | step time: 5m00s | ETA: 25m00s | skipped: no informative groups', lines(out)[0])
 
 
+class SettingsLineTests(unittest.TestCase):
+    def test_settings_come_from_the_resolved_config_and_the_train_command(self):
+        config = {'tasks_file': 'mixrl/tasks.json', 'rollout_temperature': 1.0, 'rollout_top_p': 0.95, 'rollout_top_k': 20,
+                  'routing_replay': 1, 'refill_rounds': 2, 'oversample': 0.3, 'response_concurrency': 3200,
+                  'reward_concurrency': 1400, 'inflight_groups': 100000, 'scorer_url': 'http://a',
+                  'scorer_urls': ['http://a', 'http://b'], 'lr': 1e-6, 'max_tokens_per_gpu': 16384}
+        command = ['python3', 'train.py', '--sglang-max-running-requests', '1024', '--sglang-server-concurrency', '1600',
+                   '--sglang-cuda-graph-max-bs-decode', '1024', '--sglang-mem-fraction-static', '0.8',
+                   '--use-distributed-post', '--num-rollout', '2']
+        line = console.settings_line(config, command, {'MIXRL_KEEP_TRAIN_SAMPLES': '1'})
+        for part in ('top-p 0.95, top-k 20', 'R3 replay: on', 'refill rounds: 2', 'oversample: 0.3',
+                     'in flight: 3200 responses, 1400 grading, 100000 groups', 'reward services: 2',
+                     'SGLang per engine: 1024 running, request cap 1600, CUDA graphs to 1024, memory 0.8',
+                     'distributed post: on', 'keep train responses: 1', 'max tokens/GPU: 16384'):
+            self.assertIn(part, line)
+        line = console.settings_line(dict(config, routing_replay=0, scorer_urls=None), command[:2], {})
+        for part in ('R3 replay: OFF', 'reward services: 1', 'auto running', 'distributed post: off'):
+            self.assertIn(part, line)
+
+
 class StepClockTests(unittest.TestCase):
     def test_phases_and_total(self):
         times = iter([100.0, 100.0, 700.0, 700.0, 940.0, 940.0, 960.0, 961.0])

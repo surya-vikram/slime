@@ -271,8 +271,10 @@ def resolve():
         write_json(path.parent / f'horizon_extension_{new_horizon}.json', {
             'original_schedule_rollouts': old_horizon, 'execution_rollouts': new_horizon,
             'constant_lr': c['lr'], 'config_hash': digest(previous)})
-    if path.exists() and json.loads(path.read_text()) != c:
-        raise ValueError('Existing resolved config differs; choose a fresh run name')
+    if path.exists() and (previous := json.loads(path.read_text())) != c:
+        changed = sorted(k for k in set(previous) | set(c) if previous.get(k) != c.get(k))
+        raise ValueError(f'Existing resolved config differs in {", ".join(changed[:10])}; '
+                         'resume with the settings the run started with, or choose a fresh run name')
     write_json(path, c)
     print(f'MixRL tasks ({tasks_path})\n' + task_file.table(spec, c['samples_per_prompt']))
     print(f'Reward service judge: {c["judge"]} ({"reachable" if health["judge"]["ready"] else "not reachable"}); '
