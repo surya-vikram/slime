@@ -147,6 +147,9 @@ mkdir -p "$LOG_DIR"
 exec > >(tee -a "$LOG_DIR/train.log") 2>&1
 LOG_TEE_PID=$!
 echo "=== $(date -u +%FT%TZ) mixrl/internal/launch.sh RUN_NAME=$RUN_NAME RESUME=$RESUME DRY_RUN=$DRY_RUN"
+# Thousands of concurrent generation and grading connections: the usual soft limit of 1024 open
+# files fails them with "Too many open files". Ray, SGLang and the rollout process inherit this.
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 EXIT_STEPS=()
 on_exit() {
     local status=$? step

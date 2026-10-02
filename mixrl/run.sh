@@ -72,7 +72,7 @@ done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$en
 printf 'RUN_NAME=%s\nRESUME=%s\nDATA_ROOT=/data\nCHIMERA_TRANSFORMERS_ROOT=/workspace/transformers\n' \
     "$RUN_NAME" "$RESUME" >> "$env_file"
 
-docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864
+docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576
     -v "$BASE_DIR/models/$MODEL_NAME:/data/models/$MODEL_NAME:ro"
     -v "$BASE_DIR/datasets/$DATASET_NAME:/data/datasets/$DATASET_NAME:ro"
     -v "$TRANSFORMERS_DIR:/workspace/transformers:ro"

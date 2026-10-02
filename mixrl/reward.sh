@@ -44,7 +44,7 @@ for ((i = 0; i < REWARD_PROCESSES; i++)); do
     names+=("$name")
     mkdir -p "$cache"
     # The docker socket lets the service run APPS code in sibling sandbox containers on this host.
-    docker run -d --name "$name" --net=host --ipc=host --restart=unless-stopped \
+    docker run -d --name "$name" --net=host --ipc=host --restart=unless-stopped --ulimit nofile=1048576:1048576 \
         -v /var/run/docker.sock:/var/run/docker.sock \
         -v "$EVAL_REPO:/opt/chimera-eval" \
         -v "$DATA_DIR:/data/datasets/$DATASET_NAME:ro" \
