@@ -523,6 +523,23 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('sglang', line)  # unreachable endpoints are left out, never fatal
         self.assertNotIn('judge', line)
 
+    async def test_loop_profile_in_the_pipeline_line(self):
+        import contextlib, io
+        flow = {'gen_queued': 0, 'generating': 0, 'grade_queued': 0, 'grading': 0, 'done': 0, 'gen_tokens': 0}
+        args = types.SimpleNamespace(sglang_router_ip='127.0.0.1', sglang_router_port=1)
+        out = io.StringIO()
+        with patch.dict(os.environ, {'MIXRL_PROFILE': '1', 'MIXRL_JUDGE_METRICS_URL': ''}), contextlib.redirect_stdout(out):
+            task = asyncio.create_task(runtime.pipeline_heartbeat(args, 0, 'train', flow, .15))
+            end = time.monotonic() + .4
+            while time.monotonic() < end:  # keep the loop busy in a recognizable function
+                sum(range(20000))
+                await asyncio.sleep(0)
+            task.cancel()
+        lines = [json.loads(l.split(' ', 1)[1]) for l in out.getvalue().splitlines() if l.startswith('MIXRL_PIPELINE ')]
+        profile = next(l['loop_profile'] for l in lines if l.get('loop_profile'))
+        self.assertGreater(profile['busy_share'], 0)
+        self.assertTrue(profile['top'])
+
     def test_judge_metrics_parsing(self):
         text = """# HELP vllm:num_requests_running x
 vllm:num_requests_running{engine="0",model_name="j"} 12.0

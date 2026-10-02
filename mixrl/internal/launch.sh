@@ -57,7 +57,8 @@ MIXRL_REWARD_BACKOFF_MAX=${MIXRL_REWARD_BACKOFF_MAX:-8}   # Longest sleep (s) be
 MIXRL_PIPELINE_SECONDS=${MIXRL_PIPELINE_SECONDS:-30} # MIXRL_PIPELINE line interval during collection; 0 turns it off.
 MIXRL_JUDGE_METRICS_URL=${MIXRL_JUDGE_METRICS_URL:-http://${JUDGE_HOST:-127.0.0.1}:${JUDGE_PORT:-8025}/metrics} # Judge load in that line.
 export MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE MIXRL_KEEP_TRAIN_SAMPLES MIXRL_HEALTH_WAIT_SECONDS MIXRL_REWARD_BACKOFF_MAX
-export MIXRL_PIPELINE_SECONDS MIXRL_JUDGE_METRICS_URL
+MIXRL_PROFILE=${MIXRL_PROFILE:-0} # 1: sample the rollout event loop during collection and print MIXRL_PROFILE.
+export MIXRL_PIPELINE_SECONDS MIXRL_JUDGE_METRICS_URL MIXRL_PROFILE
 export MIXRL_FINAL_RESERVE_SECONDS=${MIXRL_FINAL_RESERVE_SECONDS:-1200}
 export MIXRL_INITIAL_UPDATE_SECONDS=${MIXRL_INITIAL_UPDATE_SECONDS:-300}
 OFFLOAD_TRAIN=${OFFLOAD_TRAIN:-1} # Small-reference-model residency experiment only.
@@ -338,6 +339,10 @@ ROLLOUT_ARGS=(
 if [[ "$MODEL_PROFILE" == chimera ]]; then
     ROLLOUT_ARGS+=(--rollout-stop "<end_of_turn>")
 fi
+if [[ "${MIXRL_DISTRIBUTED_POST:-0}" == 1 ]]; then
+    # SGLang HTTP calls and reply parsing in Ray worker processes, off the rollout event loop.
+    ROLLOUT_ARGS+=(--use-distributed-post)
+fi
 
 # Slime validates that an eval dataset is declared; the MixRL rollout selects
 # enabled tasks' prompts from this frozen rl_val split, never from main_test.
@@ -552,6 +557,7 @@ keys = (
     "MIXRL_REWARD_BACKOFF_MAX",
     "MIXRL_PIPELINE_SECONDS",
     "MIXRL_JUDGE_METRICS_URL",
+    "MIXRL_PROFILE",
     "CHIMERA_MATCH_DENSE_SWIGLU",
     "CHIMERA_SGLANG_FULL_BF16_REDUCTION",
 )

@@ -364,12 +364,57 @@ def _judge_load(url):
             'kv_usage': round(sum(kv) / len(kv), 3) if kv else None}
 
 
+class LoopProfiler:
+    """Samples the event-loop thread's stack every 20 ms (stdlib only; py-spy needs ptrace).
+    snapshot() returns the share of samples where the loop was busy and the busiest functions
+    since the previous snapshot. Idle samples sit in the selector waiting for I/O."""
+
+    def __init__(self, interval=.02):
+        import collections, sys, threading
+        self.target, self.interval = threading.get_ident(), interval
+        self.counts, self.lock, self.stop = collections.Counter(), threading.Lock(), threading.Event()
+        def run():
+            while not self.stop.wait(self.interval):
+                frame = sys._current_frames().get(self.target)
+                if frame is None:
+                    continue
+                chain, f = [], frame
+                while f is not None and len(chain) < 4:
+                    chain.append(f'{f.f_code.co_filename.rsplit("/", 1)[-1]}:{f.f_code.co_name}')
+                    f = f.f_back
+                with self.lock:
+                    self.counts[' < '.join(chain)] += 1
+        threading.Thread(target=run, daemon=True, name='mixrl-loop-profiler').start()
+
+    def snapshot(self, top=6):
+        with self.lock:
+            counts, self.counts = self.counts, type(self.counts)()
+        total = sum(counts.values())
+        if not total:
+            return None
+        idle = sum(v for k, v in counts.items() if k.startswith('selectors.py:select'))
+        busy = [(k, v) for k, v in counts.most_common() if not k.startswith('selectors.py:select')][:top]
+        return {'busy_share': round(1 - idle / total, 3), 'top': [[k, round(v / total, 3)] for k, v in busy]}
+
+    def close(self):
+        self.stop.set()
+
+
 async def pipeline_heartbeat(args, rollout_id, phase, flow, interval):
     """Every `interval` seconds: where the responses are, how late the event loop runs, and how
     busy SGLang and the judge are. A large loop lag means this process, not the GPUs, is the
     bottleneck; few running requests with a long grade queue means grading is."""
     loop, started, tokens = asyncio.get_running_loop(), time.monotonic(), 0
     judge_url = os.environ.get('MIXRL_JUDGE_METRICS_URL', '')
+    profiler = LoopProfiler() if os.environ.get('MIXRL_PROFILE', '0') == '1' else None
+    try:
+        await _heartbeat_loop(args, rollout_id, phase, flow, interval, loop, started, tokens, judge_url, profiler)
+    finally:
+        if profiler:
+            profiler.close()
+
+
+async def _heartbeat_loop(args, rollout_id, phase, flow, interval, loop, started, tokens, judge_url, profiler):
     while True:
         tick = loop.time()
         await asyncio.sleep(interval)
@@ -387,6 +432,8 @@ async def pipeline_heartbeat(args, rollout_id, phase, flow, interval):
                 line['judge'] = await asyncio.wait_for(asyncio.to_thread(_judge_load, judge_url), 6)
             except Exception:
                 pass
+        if profiler:
+            line['loop_profile'] = profiler.snapshot()
         print('MIXRL_PIPELINE ' + json.dumps(line), flush=True)
 
 
