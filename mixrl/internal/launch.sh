@@ -397,6 +397,9 @@ SGLANG_ARGS=(
     --sglang-enable-metrics
     --sglang-context-length "$TRAIN_SEQUENCE_LENGTH"
 )
+# Slime also caps in-flight requests at --sglang-server-concurrency (default 512) per engine;
+# derive it from MIXRL_RESPONSE_CONCURRENCY so that setting is the real limit.
+SGLANG_ARGS+=(--sglang-server-concurrency "$(( (MIXRL_RESPONSE_CONCURRENCY + ROLLOUT_GPUS - 1) / ROLLOUT_GPUS ))")
 if [[ -n "$SGLANG_MAX_RUNNING_REQUESTS" ]]; then
     SGLANG_ARGS+=(--sglang-max-running-requests "$SGLANG_MAX_RUNNING_REQUESTS")
 fi
