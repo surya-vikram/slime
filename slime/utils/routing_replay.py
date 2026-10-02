@@ -1,4 +1,6 @@
 import os
+from contextlib import contextmanager
+
 import torch
 
 from slime.utils import accelerator
@@ -238,3 +240,40 @@ def register_routing_replay(module):
             set_routing_replay(module.routing_replay)
 
         module.register_forward_pre_hook(pre_forward_hook)
+
+
+# Filling the replay buffers is a few memory copies per micro-batch. With every torch thread (120 when
+# a container shows 240 cores but allows 50), each trainer rank's copies were throttled to ~1.8 s per
+# micro-batch: minutes per step before training could start.
+FILL_THREADS = 8
+
+
+@contextmanager
+def torch_threads(limit):
+    """At most `limit` intra-op threads inside the block; the previous count afterwards."""
+    previous = torch.get_num_threads()
+    torch.set_num_threads(max(1, min(previous, limit)))
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def layer_major_routes(routed_experts, layer_ids, pin_memory=True):
+    """Each MoE layer's routes from one micro-batch's [tokens, layers, topk] routes, in `layer_ids` order.
+
+    One pinned, layer-major copy per micro-batch: every layer's slice is a contiguous view of pinned memory,
+    which RoutingReplay.record keeps as is, instead of one strided copy into a new pinned buffer per layer.
+    """
+    if not layer_ids:
+        return []
+    out = torch.empty((len(layer_ids), routed_experts.size(0), routed_experts.size(2)),
+                      dtype=routed_experts.dtype, pin_memory=pin_memory)
+    first, last = layer_ids[0], layer_ids[-1]
+    if list(layer_ids) == list(range(first, last + 1)):
+        source = routed_experts[:, first:last + 1]
+    else:
+        source = routed_experts.index_select(1, torch.as_tensor(layer_ids, device=routed_experts.device))
+    out.copy_(source.transpose(0, 1))
+    return list(out.unbind(0))
+
