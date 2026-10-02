@@ -24,7 +24,9 @@ if [[ "$(basename "$0")" == docker ]]; then
         if [[ "$prev" == --env-file ]]; then cp "$arg" "$STUB_LOG/env_file"; fi
         prev=$arg
     done
-    if [[ "$1" == ps ]]; then echo running; fi
+    # `docker ps --format {{.Names}}` lists the running reward-service containers; other `ps` calls only test for a match.
+    if [[ "$1" == ps && " $* " == *"{{.Names}}"* ]]; then echo mixrl-reward-service
+    elif [[ "$1" == ps ]]; then echo running; fi
     if [[ "$1" == inspect ]]; then echo "${STUB_RESTARTS:-0}"; fi
     # A real `docker run` lasts the whole run; give background log followers time to start.
     if [[ "$1" == run && " $* " == *" --gpus "* ]]; then sleep 0.5; fi
@@ -94,7 +96,7 @@ class ScriptTests(unittest.TestCase):
     def test_tasks_preview_needs_no_docker(self):
         result = self.run_script('run.sh', 'tasks')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('16 of 16 tasks enabled; 512 prompts per step x 8 responses = 4096 samples', result.stdout)
+        self.assertIn('16 of 16 tasks enabled; 1008 prompts per step x 16 responses = 16128 samples', result.stdout)
         self.assertEqual(self.calls('docker'), [])
 
     def test_preflight_uses_no_gpus_and_carries_every_setting(self):
@@ -118,7 +120,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls('docker')
         (call,) = [c for c in calls if c[0] == 'run']
-        self.assertIn('"device=0,1"', call)
+        self.assertIn('"device=0,1,2,3,4,5"', call)
         self.assertIn(f'{self.base}/runs:/data/runs', call)
         self.assertNotIn('DRY_RUN=1', call)
         self.assertEqual(self.env_file()['RESUME'], '0')
@@ -146,11 +148,11 @@ class ScriptTests(unittest.TestCase):
 
     def test_clear_errors_before_any_container(self):
         cases = (
-            (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=2'),
+            (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=6'),
             (('run.sh', 'start'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
             (('run.sh', 'start'), {'MODEL_NAME': 'missing'}, 'check BASE_DIR, MODEL_NAME'),
             (('run.sh', 'start', 'bad/name'), {}, "use letters, digits"),
-            (('judge.sh',), {'JUDGE_GPUS': '2,3'}, 'lists 2 GPUs but JUDGE_TP=1'),
+            (('judge.sh',), {'JUDGE_GPUS': '2,3', 'JUDGE_TP': '1'}, 'lists 2 GPUs but JUDGE_TP x JUDGE_DP = 1 x 1'),
             (('judge.sh',), {'JUDGE_CONTEXT': '65536'}, 'must not exceed JUDGE_MAX_MODEL_LEN'),
         )
         for args, env, message in cases:
@@ -231,11 +233,11 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('JUDGE_TP x JUDGE_DP = 1 x 1', result.stderr)
 
     def test_judge_native_and_docker(self):
-        result = self.run_script('judge.sh')
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='0')
         self.assertEqual(result.returncode, 0, result.stderr)
         (call,) = self.calls('vllm')
         self.assertEqual(call[:2], ['serve', f'{self.base}/models/judge'])
-        for flag, value in (('--tensor-parallel-size', '1'), ('--max-model-len', '32768'),
+        for flag, value in (('--tensor-parallel-size', '2'), ('--max-model-len', '32768'),
                             ('--served-model-name', 'mixrl-judge'), ('--host', '127.0.0.1')):
             self.assertEqual(call[call.index(flag) + 1], value)
         (self.base / 'models/judge-assistant').mkdir()

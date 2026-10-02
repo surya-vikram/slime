@@ -47,13 +47,10 @@ MIXRL_TASKS_CONFIG=${MIXRL_TASKS_CONFIG:-$MIXRL_DIR/tasks.json}
 INITIAL_ACTOR_CHECKPOINT=${INITIAL_ACTOR_CHECKPOINT:-} # Fresh RL from other MCore weights (not optimizer).
 SAVE_HF=${SAVE_HF:-0} # Opt-in native HF export beside MCore saves; Qwen validation only.
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-512} # Unused by MixRL (per-task caps); Slime requires it.
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-} # Optional per-engine request bound.
 RESUME=${RESUME:-0}
 MIXRL_EXTEND_CONSTANT_HORIZON=${MIXRL_EXTEND_CONSTANT_HORIZON:-0} # Explicit resume-only extension; LR/WD schedule stays frozen.
 GPU_METRICS_INTERVAL=${GPU_METRICS_INTERVAL:-5} # Seconds; 0 disables nvidia-smi CSV sidecar.
 # Opt-in budget starts before model initialization. Reserve includes final eval/save.
-MIXRL_HEALTH_WAIT_SECONDS=${MIXRL_HEALTH_WAIT_SECONDS:-0} # >0: before a batch, wait this long for an unreachable judge/reward service instead of stopping.
-MIXRL_REWARD_BACKOFF_MAX=${MIXRL_REWARD_BACKOFF_MAX:-8}   # Longest sleep (s) between /score retries.
 MIXRL_PIPELINE_SECONDS=${MIXRL_PIPELINE_SECONDS:-30} # MIXRL_PIPELINE line interval during collection; 0 turns it off.
 MIXRL_JUDGE_METRICS_URL=${MIXRL_JUDGE_METRICS_URL:-http://${JUDGE_HOST:-127.0.0.1}:${JUDGE_PORT:-8025}/metrics} # Judge load in that line.
 export MIXRL_WALLCLOCK_SECONDS MIXRL_STOP_FILE MIXRL_KEEP_TRAIN_SAMPLES MIXRL_HEALTH_WAIT_SECONDS MIXRL_REWARD_BACKOFF_MAX
@@ -72,8 +69,6 @@ if [[ -n "${MODEL_CONTEXT_LENGTH:-}" && "$MODEL_CONTEXT_LENGTH" != "$TRAIN_SEQUE
     echo "MODEL_CONTEXT_LENGTH and TRAIN_SEQUENCE_LENGTH disagree" >&2; exit 1
 fi
 MODEL_CONTEXT_LENGTH=$TRAIN_SEQUENCE_LENGTH
-MIXRL_REWARD_TIMEOUT=${MIXRL_REWARD_TIMEOUT:-600}
-MIXRL_REWARD_ATTEMPTS=${MIXRL_REWARD_ATTEMPTS:-3}
 export MIXRL_ROUTER_METRICS=${MIXRL_ROUTER_METRICS:-1} # Per-step expert-load balance over all ranks (MIXRL_ROUTER).
 MIXRL_IS_POSITIVE_BOUNDS=${MIXRL_IS_POSITIVE_BOUNDS:-'[0.2,5.0]'}
 MIXRL_IS_NEGATIVE_BOUNDS=${MIXRL_IS_NEGATIVE_BOUNDS:-'[0.2,5.0]'}

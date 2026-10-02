@@ -234,13 +234,13 @@ class ConfigTests(unittest.TestCase):
         result, path = self.launch(self.health)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = json.loads(path.read_text())
-        self.assertEqual(config['samples_per_prompt'], 8)  # mixrl/config.env default
+        self.assertEqual(config['samples_per_prompt'], 16)  # mixrl/config.env default
         self.assertEqual(config['eval_samples'], 2)
         self.assertEqual(config['context_headroom'], 16)
         self.assertEqual(config['rollout_batch_size'], 1)
         self.assertEqual(config['checkpoint_context'],
                          {'phase': 'native', 'model_max_context': 32768, 'sequence_cap': 256})
-        self.assertIn('1 of 2 tasks enabled; 1 prompts per step x 8 responses = 8 samples', result.stdout)
+        self.assertIn('1 of 2 tasks enabled; 1 prompts per step x 16 responses = 16 samples', result.stdout)
         self.assertIn('judge: not needed', result.stdout)
         self.assertIn('mcqa: mcqa fixture', result.stdout)
 
