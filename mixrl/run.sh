@@ -67,6 +67,10 @@ fi
 if [[ "$command" == resume && ! -f "$run_dir/checkpoints/latest_checkpointed_iteration.txt" ]]; then
     fail "no checkpoint to resume at $run_dir/checkpoints"
 fi
+# Megatron resumes with the optimizer state; weights-only checkpoints have none (it failed with KeyError: 'optimizer').
+if [[ "$command" == resume ]] && grep -q '^NO_SAVE_OPTIM=1$' "$run_dir/manifests/config.env" 2>/dev/null; then
+    fail "run $RUN_NAME saved weights only (NO_SAVE_OPTIM=1), so it cannot resume; start a new run, and use NO_SAVE_OPTIM=0 for runs you want to resume"
+fi
 
 # start/resume: bring up what the run needs, as mixrl/judge.sh and mixrl/reward.sh would; their output
 # goes to the run's logs folder and the terminal gets one line per step.

@@ -150,6 +150,12 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('no checkpoint to resume', result.stderr)
         (run_dir / 'checkpoints').mkdir()
         (run_dir / 'checkpoints/latest_checkpointed_iteration.txt').write_text('10')
+        # A run that saved weights only cannot resume: said plainly, before any container.
+        (run_dir / 'manifests/config.env').write_text('LR=1e-6\nNO_SAVE_OPTIM=1\n')
+        result = self.run_script('run.sh', 'resume', 'gsm8k-01')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('saved weights only (NO_SAVE_OPTIM=1), so it cannot resume', result.stderr)
+        (run_dir / 'manifests/config.env').write_text('LR=1e-6\nNO_SAVE_OPTIM=0\n')
         before = len([c for c in self.calls('docker') if c[0] == 'run'])
         result = self.run_script('run.sh', 'resume', 'gsm8k-01')
         self.assertEqual(result.returncode, 0, result.stderr)
