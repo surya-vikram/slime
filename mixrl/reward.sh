@@ -56,6 +56,8 @@ for ((i = 0; i < REWARD_PROCESSES; i++)); do
         -e JUDGE_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' -e CODE_IMAGE="$EVAL_IMAGE" \
         -e CODE_CONCURRENCY="$(per_process "$CODE_CONCURRENCY")" -e REQUEST_TIMEOUT="$JUDGE_REQUEST_TIMEOUT" \
         -e REQUEST_RETRIES="$JUDGE_REQUEST_RETRIES" -e JUDGE_ATTEMPTS="$JUDGE_ATTEMPTS" \
+        -e JUDGE_KV_CACHE_NUM_TOKENS="$(per_process "$JUDGE_KV_CACHE_NUM_TOKENS")" \
+        -e MAX_PENDING="$(per_process "$JUDGE_MAX_PENDING")" \
         "$EVAL_IMAGE" -m eval_stack.reward_service \
         --data-dir "/data/datasets/$DATASET_NAME" --cache-dir /data/cache/scorer_cache \
         --host 127.0.0.1 --port "$((REWARD_PORT + i))" --workers "$(per_process "$REWARD_WORKERS")" \

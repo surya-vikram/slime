@@ -187,7 +187,8 @@ class ScriptTests(unittest.TestCase):
             self.addCleanup(server.shutdown)
         port = first.server_port
         result = self.run_script('reward.sh', REWARD_PROCESSES='2', REWARD_PORT=str(port), JUDGE_CONCURRENCY='256',
-                                 REWARD_WORKERS='768', CODE_CONCURRENCY='16')
+                                 REWARD_WORKERS='768', CODE_CONCURRENCY='16', JUDGE_KV_CACHE_NUM_TOKENS='800000',
+                                 JUDGE_MAX_PENDING='1024')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Reward service ready (2 processes)', result.stdout)
         runs = [c for c in self.calls('docker') if c[0] == 'run']
@@ -197,7 +198,8 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(run[run.index('--port') + 1], str(port + i))
             self.assertIn(f'{self.base}/cache/scorer_cache/w{i}:/data/cache/scorer_cache', run)
             # Totals are split across the processes.
-            for expected in ('JUDGE_CONCURRENCY=128', 'CODE_CONCURRENCY=8'):
+            for expected in ('JUDGE_CONCURRENCY=128', 'CODE_CONCURRENCY=8', 'JUDGE_KV_CACHE_NUM_TOKENS=400000',
+                             'MAX_PENDING=512'):
                 self.assertIn(expected, run)
             self.assertEqual(run[run.index('--workers') + 1], '384')
 
