@@ -207,7 +207,7 @@ class Console:
         if self.last_progress is not None and now - self.last_progress < 0.9 * self.progress_seconds:
             return
         self.last_progress, gen_rate, self.rates = now, statistics.mean(self.rates), []
-        what = f'eval after {self.updates(rid)} steps' if evaluating else f'step {rid + 1} rollout'
+        what = self.eval_label(rid) if evaluating else f'step {rid + 1} rollout'
         parts = [what, duration(p.get('seconds')), f'done: {p.get("done", 0)}', f'generating: {p.get("generating", 0)}',
                  f'grading: {p.get("grading", 0)}']
         if p.get('gen_queued'):
@@ -281,13 +281,13 @@ class Console:
                 f'{task} {r.get("raw_reward_mean", 0):.2f} {r.get("accepted", 0)}/{r.get("accepted", 0) + r.get("padding", 0)}'
                 for task, r in routes.items()]))
 
-    def updates(self, rid):
-        """Optimizer steps behind an evaluation tagged rollout_id: the baseline runs before step rid trains."""
-        return rid + 1 if 'train' in self.steps.get(rid, {}) else rid
+    def eval_label(self, rid):
+        """An evaluation tagged rollout_id runs before that step's rollout (the baseline) or after the step."""
+        return f'eval after step {rid + 1}' if 'collection' in self.steps.get(rid, {}) else f'eval before step {rid + 1}'
 
     def evaluation(self, e):
         domains = e.get('domains') or {}
-        parts = [f'eval after {self.updates(e.get("rollout_id", 0))} steps', f'score: {num(e.get("equal_domain_mean"))}']
+        parts = [self.eval_label(e.get('rollout_id', 0)), f'score: {num(e.get("equal_domain_mean"))}']
         parts += [f'{d} {v.get("mean_score", 0):.3f}' for d, v in domains.items() if isinstance(v, dict)]
         if e.get('ungraded_prompts'):
             parts.append(f'ungraded prompts: {e["ungraded_prompts"]}')

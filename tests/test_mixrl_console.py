@@ -81,10 +81,13 @@ class ConsoleTests(unittest.TestCase):
             c.feed(pipeline(seconds) + '\n')
             clock.now += 15
         self.assertEqual([l.split(' | ')[1] for l in lines(out)], ['15s', '1m15s'])
-        c.feed('MIXRL_TRAIN ' + json.dumps({'rollout_id': 0, 'step_id': 0, 'loss': 0.1}) + '\n')
-        c.feed('MIXRL_EVAL ' + json.dumps({'rollout_id': 0, 'equal_domain_mean': 0.5,
-                                           'domains': {'math': {'mean_score': 0.6}, 'logic': {'mean_score': 0.4}}}) + '\n')
-        self.assertEqual(lines(out)[-1], 'eval after 1 steps | score: 0.500 | math 0.600 | logic 0.400')
+        evaluation = 'MIXRL_EVAL ' + json.dumps({'rollout_id': 0, 'equal_domain_mean': 0.5,
+                                                 'domains': {'math': {'mean_score': 0.6}, 'logic': {'mean_score': 0.4}}}) + '\n'
+        c.feed(evaluation)  # the baseline: before step 1's rollout
+        self.assertEqual(lines(out)[-1], 'eval before step 1 | score: 0.500 | math 0.600 | logic 0.400')
+        c.feed('MIXRL_COLLECTION ' + json.dumps({'rollout_id': 0, 'routes': {}}) + '\n')
+        c.feed(evaluation)  # after step 1, trained or skipped
+        self.assertEqual(lines(out)[-1], 'eval after step 1 | score: 0.500 | math 0.600 | logic 0.400')
 
     def test_errors_warnings_and_launcher_lines(self):
         c, out, _, clock = make()
