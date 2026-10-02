@@ -213,6 +213,18 @@ class ScriptTests(unittest.TestCase):
                             ('--max-num-batched-tokens', '65536'), ('--api-server-count', '4')):
             self.assertEqual(run[run.index(flag) + 1], value)
         self.assertNotIn('--speculative-config', run)
+        for flag, value in (('--kv-cache-dtype', 'fp8'), ('--performance-mode', 'throughput')):
+            self.assertEqual(run[run.index(flag) + 1], value)
+        for flag in ('--language-model-only', '--aggregate-engine-logging'):
+            self.assertIn(flag, run)
+        self.assertNotIn('--max-num-seqs', run)  # no cap unless JUDGE_MAX_NUM_SEQS is set
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_DP='1',
+                                 JUDGE_MAX_NUM_SEQS='512')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls('docker') if c[0] == 'run'][-1]
+        self.assertEqual(run[run.index('--max-num-seqs') + 1], '512')
+        spec = json.loads(run[run.index('--speculative-config') + 1])
+        self.assertEqual(spec['num_speculative_tokens'], 5)
         result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='1', JUDGE_DP='1')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('JUDGE_TP x JUDGE_DP = 1 x 1', result.stderr)

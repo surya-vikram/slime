@@ -30,13 +30,19 @@ serve_args() {
     args=(--host "$JUDGE_HOST" --port "$JUDGE_PORT" --served-model-name "$JUDGE_NAME" --dtype bfloat16
         --tensor-parallel-size "$JUDGE_TP" --data-parallel-size "$JUDGE_DP"
         --gpu-memory-utilization "$JUDGE_GPU_MEMORY_UTILIZATION"
-        --max-model-len "$JUDGE_MAX_MODEL_LEN" --max-num-seqs "$JUDGE_MAX_NUM_SEQS"
+        --max-model-len "$JUDGE_MAX_MODEL_LEN" --kv-cache-dtype "$JUDGE_KV_CACHE_DTYPE"
         --max-num-batched-tokens "$JUDGE_MAX_NUM_BATCHED_TOKENS" --api-server-count "$JUDGE_API_SERVERS"
         --enable-prefix-caching --enable-auto-tool-choice
         --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer)
+    # Like chimera-eval serve_gemma.sh: throughput mode and no request cap unless one is set;
+    # the reward service's KV-token budget (JUDGE_KV_CACHE_NUM_TOKENS) bounds the load.
+    [[ -n "$JUDGE_MAX_NUM_SEQS" ]] && args+=(--max-num-seqs "$JUDGE_MAX_NUM_SEQS")
+    [[ -n "$JUDGE_PERFORMANCE_MODE" ]] && args+=(--performance-mode "$JUDGE_PERFORMANCE_MODE")
+    [[ "$JUDGE_LANGUAGE_MODEL_ONLY" == 1 ]] && args+=(--language-model-only)  # skip the vision encoder
+    (( JUDGE_DP > 1 )) && args+=(--aggregate-engine-logging)
     if [[ "$JUDGE_SPECULATIVE" == 1 && -d "$DRAFTER_PATH" ]]; then
         # DFlash speculative decoding when the drafter model is present.
-        args+=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$models/$JUDGE_MODEL_DIR-assistant\",\"num_speculative_tokens\":15}")
+        args+=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$models/$JUDGE_MODEL_DIR-assistant\",\"num_speculative_tokens\":$JUDGE_SPECULATIVE_TOKENS}")
     fi
 }
 
