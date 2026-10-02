@@ -169,6 +169,7 @@ class ScriptTests(unittest.TestCase):
         run = next(c for c in self.calls('docker') if c[0] == 'run')
         for expected in ('/var/run/docker.sock:/var/run/docker.sock', f'{self.base}/repos/chimera-eval:/opt/chimera-eval',
                          f'JUDGE_URL=http://127.0.0.1:{self.env["JUDGE_PORT"]}/v1', 'JUDGE_CONTEXT=32768',
+                         'JUDGE_CHAT_TEMPLATE_KWARGS={"reasoning_strength":"low"}',
                          '--judge-revision', 'mixrl-judge', self.env['REWARD_PORT']):
             self.assertIn(expected, run)
 
