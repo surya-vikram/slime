@@ -185,7 +185,8 @@ class ScriptTests(unittest.TestCase):
         runs = [c for c in self.calls('docker') if c[0] == 'run']
         self.assertEqual([c[c.index('--name') + 1] for c in runs], ['mixrl-judge-server'])
         # Judge up, reward service down: reward.sh runs; its container dies, so nothing trains.
-        result = self.run_script('run.sh', 'start', 'run-b', REWARD_PORT=str(free_port()), STUB_NO_CONTAINERS='1')
+        result = self.run_script('run.sh', 'start', 'run-b', REWARD_PORT=str(free_port()), STUB_NO_CONTAINERS='1',
+                                 REWARD_PROCESSES='1')
         self.assertEqual(result.returncode, 1)
         self.assertIn('reward service: starting 1 process(es)', result.stdout)
         self.assertIn('the reward service did not start', result.stderr)
@@ -212,7 +213,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(self.run_script('run.sh', 'train').returncode, 2)
 
     def test_reward_service_start(self):
-        result = self.run_script('reward.sh')
+        result = self.run_script('reward.sh', REWARD_PROCESSES='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Judge is up', result.stdout)
         self.assertIn('Reward service ready. Judge mixrl-judge: reachable.', result.stdout)
