@@ -97,6 +97,9 @@ def resolve():
     c['colocate'] = int(env.get('COLOCATE', '1'))
     c['rollout_gpus'] = int(env.get('ROLLOUT_GPUS', env['POLICY_GPUS']))
     c['use_rollout_logprobs'] = int(env.get('USE_ROLLOUT_LOGPROBS', '0'))
+    if c['objective'] == 'dapo' and c['use_rollout_logprobs']:
+        # DAPO's PPO ratio reads the recomputed old log-probs; SGLang's would fold numeric differences into it.
+        raise ValueError('MIXRL_OBJECTIVE=dapo needs USE_ROLLOUT_LOGPROBS=0')
     c['optimizer_schedule_rollouts'] = int(env.get('NUM_ROLLOUT', '5'))
     if c['rollout_gpus'] < 1 or c['execution_mode'] not in ('sync', 'async'):
         raise ValueError('Invalid scheduling configuration')

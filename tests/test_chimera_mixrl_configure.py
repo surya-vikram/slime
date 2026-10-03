@@ -249,6 +249,12 @@ class ConfigTests(unittest.TestCase):
         # (each launch here also gets a new reward-service port, so scorer_url differs too)
         self.assertRegex(result.stdout + result.stderr, r'Existing resolved config differs in [a-z_, ]*\blr\b')
 
+    def test_dapo_refuses_rollout_logprobs(self):
+        result, path = self.launch(self.health, MIXRL_OBJECTIVE='dapo', USE_ROLLOUT_LOGPROBS='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('MIXRL_OBJECTIVE=dapo needs USE_ROLLOUT_LOGPROBS=0', result.stdout + result.stderr)
+        self.assertFalse(path.exists())
+
     def test_launcher_rejects_removed_task_variables(self):
         for name, value in (('MIXRL_QUOTAS', '{"mcqa":1}'), ('MIXRL_CAPS', '{"mcqa":64}'),
                             ('MIXRL_EVAL_QUOTAS', '{}'), ('ROLLOUT_BATCH_SIZE', '1'),

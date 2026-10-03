@@ -91,22 +91,21 @@ The MiMo loss weights each token by the ratio of two log-probs: the actor's, fro
 training forward pass, and SGLang's, recorded when the token was generated. It never
 uses a separately recomputed "old" log-prob.
 
-- `0` (default): before training, the actor runs one extra forward pass over the whole
+- `0`: before training, the actor runs one extra forward pass over the whole
   batch to recompute log-probs. With `MIXRL_OBJECTIVE=mimo` and one optimizer step per
   batch the loss does not read them (they match the training pass), so the pass only
   costs time: up to about a quarter of the actor's compute per step.
-- `1`: skip that pass. Loss, advantages and the `train_rollout_logprob_abs_diff`
+- `1` (default): skip that pass. Loss, advantages and the `train_rollout_logprob_abs_diff`
   metric are unchanged; routing replay then applies the recorded expert routes in the
   training forward and backward only.
-- With `MIXRL_OBJECTIVE=dapo` keep `0`: there the PPO ratio's old log-prob is the
-  recomputed one, and `1` would fold SGLang/Megatron numeric differences into the
-  clipped ratio.
+- `MIXRL_OBJECTIVE=dapo` needs `0` (launch refuses `1`): there the PPO ratio's old
+  log-prob is the recomputed one, and `1` would fold SGLang/Megatron numeric
+  differences into the clipped ratio.
 
-Status: `0` until confirmed on the H200s. To confirm, start a new run with
-`USE_ROLLOUT_LOGPROBS=1` and check that the first steps finish (no "R3 routing replay
-was not consumed exactly once") and that `MIXRL_TRAIN` loss and
-`train_rollout_logprob_abs_diff` look like a `0` run's. It is part of the recipe, so
-`resume` refuses a changed value.
+Confirmed on 2 H200s (EP 2, R3 and top-p replay on), 3 steps each way on the same
+tasks: no R3 replay errors, rollout/training KL 1.1-1.5e-4 and mean log-prob gap
+0.006-0.007 with either value, no importance-ratio masking; the pass was 25-42% of the
+training phase. It is part of the recipe, so `resume` refuses a changed value.
 
 ## Watching a run
 
