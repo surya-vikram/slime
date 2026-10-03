@@ -228,9 +228,9 @@ mixrl/run.sh resume gsm8k-01   # after an interruption (reuses running services,
 log; the preflight checks everything except the GPUs in the real container (~minutes: it
 hashes checkpoints). Running services are reused: after changing judge or reward settings,
 restart them with `mixrl/judge.sh` / `mixrl/reward.sh` (or stop them with `... stop`).
-`resume` needs optimizer state in the checkpoints: set `NO_SAVE_OPTIM=0` for runs you may
-resume (the default saves weights only), and resume with the settings and code the run started
-with (don't update the repo mid-run). To train past `NUM_ROLLOUT`:
+`resume` needs optimizer state in the checkpoints, which the default `NO_SAVE_OPTIM=0` saves
+(~130 GB each, every `SAVE_INTERVAL`=20 steps: delete old `checkpoints/iter_*` as the run goes),
+and the settings and code the run started with (don't update the repo mid-run). To train past `NUM_ROLLOUT`:
 `NUM_ROLLOUT=500 MIXRL_EXTEND_CONSTANT_HORIZON=1 mixrl/run.sh resume gsm8k-01`.
 
 Choose tasks in `mixrl/tasks.json` and settings in `mixrl/config.env` (or on the command
