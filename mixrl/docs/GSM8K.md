@@ -38,13 +38,12 @@ EXPERT_MODEL_PARALLEL_SIZE=2        # keep: the only value tested (expert-DP bec
 MIXRL_INFLIGHT_GROUPS=64            # throughput only, results unchanged
 MIXRL_RESPONSE_CONCURRENCY=512      # 64 would be only 8 requests per SGLang engine
 SGLANG_CUDA_GRAPH_MAX_BS=64
+N_SAMPLES_PER_PROMPT=8              # 8 responses per prompt (the mixed-task default is 16)
+NUM_ROLLOUT=100                     # about one pass over GSM8K's 4,984 prompts at 48 per step
 ```
 
-Leave the rest at its defaults:
-- LR 1e-6 with a 10-step warmup;
-- temperature 1.0, top-p 0.95, top-k 20;
-- 8 responses per prompt, 16K sequence length;
-- 100 steps, which is about one pass over GSM8K's 4,984 prompts at 48 per step.
+Leave the rest at its defaults: LR 1e-6 with a 10-step warmup; temperature 1.0, top-p 0.95,
+top-k 20; 16K sequence length.
 
 ### 4. Enable only GSM8K in `mixrl/tasks.json`
 
