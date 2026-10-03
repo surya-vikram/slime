@@ -33,7 +33,19 @@ run's `logs/` folder (`judge_start.log`, `reward_start.log`, `preflight.log`, `t
 
 `resume` needs checkpoints with optimizer state: start runs you may resume with
 `NO_SAVE_OPTIM=0` (the default `1` saves weights only, and `resume` refuses such a run).
-It also needs the settings the run started with; a refused resume names what differs.
+It also needs the settings and the code the run started with: keep the repo unchanged
+until the run ends. A refused resume names what differs (a code change shows up as
+`launcher_hash`, `implementation_hash`, ...).
+
+To run longer than `NUM_ROLLOUT`, resume with a larger step count:
+
+```bash
+NUM_ROLLOUT=500 MIXRL_EXTEND_CONSTANT_HORIZON=1 mixrl/run.sh resume run-a
+```
+
+Only the step count may change. The LR schedule keeps the run's original horizon (after
+warmup the LR is constant, so nothing changes), and the run records the extension in
+`manifests/horizon_extension_<steps>.json`.
 
 The run name only names the output folder, `$BASE_DIR/runs/chimera/mixrl/<name>/`
 (checkpoints, logs, evals, and a frozen copy of the settings and tasks it ran with).
