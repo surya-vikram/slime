@@ -267,6 +267,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.source.sampler.group_index, 2)
         self.assertTrue(all(not any(s.loss_mask) for g in output.samples for s in g))
 
+    async def test_cancelled_groups_are_stopped_in_sglang_before_returning(self):
+        real, stopped = runtime.collect, []
+        async def with_cancel(*a, **kw):
+            groups, metrics = await real(*a, **kw)
+            metrics['mcqa']['cancelled'] = 1  # a spare was cancelled while still generating
+            return groups, metrics
+        async def stop(args):
+            stopped.append(True)
+        with patch.object(runtime, 'collect', with_cancel), patch.object(runtime, 'stop_generation', stop):
+            await runtime._rollout(self.args, 0, self.source)
+        self.assertEqual(stopped, [True])
+        with patch.object(runtime, 'stop_generation', stop):  # nothing cancelled: nothing to stop
+            await runtime._rollout(self.args, 1, self.source)
+        self.assertEqual(stopped, [True])
+
+    async def test_stop_generation_aborts_every_engine_until_idle(self):
+        aborted = []
+        async def get(url):
+            self.assertEqual(url, 'http://router:9/workers')
+            return {'workers': [{'url': 'http://a'}, {'url': 'http://b'}]}
+        async def until_idle(urls):
+            aborted.extend(urls)
+        args = types.SimpleNamespace(sglang_router_ip='router', sglang_router_port=9)
+        with patch('slime.utils.http_utils.get', get), \
+                patch('slime.backends.sglang_utils.server_control.abort_servers_until_idle', until_idle):
+            await runtime.stop_generation(args)
+        self.assertEqual(aborted, ['http://a', 'http://b'])
+
     async def test_full_collection_masks_and_resume(self):
         output = await runtime._rollout(self.args, 0, self.source)
         self.assertEqual(len(output.samples), 2)

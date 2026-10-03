@@ -270,7 +270,8 @@ def resolve():
         # backend reads this frozen horizon while the driver may run longer.
         c['optimizer_schedule_rollouts'] = old_horizon
         if c != previous:
-            raise ValueError('Horizon extension cannot change any other resolved setting')
+            changed = sorted(k for k in set(previous) | set(c) if previous.get(k) != c.get(k))
+            raise ValueError(f'Horizon extension cannot change any other resolved setting; differs in {", ".join(changed[:10])}')
         write_json(path.parent / f'horizon_extension_{new_horizon}.json', {
             'original_schedule_rollouts': old_horizon, 'execution_rollouts': new_horizon,
             'constant_lr': c['lr'], 'config_hash': digest(previous)})

@@ -451,6 +451,14 @@ async def _heartbeat_loop(args, rollout_id, phase, flow, interval, loop, started
         print('MIXRL_PIPELINE ' + json.dumps(line), flush=True)
 
 
+async def stop_generation(args):
+    """Abort whatever SGLang still runs and wait until every engine is idle."""
+    from slime.backends.sglang_utils.server_control import abort_servers_until_idle
+    from slime.utils.http_utils import get
+    response = await get(f'http://{args.sglang_router_ip}:{args.sglang_router_port}/workers')
+    await abort_servers_until_idle([worker['url'] for worker in response['workers']])
+
+
 async def gather_cancel(coros):
     tasks = [asyncio.create_task(c) for c in coros]
     try:
@@ -711,6 +719,11 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         groups, metrics = await collect(c['quotas'], propose, execute, assess,
                                         inflight=c['inflight_groups'], refill_rounds=c.get('refill_rounds', 0),
                                         timeout=c['collection_timeout'], event=event, spares=spares)
+        if any(m.get('cancelled') for m in metrics.values()):
+            # Cancelled spares and surplus refills can still be generating in SGLang (with distributed post their
+            # requests are not cancelled at all). The trainer frees SGLang's memory next; under a running batch
+            # that is a CUDA illegal memory access. Stop them and wait until every engine is idle.
+            await asyncio.wait_for(stop_generation(args), 120)
         # Length penalties and loss masks are fixed here, before conversion and logging,
         # so reward normalization reads exactly what the logs report.
         for group in groups:
