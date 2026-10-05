@@ -380,6 +380,23 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(groups, [('a', 2), ('a', 3)])
         self.assertLess(timeline.index(('proposed', 3)), timeline.index(('finished', 1)))
 
+    async def test_priority_gate_counts_waiters_out_when_they_get_a_slot_or_are_cancelled(self):
+        from slime_plugins.chimera_mixrl.core import PriorityGate
+        gate, flow = PriorityGate(1), {'queued': 0}
+        await gate.acquire()                      # the only slot is taken
+        async def wait():
+            async with gate.slot(0, waiting=(flow, 'queued')):
+                await asyncio.sleep(0)
+        first, second = asyncio.ensure_future(wait()), asyncio.ensure_future(wait())
+        await asyncio.sleep(0)
+        self.assertEqual(flow['queued'], 2)
+        second.cancel()                           # a spare no longer needed, still waiting
+        await asyncio.sleep(0)
+        self.assertEqual(flow['queued'], 1)
+        gate.release()
+        await first
+        self.assertEqual(flow['queued'], 0)
+
     async def test_priority_gate_serves_lowest_priority_first_and_survives_cancellation(self):
         from slime_plugins.chimera_mixrl.core import PriorityGate
         gate, order = PriorityGate(1), []

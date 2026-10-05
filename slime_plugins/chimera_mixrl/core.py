@@ -215,12 +215,20 @@ class PriorityGate:
                 return
         self.free += 1
 
-    def slot(self, priority=0):
+    def slot(self, priority=0, waiting=None):
+        """waiting: optional (counter dict, key) counting tasks waiting for a slot, including ones
+        cancelled while they wait (an unneeded spare), which never get one."""
         gate = self
 
         class _Slot:
             async def __aenter__(self):
-                await gate.acquire(priority)
+                if waiting:
+                    waiting[0][waiting[1]] += 1
+                try:
+                    await gate.acquire(priority)
+                finally:
+                    if waiting:
+                        waiting[0][waiting[1]] -= 1
 
             async def __aexit__(self, *exc):
                 gate.release()

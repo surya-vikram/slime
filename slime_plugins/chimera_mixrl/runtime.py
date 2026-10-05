@@ -551,9 +551,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 text = text[:-len(eos)]
         sample.metadata['grading_text'] = text
         sample.metadata['reward_queued_at'] = time.time()
-        flow['grade_queued'] += 1
-        async with scoring_slots.slot(priority(sample)):
-            flow['grade_queued'] -= 1
+        async with scoring_slots.slot(priority(sample), waiting=(flow, 'grade_queued')):
             flow['grading'] += 1
             try:
                 return await reward(args, sample)
@@ -564,9 +562,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         meta = sample.metadata['mixrl']
         path = directory / f'{sample.index}.json'
         sample.metadata['generation_queued_at'] = time.time()
-        flow['gen_queued'] += 1
-        async with slots.slot(priority(sample)):
-            flow['gen_queued'] -= 1
+        async with slots.slot(priority(sample), waiting=(flow, 'gen_queued')):
             # Retry completed generations without rerolling after judge/network failure.
             if keep_files and path.exists():
                 saved = load_sample(path, num_layers=getattr(args, 'num_layers', 25),
