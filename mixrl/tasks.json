@@ -16,7 +16,7 @@
     "Preview: python3 -m slime_plugins.chimera_mixrl.tasks --samples-per-prompt 8"
   ],
   "eval": {
-    "samples_per_prompt": 4
+    "samples_per_prompt": 16
   },
   "domains": {
     "math": {
@@ -69,7 +69,7 @@
       }
     },
     "nemotron_math": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 48,
       "eval_prompts": "all",
       "max_response_tokens": 3072,
@@ -109,7 +109,7 @@
       }
     },
     "openqa": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 64,
       "eval_prompts": "all",
       "max_response_tokens": 1024,
@@ -130,7 +130,7 @@
       }
     },
     "science": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 32,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
@@ -151,7 +151,7 @@
       }
     },
     "hotpot_train": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 128,
       "eval_prompts": "all",
       "max_response_tokens": 1024,
@@ -171,7 +171,7 @@
       }
     },
     "cascade_chat": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 128,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
@@ -191,7 +191,7 @@
       }
     },
     "cascade_lists": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 16,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
@@ -211,7 +211,7 @@
       }
     },
     "cascade_plans": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 8,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
@@ -231,7 +231,7 @@
       }
     },
     "nvidia_multichallenge": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 24,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
@@ -252,7 +252,7 @@
       }
     },
     "nvidia_multichallenge_advanced": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 16,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
@@ -293,7 +293,7 @@
       }
     },
     "structured_train": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 112,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
@@ -315,7 +315,7 @@
       }
     },
     "reasoning_gym": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 24,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
@@ -353,7 +353,7 @@
       }
     },
     "apps": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 32,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
