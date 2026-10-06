@@ -1,4 +1,5 @@
-"""Ungradable responses: dropped from training (refilled or zero-loss padding), left out of eval.
+"""Ungradable responses: masked in training (the rest of the group trains; fewer than two graded responses
+make the group zero-loss padding that is refilled), left out of their prompt in eval.
 
 Pure Python: a minimal stand-in for slime.utils.types.Sample replaces the torch import.
 """
@@ -85,6 +86,8 @@ class CollectTests(unittest.IsolatedAsyncioTestCase):
         def assess(kind):
             if kind == 'failed':
                 return False, [0., 0.], [False, False], True
+            if kind == 'masked':  # informative, one of three responses masked
+                return True, [0., 1., 0.], [False, False, False], False, [False, False, True]
             return kind == 'informative', [0., 1.], [False, False], False
 
         batch, metrics = await core.collect({'t': quota}, propose, execute, assess, inflight=8,
@@ -107,18 +110,37 @@ class CollectTests(unittest.IsolatedAsyncioTestCase):
         _, m, _ = await self.run_collect(['failed', 'informative'], 2, 0)
         self.assertEqual((m['responses'], m['score_sum'], m['attempted']), (2, 1., 2))
 
+    async def test_a_masked_response_is_counted_but_not_scored(self):
+        batch, m, _ = await self.run_collect(['masked'], 1, 0)
+        self.assertEqual(batch, ['masked'])
+        self.assertEqual((m['accepted'], m['responses'], m['masked'], m['score_sum']), (1, 2, 1, 1.))
+
 
 class PostProcessTests(unittest.TestCase):
-    def test_failed_padding_group_has_no_loss_or_advantage(self):
+    def test_a_masked_response_has_no_loss_and_the_rest_of_its_group_trains(self):
         os.environ['CHIMERA_MIXRL_CONFIG'] = self.config_path
         good = group('t', 0, [valid(1), valid(0), valid(1), valid(0)])
-        bad = group('t', 1, [valid(1), FAILED, valid(0), valid(1)])
+        masked = group('t', 1, [valid(1), FAILED, valid(0), valid(1)])
+        args = types.SimpleNamespace(n_samples_per_prompt=4, rollout_batch_size=2, grpo_std_normalization=False)
+        raw, normalized = runtime.post_process_rewards(args, good + masked)
+        self.assertEqual(normalized[5], 0.)
+        self.assertEqual(masked[1].loss_mask, [0] * masked[1].response_length)
+        self.assertTrue(all(s.loss_mask is None for i, s in enumerate(masked) if i != 1))
+        # Advantages come from the three graded responses (mean 2/3), not from a fabricated zero.
+        self.assertGreater(normalized[4], 0)
+        self.assertLess(normalized[6], 0)
+        self.assertAlmostEqual(masked[0].metadata['base_advantage'], 1 - 2 / 3)
+        # Both groups are informative: the MiMo batch scale is 2 / 2.
+        self.assertAlmostEqual(normalized[0], good[0].metadata['base_advantage'] * good[0].metadata['group_length_scale'])
+
+    def test_a_group_with_fewer_than_two_graded_responses_is_padding(self):
+        os.environ['CHIMERA_MIXRL_CONFIG'] = self.config_path
+        good = group('t', 0, [valid(1), valid(0), valid(1), valid(0)])
+        bad = group('t', 1, [valid(1), FAILED, FAILED, FAILED])
         args = types.SimpleNamespace(n_samples_per_prompt=4, rollout_batch_size=2, grpo_std_normalization=False)
         raw, normalized = runtime.post_process_rewards(args, good + bad)
-        self.assertEqual(raw[4:], [0.] * 4)
         self.assertEqual(normalized[4:], [0.] * 4)
         self.assertTrue(all(s.loss_mask == [0] * s.response_length for s in bad))
-        self.assertTrue(any(a != 0 for a in normalized[:4]))
         # Only the graded group counts as informative: the MiMo batch scale is 2 / 1.
         self.assertAlmostEqual(abs(normalized[0]), abs(good[0].metadata['base_advantage'] * 2
                                                        * good[0].metadata['group_length_scale']))
@@ -135,21 +157,22 @@ class PostProcessTests(unittest.TestCase):
 
 
 class EvaluationSummaryTests(unittest.TestCase):
-    def test_prompt_with_ungradable_response_is_left_out(self):
+    def test_an_ungradable_response_is_left_out_of_its_prompt(self):
         row = {'task': 'a', 'domain': 'd', 'binary': True}
         graded = [_Sample(grade=valid(1)), _Sample(grade=valid(0))]
-        ungraded = [_Sample(grade=valid(1)), _Sample(grade=FAILED)]
-        summary = routes.evaluation_summary([(row, graded), (row, ungraded)])
-        self.assertEqual(summary['tasks']['a']['prompts'], 1)
-        self.assertEqual(summary['tasks']['a']['ungraded_prompts'], 1)
-        self.assertEqual(summary['tasks']['a']['mean_score'], 0.5)
-        self.assertEqual(summary['ungraded_prompts'], 1)
+        partly = [_Sample(grade=valid(1)), _Sample(grade=FAILED)]
+        summary = routes.evaluation_summary([(row, graded), (row, partly)])
+        self.assertEqual(summary['tasks']['a']['prompts'], 2)
+        self.assertEqual(summary['tasks']['a']['mean_score'], (0.5 + 1.) / 2)  # 1.0 from its graded response
+        self.assertEqual(summary['tasks']['a']['pass@2'], 1.)
+        self.assertEqual((summary['tasks']['a']['masked_responses'], summary['masked_responses']), (1, 1))
+        self.assertEqual(summary['ungraded_prompts'], 0)
 
     def test_task_with_only_ungradable_prompts_is_reported_not_scored(self):
         a = {'task': 'a', 'domain': 'd', 'binary': True}
         b = {'task': 'b', 'domain': 'e', 'binary': True}
         summary = routes.evaluation_summary([(a, [_Sample(grade=valid(1))]), (b, [_Sample(grade=FAILED)])])
-        self.assertEqual(summary['tasks']['b'], {'prompts': 0, 'ungraded_prompts': 1})
+        self.assertEqual(summary['tasks']['b'], {'prompts': 0, 'ungraded_prompts': 1, 'masked_responses': 1})
         self.assertNotIn('e', summary['domains'])
         self.assertEqual(summary['equal_domain_mean'], 1.)
 

@@ -45,7 +45,15 @@ class TaskFileTests(unittest.TestCase):
         spec = tasks.load()
         self.assertEqual((len(spec['tasks']), len(spec['domains'])), (16, 9))
         resolved = tasks.resolved(spec)
-        self.assertEqual(resolved['rollout_batch_size'], 1008)
+        self.assertEqual(resolved['rollout_batch_size'], 873)
+        # Every task uses its pool at most 3 times in the default 100 steps with 1 refill round.
+        self.assertTrue(all(tasks.max_passes(t, 100, 1) <= tasks.MAX_PASSES for t in spec['tasks'].values()))
+        table = tasks.table(spec, 16, 100, 1)
+        self.assertIn('max passes in 100 steps', table)
+        self.assertNotIn('may memorise', table)
+        more = json.loads(json.dumps(spec))
+        more['tasks']['calendar']['prompts_per_step'] = 72
+        self.assertIn('note: calendar can use its 2974 prompts up to 4.8 times in 100 steps', tasks.table(more, 16, 100, 1))
         self.assertEqual({n for n, t in spec['tasks'].items() if t['about']['judge'] == 'none'}, JUDGE_FREE)
         # "all": every validation prompt; 506 in total (v5), 52-57 per domain.
         self.assertEqual(sum(resolved['eval_quotas'].values()), 506)

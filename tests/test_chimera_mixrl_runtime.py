@@ -463,6 +463,29 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(top_p=top_p, top_k=top_k), self.assertRaisesRegex(ValueError, 'Rollout sampling differs'):
                 await runtime._rollout(self.args, 1, self.source)
 
+    async def test_an_ungradable_response_is_masked_and_its_group_still_trains(self):
+        self.c.update(truncation='zero', objective='mimo')
+        original = runtime.request
+        calls = []
+        def request(url, payload=None, timeout=1):
+            if payload is not None and payload['response']['text'].endswith('A'):
+                calls.append(payload['request_id'])
+                raise runtime.ServiceHTTPError(url, 422, '{"error": "Ungradable: Judge did not finish", "ungradable": true}')
+            return original(url, payload, timeout)
+        with patch.object(runtime, 'request', side_effect=request):
+            output = await runtime._rollout(self.args, 0, self.source)
+        self.assertEqual(len(calls), 2)  # one per group, never retried
+        flat = [s for g in output.samples for s in g]
+        lost = [s for s in flat if runtime.grade_failed(s)]
+        self.assertEqual(len(lost), 2)
+        self.assertTrue(all(s.loss_mask == [0, 0] for s in lost))
+        _, advantages = runtime.post_process_rewards(self.args, flat)
+        # Each group: a right answer, the masked one, a capped one (0 under 'zero'): still informative.
+        for group in output.samples:
+            self.assertGreater(advantages[flat.index(group[0])], 0)
+            self.assertEqual(advantages[flat.index(group[1])], 0.)
+            self.assertLess(advantages[flat.index(group[2])], 0)
+
     async def test_reward_concurrency_bounds_judge_tasks_and_judge_free_tasks_skip_it(self):
         self.c['reward_concurrency'] = 1
         original = runtime.request

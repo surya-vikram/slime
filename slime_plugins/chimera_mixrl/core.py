@@ -146,7 +146,7 @@ def length_penalties(scores, lengths, cfg=MIMO_LENGTH_PENALTY):
     return deltas
 
 
-def group_rewards(grades, capped, policy='mask', standardize=True, penalties=None):
+def group_rewards(grades, capped, policy='mask', standardize=True, penalties=None, masked=None):
     """Group-relative advantages from validated scores.
 
     capped marks responses without a finished answer (cut off at the cap, or reasoning
@@ -155,17 +155,23 @@ def group_rewards(grades, capped, policy='mask', standardize=True, penalties=Non
     penalties (e.g. length_penalties) shift the scores used for advantages only; whether
     the group is informative is decided by the outcome scores. Raw scores are returned
     unchanged. None/invalid judgments must not be supplied as a valid zero.
+    masked marks responses that could not be graded (the judge could not judge them): under either
+    policy they are left out of sibling statistics and the loss, with a placeholder score of 0.
     """
-    if policy not in ('mask', 'zero') or len(grades) != len(capped) or len(grades) < 2:
+    masked = list(masked) if masked is not None else [False] * len(grades)
+    if policy not in ('mask', 'zero') or len(grades) != len(capped) or len(masked) != len(grades) or len(grades) < 2:
         raise ValueError('Invalid group configuration')
     scores = []
-    for grade in grades:
+    for grade, skip in zip(grades, masked):
+        if skip:
+            scores.append(0.)
+            continue
         score = grade.get('score')
         if grade.get('status') != 'valid' or type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
             raise ValueError('Invalid required reward; no partial group or fabricated zero')
         scores.append(float(score))
     scores = [0. if cap else score for score, cap in zip(scores, capped)]
-    eligible = [not cap or policy == 'zero' for cap in capped]
+    eligible = [not skip and (not cap or policy == 'zero') for cap, skip in zip(capped, masked)]
     valid = [s for s, keep in zip(scores, eligible) if keep]
     if len(valid) < 2 or max(valid) - min(valid) <= 1e-8:
         return scores, [0.] * len(scores), eligible, False
@@ -274,7 +280,7 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
     routes = deque(quotas)
     metrics = {r: {'attempted': 0, 'accepted': 0, 'constant': 0, 'refilled': 0, 'padding': 0,
                    'all_correct': 0, 'all_wrong': 0, 'grade_failed': 0, 'cancelled': 0,
-                   'score_sum': 0., 'responses': 0, 'capped': 0} for r in quotas}
+                   'score_sum': 0., 'responses': 0, 'capped': 0, 'masked': 0} for r in quotas}
 
     async def run():
         started = time.monotonic()
@@ -325,7 +331,7 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
             m = metrics[route]
             m['attempted'] += 1
             if len(outcome) > 3 and outcome[3]:
-                # Some response could not be graded: no scores to count or train on.
+                # Fewer than two responses could be graded: nothing to compare or train on.
                 # Replace it like a constant group; use it only as zero-loss padding.
                 failed[route].append((index, group))
                 m['grade_failed'] += 1
@@ -335,6 +341,11 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
                     m['refilled'] += 1
                     decision = 'grade_failed_replaced'
             else:
+                # Ungradable answers (outcome[4]) are masked: counted, but not scored.
+                masked = outcome[4] if len(outcome) > 4 else [False] * len(scores)
+                scores = [s for s, skip in zip(scores, masked) if not skip]
+                capped = [c for c, skip in zip(capped, masked) if not skip]
+                m['masked'] += sum(masked)
                 m['score_sum'] += sum(scores)
                 m['responses'] += len(scores)
                 m['capped'] += sum(capped)

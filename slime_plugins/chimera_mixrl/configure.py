@@ -280,7 +280,8 @@ def resolve():
         raise ValueError(f'Existing resolved config differs in {", ".join(changed[:10])}; '
                          'resume with the settings the run started with, or choose a fresh run name')
     write_json(path, c)
-    print(f'MixRL tasks ({tasks_path})\n' + task_file.table(spec, c['samples_per_prompt']))
+    print(f'MixRL tasks ({tasks_path})\n' + task_file.table(spec, c['samples_per_prompt'],
+                                                     int(os.environ.get('NUM_ROLLOUT', 0)) or None, c['refill_rounds']))
     print(f'Reward service judge: {c["judge"]} ({"reachable" if health["judge"]["ready"] else "not reachable"}); '
           f'{len(c["excluded_row_ids"])} quarantined rows; resolved config: {path}')
 

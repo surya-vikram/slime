@@ -187,7 +187,7 @@ class Console:
             self.say(f'task {value["task"]} | started pass {value["pass"]} over its {value["pool"]} prompts')
         elif kind == 'GRADE_FAILED':
             what = 'judge could not judge a response (not retried)' if value.get('ungradable') else 'grading failed'
-            self.warn(f'{what}, its group dropped | task: {value.get("task")} | row: {value.get("row")} | '
+            self.warn(f'{what}, response masked | task: {value.get("task")} | row: {value.get("row")} | '
                       f'{str(value.get("error", ""))[:200]}', key=f'grade_failed:{value.get("task")}')
         elif kind == 'HEALTH_WAIT':
             self.warn(f'waiting for services before the next batch: {json.dumps(value)[:300]}', key='health_wait')
@@ -261,6 +261,7 @@ class Console:
         padding = sum(r.get('padding', 0) for r in routes.values())
         capped = sum(r.get('capped', 0) for r in routes.values())
         failed = sum(r.get('grade_failed', 0) for r in routes.values())
+        masked = sum(r.get('masked', 0) for r in routes.values())
         parts = [' ' * len(head), f'rollout: {duration(s.get("rollout"))}']
         train_part = f'train: {duration(s.get("train"))}'
         if perf.get('actor_train_tok_per_s'):
@@ -277,18 +278,21 @@ class Console:
                       f'gen: {rate(timing.get("generated_tokens_per_second", 0))} tok/s']
         if peaks:
             parts.append('peak KV: ' + ', '.join(f'{k} {pct(v)}' for k, v in peaks.items()))
+        if masked:
+            parts.append(f'masked (ungradable): {masked}')
         if failed:
-            parts.append(f'grade failed: {failed}')
+            parts.append(f'ungraded groups: {failed}')
         self.say(' | '.join(parts))
         if routes:
             self.say(' | '.join([' ' * len(head) + ' reward by task (informative/quota)'] + [
                 f'{task} {r.get("raw_reward_mean", 0):.2f} {r.get("accepted", 0)}/{r.get("accepted", 0) + r.get("padding", 0)}'
                 for task, r in routes.items()]))
         for task, r in routes.items():
-            # Dropped groups lean towards prompts whose answers the judge struggles with (long ones).
-            if r.get('grade_failed', 0) > 0.01 * max(1, r.get('attempted', 0)):
-                self.warn(f'task {task}: {r["grade_failed"]} of {r.get("attempted", 0)} groups could not be graded '
-                          f'and were dropped this step (over 1%)', key=f'grade_failed_share:{task}')
+            # Masked answers lean towards those the judge struggles with (long ones).
+            lost = r.get('masked', 0)
+            if lost > 0.01 * max(1, r.get('responses', 0) + lost):
+                self.warn(f'task {task}: {lost} of {r.get("responses", 0) + lost} responses could not be graded '
+                          f'and were masked this step (over 1%)', key=f'masked_share:{task}')
 
     def eval_label(self, rid):
         """An evaluation tagged rollout_id runs before that step's rollout (the baseline) or after the step."""

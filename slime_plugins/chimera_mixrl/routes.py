@@ -29,16 +29,20 @@ def evaluation_summary(groups):
     Each item is (frozen row, completed Samples); no dynamic filtering. pass@k
     here is observed any-pass among all k draws, only for binary routes.
     """
-    tasks, domains, ungraded = {}, {}, {}
+    tasks, domains, ungraded, masked = {}, {}, {}, {}
     for row, samples in groups:
         if not samples:
             raise ValueError('Missing evaluation responses')
-        grades = [s.metadata['grade'] for s in samples]
-        if any(g.get('status') == 'grade_failed' for g in grades):
-            # The reward service could not grade a response after every retry: leave the
-            # prompt out of the score (never a zero) and report how many were left out.
+        all_samples = samples
+        # A response the reward service could not grade is never a zero: the prompt is scored on its
+        # other responses (pass@k then counts only those), or left out when none could be graded.
+        samples = [s for s in samples if s.metadata['grade'].get('status') != 'grade_failed']
+        if len(samples) < len(all_samples):
+            masked[row['task']] = masked.get(row['task'], 0) + len(all_samples) - len(samples)
+        if not samples:
             ungraded[row['task']] = ungraded.get(row['task'], 0) + 1
             continue
+        grades = [s.metadata['grade'] for s in samples]
         if any(g.get('status') != 'valid' for g in grades):
             raise ValueError('Evaluation cannot aggregate failed grading')
         item = {'mean_score': statistics.mean(g['score'] for g in grades),
@@ -48,7 +52,7 @@ def evaluation_summary(groups):
         if row['binary']:
             if any(type(g.get('passed')) is not bool for g in grades):
                 raise ValueError('Binary route lacks an explicit pass verdict')
-            item[f'pass@{len(samples)}'] = float(any(g['passed'] for g in grades))
+            item[f'pass@{len(all_samples)}'] = float(any(g['passed'] for g in grades))
         tasks.setdefault(row['task'], []).append(item)
         domains.setdefault(row['domain'], []).append(item)
 
@@ -59,10 +63,12 @@ def evaluation_summary(groups):
     task_scores = {k: aggregate(v) for k, v in tasks.items()}
     for task, count in ungraded.items():
         task_scores.setdefault(task, {'prompts': 0})['ungraded_prompts'] = count
+    for task, count in masked.items():
+        task_scores.setdefault(task, {'prompts': 0})['masked_responses'] = count
     domain_scores = {k: aggregate(v) for k, v in domains.items()}
     return {'tasks': task_scores, 'domains': domain_scores,
             'equal_domain_mean': (statistics.mean(x['mean_score'] for x in domain_scores.values())
                                   if domain_scores else 0.),
-            'ungraded_prompts': sum(ungraded.values()),
+            'ungraded_prompts': sum(ungraded.values()), 'masked_responses': sum(masked.values()),
             'aggregation': 'prompt mean within each domain, equal mean across enabled domains; no pass@k quality score; '
-                           'prompts with an ungradable response are left out'}
+                           'an ungradable response is left out of its prompt, a prompt without graded responses is left out'}

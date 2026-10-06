@@ -70,7 +70,7 @@
     },
     "nemotron_math": {
       "enabled": true,
-      "prompts_per_step": 48,
+      "prompts_per_step": 27,
       "eval_prompts": "all",
       "max_response_tokens": 3072,
       "about": {
@@ -232,7 +232,7 @@
     },
     "nvidia_multichallenge": {
       "enabled": true,
-      "prompts_per_step": 24,
+      "prompts_per_step": 10,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {
@@ -253,7 +253,7 @@
     },
     "nvidia_multichallenge_advanced": {
       "enabled": true,
-      "prompts_per_step": 16,
+      "prompts_per_step": 7,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {
@@ -294,7 +294,7 @@
     },
     "structured_train": {
       "enabled": true,
-      "prompts_per_step": 112,
+      "prompts_per_step": 75,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {
@@ -316,7 +316,7 @@
     },
     "reasoning_gym": {
       "enabled": true,
-      "prompts_per_step": 24,
+      "prompts_per_step": 14,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {
@@ -336,7 +336,7 @@
     },
     "calendar": {
       "enabled": true,
-      "prompts_per_step": 72,
+      "prompts_per_step": 44,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {
@@ -354,7 +354,7 @@
     },
     "apps": {
       "enabled": true,
-      "prompts_per_step": 32,
+      "prompts_per_step": 16,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
       "about": {

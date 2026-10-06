@@ -81,8 +81,13 @@ def scorer_url(c, request_id=None):
 
 # A response the reward service could not grade: the judge could not judge it (HTTP 422, never
 # retried: it would be asked the same question again) or every retry failed. It never gets a score:
-# training drops its group from the loss (refill replaces it), eval leaves the prompt out.
+# training masks it (left out of its group's statistics and the loss; the rest of the group trains,
+# and a group with fewer than two graded responses becomes padding), eval scores its prompt on the rest.
 GRADE_FAILED = 'grade_failed'
+
+
+def masked(group):
+    return [grade_failed(s) for s in group]
 
 # Reward-service requests at once for tasks that never call the judge (exact checks, the APPS
 # sandbox), on top of MIXRL_REWARD_CONCURRENCY: they grade in milliseconds to seconds and must not
@@ -296,11 +301,12 @@ def post_process_rewards(args, samples):
     if len(samples) != n * args.rollout_batch_size:
         raise ValueError('Incomplete accepted batch')
     def outcome(group, standardize=True, penalties=None):
-        if any(grade_failed(s) for s in group):
+        skip = masked(group)
+        if len(group) - sum(skip) < 2:
             # Ungraded padding group: no scores, no advantages, no loss.
             return [0.] * len(group), [0.] * len(group), [False] * len(group), False
         return group_rewards([s.metadata['grade'] for s in group], [unfinished(s) for s in group],
-                             c['truncation'], standardize, penalties)
+                             c['truncation'], standardize, penalties, masked=skip)
 
     informative = sum(outcome(samples[start:start+n])[-1] for start in range(0, len(samples), n))
     # Native reduction divides by the fixed global response count. Compensate
@@ -681,12 +687,13 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 gather_cancel(evaluate_group(g) for g in groups), c['collection_timeout'])
             for row, group in zip(panel, completed):
                 evaluation_groups.append((row, group))
-                if any(grade_failed(s) for s in group):
-                    continue  # counted per task in the summary, never scored
+                graded = [s for s in group if not grade_failed(s)]  # ungradable responses are never scored
+                if not graded:
+                    continue  # counted per task in the summary
                 entry = data.setdefault(row['task'], {'rewards': [], 'truncated': [], 'samples': []})
-                entry['rewards'].extend(s.reward for s in group)
-                entry['truncated'].extend(s.status == Sample.Status.TRUNCATED for s in group)
-                entry['samples'].extend(group)
+                entry['rewards'].extend(s.reward for s in graded)
+                entry['truncated'].extend(s.status == Sample.Status.TRUNCATED for s in graded)
+                entry['samples'].extend(graded)
             summary = evaluation_summary(evaluation_groups)
             summary['samples_per_prompt'] = eval_samples
             write_json(directory / 'evaluation.json', summary)
@@ -711,10 +718,12 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         def assess(group):
             validate_group(group, args.n_samples_per_prompt)
             capped = [unfinished(s) for s in group]
-            if any(grade_failed(s) for s in group):
+            skip = masked(group)
+            if len(group) - sum(skip) < 2:
                 return False, [0.] * len(group), capped, True
-            scores, _, _, usable = group_rewards([s.metadata['grade'] for s in group], capped, c['truncation'])
-            return usable, scores, capped, False
+            scores, _, _, usable = group_rewards([s.metadata['grade'] for s in group], capped, c['truncation'],
+                                                 masked=skip)
+            return usable, scores, capped, False, skip
         def event(route, job, group, decision):
             print('MIXRL_GROUP ' + json.dumps({
                 'rollout_id': rollout_id, 'route': route, 'group': group[0].group_index,
@@ -736,13 +745,19 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         # Length penalties and loss masks are fixed here, before conversion and logging,
         # so reward normalization reads exactly what the logs report.
         for group in groups:
-            usable, scores, _, _ = assess(group)
+            usable, scores = assess(group)[:2]
+            skip = masked(group)
             deltas = [0.] * len(group)
             if c.get('length_penalty') and usable:
-                deltas = length_penalties(scores, [s.response_length for s in group], c['length_penalty'])
-            for sample, delta in zip(group, deltas):
+                # Over the graded responses only; a masked response is neither penalized nor counted.
+                graded = [i for i, m in enumerate(skip) if not m]
+                for i, delta in zip(graded, length_penalties([scores[i] for i in graded],
+                                                             [group[i].response_length for i in graded],
+                                                             c['length_penalty'])):
+                    deltas[i] = delta
+            for sample, delta, mask in zip(group, deltas, skip):
                 sample.metadata['length_penalty'] = delta
-                if not usable or (c['truncation'] == 'mask' and unfinished(sample)):
+                if not usable or mask or (c['truncation'] == 'mask' and unfinished(sample)):
                     sample.loss_mask = [0] * sample.response_length
         for route in metrics:
             position = source.sampler.position(route)

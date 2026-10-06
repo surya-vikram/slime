@@ -83,7 +83,9 @@ and the train command).
 
 Defaults are set for 8 H200s split 4 + 4: training and generation on `TRAIN_GPUS=0,1,2,3`, four judge
 replicas on GPUs 4-7. The dense judge is compute-bound, so in the 16-task mix it needs as many GPUs as the policy.
-A response the judge cannot judge (cut off on every attempt) drops its group at once, without retries.
+The judge gets one attempt per verdict (4,096 tokens, brief reasoning). A response it cannot judge (cut off or
+unreadable) is masked at once, without retries: left out of its group's statistics and the loss while the rest of
+the group trains. Each task's prompts_per_step keeps it at or below 3 passes over its pool in the default 100 steps.
 Training won't start, and says why, when a task needs a judge that is down, the reward
 service can't grade a task, the data doesn't match `tasks.json`, or GPUs and paths
 don't line up.
@@ -176,7 +178,7 @@ left. Resume and retried starts append to the same files. The MIXRL_* lines in
 | `MIXRL_STEP` | each step | wall-clock seconds of the step and of its phases: `rollout`, `train`, `sync` (weights to SGLang), `save`, `eval` |
 | `MIXRL_PIPELINE` | every 30 s of a rollout | responses waiting to generate, generating, waiting to grade, grading, done; tokens/s; SGLang and judge running requests and KV use |
 | `MIXRL_READY` | once | startup finished (models loaded, first weights in SGLang) |
-| `MIXRL_GRADE_FAILED` / `MIXRL_REWARD_RETRY` / `MIXRL_HEALTH_WAIT` | when they happen | a response that could not be graded, its group dropped (`ungradable: true`: the judge could not judge it, never retried) / a reward-service request retried after a 5xx or network error / waiting for a service before a step |
+| `MIXRL_GRADE_FAILED` / `MIXRL_REWARD_RETRY` / `MIXRL_HEALTH_WAIT` | when they happen | a response that could not be graded, masked (`ungradable: true`: the judge could not judge it, never retried) / a reward-service request retried after a 5xx or network error / waiting for a service before a step |
 | `MIXRL_PASS` / `MIXRL_FAILURE` / `MIXRL_STOP` | when they happen | a task reshuffled its pool / a rollout failed (with the error) / a clean stop |
 
 Slime also prints `rollout N: {...}`, `eval N: {...}` and `perf N: {...}` summaries;

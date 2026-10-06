@@ -17,7 +17,7 @@ COLLECTION = {'rollout_id': 0, 'routes': {
     'gsm8k_train': {'attempted': 10, 'accepted': 6, 'padding': 2, 'refilled': 4, 'responses': 160, 'capped': 8,
                     'raw_reward_mean': 0.5, 'grade_failed': 0},
     'mcqa': {'attempted': 4, 'accepted': 4, 'padding': 0, 'refilled': 0, 'responses': 64, 'capped': 0,
-             'raw_reward_mean': 0.25, 'grade_failed': 1}}}
+             'raw_reward_mean': 0.25, 'grade_failed': 1, 'masked': 2}}}
 
 
 class Clock:
@@ -63,16 +63,16 @@ class ConsoleTests(unittest.TestCase):
                                            'train': 251.0, 'sync': 24.0, 'save': 52.0}) + '\n')
         printed = lines(out)
         # one progress line (the second came within a minute), three step lines, and a warning: mcqa could
-        # not grade 1 of its 4 groups (over 1%)
+        # not grade 2 of its 66 responses (over 1%)
         self.assertEqual(len(printed), 5)
         head, detail, tasks = printed[1:4]
-        self.assertEqual(printed[4], 'WARNING task mcqa: 1 of 4 groups could not be graded and were dropped this step (over 1%)')
+        self.assertEqual(printed[4], 'WARNING task mcqa: 2 of 66 responses could not be graded and were masked this step (over 1%)')
         for part in ('step   1/400', 'step time: 20m02s', 'ETA: 5d13h', 'reward: 0.429', 'loss: -5.6100E-02',
                      'grad norm: 0.154', 'lr: 5.00E-08', 'logprob diff: 0.0050', 'IS masked: 1%'):
             self.assertIn(part, head)
         for part in ('rollout: 10m44s', 'train: 4m11s (12.3k tok/s)', 'sync: 24s', 'save: 52s',
                      'groups: 10/12 informative, 2 padded', 'refills: 4', 'responses: 224', 'resp len: 200',
-                     'capped: 4%', 'peak KV: sglang 70%, judge 10%', 'grade failed: 1'):
+                     'capped: 4%', 'peak KV: sglang 70%, judge 10%', 'masked (ungradable): 2', 'ungraded groups: 1'):
             self.assertIn(part, detail)
         self.assertIn('gsm8k_train 0.50 6/8 | mcqa 0.25 4/4', tasks)
         kinds = [json.loads(line)['kind'] for line in metrics.getvalue().splitlines()]
@@ -124,8 +124,8 @@ class ConsoleTests(unittest.TestCase):
         c.feed('MIXRL_GRADE_FAILED ' + json.dumps(record) + '\n')
         c.feed('MIXRL_GRADE_FAILED ' + json.dumps(dict(record, task='apps', ungradable=False)) + '\n')
         self.assertEqual([l.split(' | ')[0] for l in lines(out)],
-                         ['WARNING judge could not judge a response (not retried), its group dropped',
-                          'WARNING grading failed, its group dropped'])
+                         ['WARNING judge could not judge a response (not retried), response masked',
+                          'WARNING grading failed, response masked'])
 
     def test_full_mode_passes_every_line_and_a_lost_terminal_does_not_stop_it(self):
         c, out, metrics, _ = make(full=True)

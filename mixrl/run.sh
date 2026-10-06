@@ -29,7 +29,8 @@ case "$command" in
         [[ $# -eq 0 ]] || usage
         cd "$REPO_ROOT"
         exec env PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.tasks \
-            "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT"
+            "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
+            --steps "$NUM_ROLLOUT" --refill-rounds "$MIXRL_REFILL_ROUNDS"
         ;;
     preflight|start)
         [[ $# -le 1 ]] || usage
@@ -80,7 +81,8 @@ if [[ "$command" != preflight ]]; then
     logs=$run_dir/logs
     { mkdir -p "$logs" 2>/dev/null && [[ -w "$logs" ]]; } || { logs=$(mktemp -d); note "note: $run_dir/logs is not writable; service logs: $logs"; }
     tasks_text=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.tasks \
-        "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT") || fail "mixrl/tasks.json: $tasks_text"
+        "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
+        --steps "$NUM_ROLLOUT" --refill-rounds "$MIXRL_REFILL_ROUNDS") || fail "mixrl/tasks.json: $tasks_text"
     printf '%s\n' "$tasks_text" > "$logs/tasks.txt"
     note "tasks: $(grep -m1 'tasks enabled' <<< "$tasks_text") (table: $logs/tasks.txt)"
     if judge_up; then

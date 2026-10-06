@@ -98,7 +98,9 @@ class ScriptTests(unittest.TestCase):
     def test_tasks_preview_needs_no_docker(self):
         result = self.run_script('run.sh', 'tasks')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('16 of 16 tasks enabled; 1008 prompts per step x 16 responses = 16128 samples', result.stdout)
+        self.assertIn('16 of 16 tasks enabled; 873 prompts per step x 16 responses = 13968 samples', result.stdout)
+        self.assertIn('max passes in 100 steps', result.stdout)
+        self.assertNotIn('may memorise', result.stdout)  # the default quotas keep every task at or below 3 passes
         self.assertEqual(self.calls('docker'), [])
 
     def test_preflight_uses_no_gpus_and_carries_every_setting(self):

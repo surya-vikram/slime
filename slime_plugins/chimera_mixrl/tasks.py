@@ -181,8 +181,19 @@ def _grid(rows):
     return lines
 
 
-def table(spec, samples_per_prompt=None):
+# Calendar stopped improving on eval around its third pass over its pool; the user keeps every task at or below 3.
+MAX_PASSES = 3
+
+
+def max_passes(task, steps, refill_rounds):
+    """Most times a task can use its pool in `steps` steps: each step takes at most (1 + refill rounds) x
+    prompts_per_step prompts (spare groups count towards that budget)."""
+    return task['prompts_per_step'] * (1 + refill_rounds) * steps / task['about']['train_pool']
+
+
+def table(spec, samples_per_prompt=None, steps=None, refill_rounds=None):
     chosen = enabled(spec)
+    passes = steps is not None and refill_rounds is not None
     counts = eval_counts(spec)
     groups = by_domain(spec, spec['tasks'])
     domain_rows = [('domain', 'tasks on', 'prompts/step', 'eval prompts', 'val pool', 'judge')]
@@ -193,12 +204,15 @@ def table(spec, samples_per_prompt=None):
                             str(sum(counts[n] for n in on)) if on else '-',
                             str(sum(t['about']['val_pool'] for t in on.values())) if on else '-',
                             ('needed' if needs else 'no') if on else '-'))
-    task_rows = [('task', 'domain', 'on', 'prompts', 'train pool', 'eval', 'val pool', 'resp_cap', 'judge', 'steps/pass')]
+    last = f'max passes in {steps} steps' if passes else 'steps/pass'
+    task_rows = [('task', 'domain', 'on', 'prompts', 'train pool', 'eval', 'val pool', 'resp_cap', 'judge', last)]
     for name, t in spec['tasks'].items():
         a = t['about']
         task_rows.append((name, a['domain'], 'yes' if t['enabled'] else '-', str(t['prompts_per_step']),
                           str(a['train_pool']), str(counts.get(name, '-')), str(a['val_pool']),
-                          str(t['max_response_tokens']), a['judge'], f"{a['train_pool'] / t['prompts_per_step']:.0f}"))
+                          str(t['max_response_tokens']), a['judge'],
+                          f'{max_passes(t, steps, refill_rounds):.1f}' if passes
+                          else f"{a['train_pool'] / t['prompts_per_step']:.0f}"))
     lines = _grid(domain_rows) + [''] + _grid(task_rows) + ['']
     lines += [f'{n}: {t["about"]["summary"]}' for n, t in chosen.items()]
     batch = sum(t['prompts_per_step'] for t in chosen.values())
@@ -211,6 +225,10 @@ def table(spec, samples_per_prompt=None):
         evaluated += f'; up to {eval_cost(spec, samples_per_prompt)["steps"]:.2f} training steps of tokens'
     needs = [n for n, t in chosen.items() if t['about']['judge'] != 'none']
     lines += [evaluated, 'judge: needed by ' + ', '.join(needs) if needs else 'judge: not needed']
+    if passes:
+        lines += [f'note: {n} can use its {t["about"]["train_pool"]} prompts up to {max_passes(t, steps, refill_rounds):.1f} '
+                  f'times in {steps} steps (more than {MAX_PASSES}: it may memorise them); lower its prompts_per_step'
+                  for n, t in chosen.items() if max_passes(t, steps, refill_rounds) > MAX_PASSES]
     return '\n'.join(lines + notes(spec))
 
 
@@ -226,8 +244,10 @@ def main():
     parser = argparse.ArgumentParser(description='Preview and validate a MixRL task file.')
     parser.add_argument('path', nargs='?', default=str(DEFAULT_PATH))
     parser.add_argument('--samples-per-prompt', type=int)
+    parser.add_argument('--steps', type=int, help='training steps, to show how often each task reuses its pool')
+    parser.add_argument('--refill-rounds', type=int)
     args = parser.parse_args()
-    print(table(load(args.path), args.samples_per_prompt))
+    print(table(load(args.path), args.samples_per_prompt, args.steps, args.refill_rounds))
 
 
 if __name__ == '__main__':

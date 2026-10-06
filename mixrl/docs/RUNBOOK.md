@@ -111,6 +111,10 @@ current batch waits for the next batch instead of being skipped for the pass.
   than the median passing length loses up to 0.1, ramping as t^1.5 to the full
   deduction at twice the median. It shifts the scores used for advantages only;
   logged and eval scores stay raw, and it never makes an all-correct group trainable.
+- Ungradable responses (the judge's one attempt was cut off or unreadable) are masked: left
+  out of their group's mean, spread and length penalty and out of the loss; a group with fewer
+  than two graded responses becomes zero-loss padding and is refilled. Eval scores a prompt on
+  its graded responses and reports `masked_responses`.
 - Refill (`MIXRL_REFILL_ROUNDS`, default 1; 0 = off): a group without outcome
   spread is replaced by a fresh prompt of the same task while the task is short of
   `prompts_per_step` informative groups (counting groups still generating), up to
