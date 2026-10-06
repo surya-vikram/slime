@@ -81,8 +81,10 @@ variable that is no setting at all gets a warning, so a typo does not pass silen
 terminal shows a `settings` line with what its processes actually use (from the resolved config
 and the train command).
 
-Defaults are set for 8 H200s split 4 + 4: training and generation on `TRAIN_GPUS=0,1,2,3`, four judge
-replicas on GPUs 4-7. The dense judge is compute-bound, so with the judge tasks on it needs as many GPUs as the policy.
+Defaults are set for 8 H200s split 5 + 3: training and generation on `TRAIN_GPUS=0,1,2,3,4`, three judge
+replicas on GPUs 5-7. The dense judge is compute-bound; with the cascade tasks off and long rubrics judged in one call,
+three replicas keep grading about as fast as five GPUs generate. With 5 training GPUs, prompts per step x 16 must
+divide by 5 (the launcher refuses otherwise).
 The cascade quality tasks are off by default: they have no reference answers, so the judge has to work each answer
 out itself (long, noisy verdicts that can reward confident wrong answers) until references are added.
 The judge gets one attempt per verdict (4,096 tokens, brief reasoning). A response it cannot judge (cut off or

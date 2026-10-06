@@ -274,7 +274,7 @@
     },
     "nemotron_if": {
       "enabled": true,
-      "prompts_per_step": 144,
+      "prompts_per_step": 143,
       "eval_prompts": "all",
       "max_response_tokens": 2048,
       "about": {

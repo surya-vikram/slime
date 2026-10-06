@@ -48,7 +48,8 @@ class TaskFileTests(unittest.TestCase):
         self.assertEqual({n for n, t in spec['tasks'].items() if not t['enabled']},
                          {'cascade_chat', 'cascade_lists', 'cascade_plans'})
         resolved = tasks.resolved(spec)
-        self.assertEqual(resolved['rollout_batch_size'], 721)
+        self.assertEqual(resolved['rollout_batch_size'], 720)
+        self.assertEqual(720 * 16 % 5, 0)  # the default 5 training GPUs split the batch evenly
         # Every task uses its pool at most 3 times in the default 100 steps with 1 refill round.
         self.assertTrue(all(tasks.max_passes(t, 100, 1) <= tasks.MAX_PASSES for t in spec['tasks'].values()))
         table = tasks.table(spec, 16, 100, 1)
