@@ -45,7 +45,7 @@ NUM_ROLLOUT=500 MIXRL_EXTEND_CONSTANT_HORIZON=1 mixrl/run.sh resume run-a
 ```
 
 Only the step count may change. The LR schedule keeps the run's original horizon (after
-warmup the LR is constant, so nothing changes), and the run records the extension in
+any warmup the LR is constant, so nothing changes), and the run records the extension in
 `manifests/horizon_extension_<steps>.json`.
 
 The run name only names the output folder, `$BASE_DIR/runs/chimera/mixrl/<name>/`
@@ -98,7 +98,7 @@ don't line up.
 | `MIXRL_LENGTH_PENALTY` | `1` | MiMo's group-relative length penalty: in groups where most answers pass, a correct answer more than 30% longer than the median correct one loses up to 0.1 (full at twice the median). Advantages only; logged scores stay raw. |
 | `MIXRL_REFILL_ROUNDS` | `1` | Replace groups without reward spread by new prompts of the same task, up to (1 + N) x `prompts_per_step` per task per step, then continue with what there is. `0` = off. |
 | `ROLLOUT_TEMPERATURE`, `ROLLOUT_TOP_P`, `ROLLOUT_TOP_K` | `1.0`, `0.95`, `20` | Rollout and eval sampling (MiMo's code recipe; top-k 20 is also Qwen3's default). Top-p < 1 replays each token's candidate set in the loss (MiMo); top-k caps that set at 20 ids and needs top-p < 1. |
-| `LR_WARMUP_STEPS` | `10` | Linear LR warmup, then constant (DAPO's recipe at LR 1e-6). Adam starts without optimizer state; the first step only initializes its moments (LR 0). |
+| `LR_WARMUP_STEPS` | `0` | Constant LR from the first step (MiMo-7B, DeepSeekMath GRPO and verl's default; at LR 1e-6 with gradient clipping a fresh Adam needs no ramp, and in 100 steps a 10-step warmup would cost a tenth of the run). `>0`: linear warmup over that many steps first (DAPO used 20). |
 
 These are part of the recipe: `resume` refuses a changed value.
 

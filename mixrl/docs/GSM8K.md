@@ -42,7 +42,7 @@ N_SAMPLES_PER_PROMPT=8              # 8 responses per prompt (the mixed-task def
 NUM_ROLLOUT=100                     # about one pass over GSM8K's 4,984 prompts at 48 per step
 ```
 
-Leave the rest at its defaults: LR 1e-6 with a 10-step warmup; temperature 1.0, top-p 0.95,
+Leave the rest at its defaults: constant LR 1e-6 (no warmup); temperature 1.0, top-p 0.95,
 top-k 20; 16K sequence length.
 
 ### 4. Enable only GSM8K in `mixrl/tasks.json`
