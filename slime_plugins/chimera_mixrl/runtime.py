@@ -79,9 +79,15 @@ def scorer_url(c, request_id=None):
     return urls[int(request_id[:8], 16) % len(urls)]
 
 
-# A response the reward service could not grade after every retry. It never gets a score:
+# A response the reward service could not grade: the judge could not judge it (HTTP 422, never
+# retried: it would be asked the same question again) or every retry failed. It never gets a score:
 # training drops its group from the loss (refill replaces it), eval leaves the prompt out.
 GRADE_FAILED = 'grade_failed'
+
+# Reward-service requests at once for tasks that never call the judge (exact checks, the APPS
+# sandbox), on top of MIXRL_REWARD_CONCURRENCY: they grade in milliseconds to seconds and must not
+# queue behind judge calls (in the 16-task run they waited up to ~10 min for a slot).
+QUICK_GRADING_SLOTS = 512
 
 
 def grade_failed(sample):
@@ -239,13 +245,15 @@ async def reward(args, sample, **kwargs):
     for attempt in range(c['reward_attempts']):
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                scoring_pool(c.get('reward_concurrency', 8)), request, scorer_url(c, payload['request_id']) + '/score',
-                payload, c['reward_timeout'])
+                scoring_pool(c.get('reward_concurrency', 8) + QUICK_GRADING_SLOTS), request,
+                scorer_url(c, payload['request_id']) + '/score', payload, c['reward_timeout'])
             break
         except ServiceHTTPError as exc:
+            error = exc
+            if exc.code == 422:
+                break  # the judge answered but could not judge this response (cut off): retries only repeat that
             if exc.code not in (408, 429, 500, 502, 503, 504):
                 raise  # 4xx: a malformed or conflicting request is a bug, not a grading fault
-            error = exc
         except (OSError, TimeoutError) as exc:
             error = exc
         print(f'MIXRL_REWARD_RETRY attempt {attempt + 1}/{c["reward_attempts"]}: {type(error).__name__}: {error}', flush=True)
@@ -253,10 +261,12 @@ async def reward(args, sample, **kwargs):
             await asyncio.sleep(min(2 ** attempt, int(os.environ.get('MIXRL_REWARD_BACKOFF_MAX', '8'))))
     if result is None:
         reason = f'{type(error).__name__}: {error}'[:2000]
+        ungradable = isinstance(error, ServiceHTTPError) and error.code == 422
         sample.metadata['reward_finished_at'] = time.time()
-        sample.metadata['grade'] = {'status': GRADE_FAILED, 'error': reason}
+        sample.metadata['grade'] = {'status': GRADE_FAILED, 'error': reason, 'ungradable': ungradable}
         print('MIXRL_GRADE_FAILED ' + json.dumps({'task': meta['task'], 'split': meta['split'], 'row': meta['row_id'],
-                                                 'sample': meta['sample'], 'error': reason}), flush=True)
+                                                 'sample': meta['sample'], 'ungradable': ungradable,
+                                                 'error': reason}), flush=True)
         return 0.  # placeholder only; grade_failed() keeps it out of every loss and score
     if result['protocol_id'] != c['scorer_protocol'] or result['request_id'] != payload['request_id']:
         raise RuntimeError('Mismatched reward response identity')
@@ -531,6 +541,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     # finish one after another and keep-or-refill decisions arrive throughout the step.
     slots = PriorityGate(c['response_concurrency'])
     scoring_slots = PriorityGate(c.get('reward_concurrency', 8))
+    quick_slots = PriorityGate(QUICK_GRADING_SLOTS)
+    judge_free = {task for task, route in c['routes'].items() if route.get('judge') == 'none'}
     priority = lambda sample: sample.metadata.get('mixrl_priority', 0)
     # Where every response is right now, for the MIXRL_PIPELINE line.
     flow = {'gen_queued': 0, 'generating': 0, 'grade_queued': 0, 'grading': 0, 'done': 0, 'gen_tokens': 0}
@@ -551,7 +563,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                 text = text[:-len(eos)]
         sample.metadata['grading_text'] = text
         sample.metadata['reward_queued_at'] = time.time()
-        async with scoring_slots.slot(priority(sample), waiting=(flow, 'grade_queued')):
+        gate = quick_slots if sample.metadata['mixrl']['task'] in judge_free else scoring_slots
+        async with gate.slot(priority(sample), waiting=(flow, 'grade_queued')):
             flow['grading'] += 1
             try:
                 return await reward(args, sample)

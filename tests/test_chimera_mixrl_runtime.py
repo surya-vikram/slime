@@ -463,11 +463,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(top_p=top_p, top_k=top_k), self.assertRaisesRegex(ValueError, 'Rollout sampling differs'):
                 await runtime._rollout(self.args, 1, self.source)
 
-    async def test_reward_concurrency_is_independent_and_bounded(self):
+    async def test_reward_concurrency_bounds_judge_tasks_and_judge_free_tasks_skip_it(self):
         self.c['reward_concurrency'] = 1
         original = runtime.request
         lock = threading.Lock()
-        active = maximum = 0
         def slow_request(url, payload=None, timeout=1):
             nonlocal active, maximum
             if payload is None:
@@ -481,10 +480,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 with lock:
                     active -= 1
-        with patch.object(runtime, 'request', side_effect=slow_request):
-            await runtime._rollout(self.args, 0, self.source)
-        self.assertEqual(maximum, 1)
-        self.assertEqual(self.judged, 4)
+        for rollout_id, judge in enumerate(('always', 'none')):
+            self.c['routes']['mcqa']['judge'] = judge
+            active = maximum = self.judged = 0
+            with self.subTest(judge=judge), patch.object(runtime, 'request', side_effect=slow_request):
+                await runtime._rollout(self.args, rollout_id, self.source)
+                self.assertEqual(self.judged, 4)
+                if judge == 'always':
+                    self.assertEqual(maximum, 1)
+                else:  # graded in their own slots, not behind the judge's
+                    self.assertGreater(maximum, 1)
 
     @patch.dict(os.environ, {'MIXRL_KEEP_TRAIN_SAMPLES': '1'})
     async def test_failed_batch_reuses_persisted_completions(self):

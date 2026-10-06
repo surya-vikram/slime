@@ -111,7 +111,7 @@ current batch waits for the next batch instead of being skipped for the pass.
   than the median passing length loses up to 0.1, ramping as t^1.5 to the full
   deduction at twice the median. It shifts the scores used for advantages only;
   logged and eval scores stay raw, and it never makes an all-correct group trainable.
-- Refill (`MIXRL_REFILL_ROUNDS`, default 2; 0 = off): a group without outcome
+- Refill (`MIXRL_REFILL_ROUNDS`, default 1; 0 = off): a group without outcome
   spread is replaced by a fresh prompt of the same task while the task is short of
   `prompts_per_step` informative groups (counting groups still generating), up to
   (1 + rounds) x `prompts_per_step` prompts per task per step. Then the step

@@ -186,7 +186,8 @@ class Console:
         elif kind == 'PASS':
             self.say(f'task {value["task"]} | started pass {value["pass"]} over its {value["pool"]} prompts')
         elif kind == 'GRADE_FAILED':
-            self.warn(f'grading failed, response dropped | task: {value.get("task")} | row: {value.get("row")} | '
+            what = 'judge could not judge a response (not retried)' if value.get('ungradable') else 'grading failed'
+            self.warn(f'{what}, its group dropped | task: {value.get("task")} | row: {value.get("row")} | '
                       f'{str(value.get("error", ""))[:200]}', key=f'grade_failed:{value.get("task")}')
         elif kind == 'HEALTH_WAIT':
             self.warn(f'waiting for services before the next batch: {json.dumps(value)[:300]}', key='health_wait')
@@ -283,6 +284,11 @@ class Console:
             self.say(' | '.join([' ' * len(head) + ' reward by task (informative/quota)'] + [
                 f'{task} {r.get("raw_reward_mean", 0):.2f} {r.get("accepted", 0)}/{r.get("accepted", 0) + r.get("padding", 0)}'
                 for task, r in routes.items()]))
+        for task, r in routes.items():
+            # Dropped groups lean towards prompts whose answers the judge struggles with (long ones).
+            if r.get('grade_failed', 0) > 0.01 * max(1, r.get('attempted', 0)):
+                self.warn(f'task {task}: {r["grade_failed"]} of {r.get("attempted", 0)} groups could not be graded '
+                          f'and were dropped this step (over 1%)', key=f'grade_failed_share:{task}')
 
     def eval_label(self, rid):
         """An evaluation tagged rollout_id runs before that step's rollout (the baseline) or after the step."""

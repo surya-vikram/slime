@@ -128,7 +128,7 @@ class ScriptTests(unittest.TestCase):
         preflight, call = [c for c in calls if c[0] == 'run']
         self.assertIn('DRY_RUN=1', preflight)
         self.assertNotIn('--gpus', preflight)
-        self.assertIn('"device=0,1,2,3,4,5"', call)
+        self.assertIn('"device=0,1,2,3"', call)
         self.assertIn(f'{self.base}/runs:/data/runs', call)
         self.assertNotIn('DRY_RUN=1', call)
         self.assertEqual(self.env_file()['RESUME'], '0')
@@ -180,7 +180,7 @@ class ScriptTests(unittest.TestCase):
         # Judge down and needed by the enabled tasks: start runs judge.sh, whose container dies at once.
         result = self.run_script('run.sh', 'start', 'run-a', JUDGE_PORT=str(free_port()), STUB_NO_CONTAINERS='1')
         self.assertEqual(result.returncode, 1)
-        self.assertIn('judge: starting on GPUs 6,7', result.stdout)
+        self.assertIn('judge: starting on GPUs 4,5,6,7', result.stdout)
         self.assertIn('the judge did not start', result.stderr)
         runs = [c for c in self.calls('docker') if c[0] == 'run']
         self.assertEqual([c[c.index('--name') + 1] for c in runs], ['mixrl-judge-server'])
@@ -197,7 +197,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_clear_errors_before_any_container(self):
         cases = (
-            (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=6'),
+            (('run.sh', 'start'), {'TRAIN_GPUS': '0'}, 'lists 1 GPUs but POLICY_GPUS=4'),
             (('run.sh', 'preflight'), {'REWARD_PORT': str(free_port())}, 'start it with mixrl/reward.sh'),
             (('run.sh', 'start'), {'MODEL_NAME': 'missing'}, 'check BASE_DIR, MODEL_NAME'),
             (('run.sh', 'start', 'bad/name'), {}, "use letters, digits"),
@@ -270,7 +270,7 @@ class ScriptTests(unittest.TestCase):
         for flag in ('--language-model-only', '--aggregate-engine-logging'):
             self.assertIn(flag, run)
         self.assertEqual(run[run.index('--max-num-seqs') + 1], '1024')  # vLLM 0.28 would stop at 512
-        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_MAX_NUM_SEQS='0')
+        result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_DP='2', JUDGE_MAX_NUM_SEQS='0')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('--max-num-seqs', [c for c in self.calls('docker') if c[0] == 'run'][-1])  # 0: vLLM's own
         result = self.run_script('judge.sh', JUDGE_USE_DOCKER='1', JUDGE_GPUS='2,3', JUDGE_TP='2', JUDGE_DP='1',
@@ -289,8 +289,8 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         (call,) = self.calls('vllm')
         self.assertEqual(call[:2], ['serve', f'{self.base}/models/judge'])
-        # Default layout: two replicas of the 30B judge, one per GPU, two front-end processes.
-        for flag, value in (('--tensor-parallel-size', '1'), ('--data-parallel-size', '2'), ('--max-num-seqs', '1024'),
+        # Default layout: four replicas of the 30B judge, one per GPU, two front-end processes.
+        for flag, value in (('--tensor-parallel-size', '1'), ('--data-parallel-size', '4'), ('--max-num-seqs', '1024'),
                             ('--api-server-count', '2'), ('--max-model-len', '32768'),
                             ('--served-model-name', 'mixrl-judge'), ('--host', '127.0.0.1')):
             self.assertEqual(call[call.index(flag) + 1], value)

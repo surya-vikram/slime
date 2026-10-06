@@ -202,6 +202,18 @@ class RewardExhaustionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runtime.grade_failed(sample))
         self.assertIn('judge timed out', sample.metadata['grade']['error'])
 
+    async def test_a_response_the_judge_cannot_judge_is_dropped_without_retries(self):
+        self.status = 422
+        sample = self.sample()
+        self.assertEqual(await runtime.reward(None, sample), 0.)
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(runtime.grade_failed(sample))
+        self.assertTrue(sample.metadata['grade']['ungradable'])
+        self.status = 503
+        sample = self.sample()
+        await runtime.reward(None, sample)
+        self.assertFalse(sample.metadata['grade']['ungradable'])
+
     async def test_client_error_still_stops(self):
         self.status = 400
         with self.assertRaises(runtime.ServiceHTTPError):

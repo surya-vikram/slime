@@ -62,8 +62,11 @@ class ConsoleTests(unittest.TestCase):
         c.feed('MIXRL_STEP ' + json.dumps({'rollout_id': 0, 'num_rollout': 400, 'seconds': 1202.0, 'rollout': 644.0,
                                            'train': 251.0, 'sync': 24.0, 'save': 52.0}) + '\n')
         printed = lines(out)
-        self.assertEqual(len(printed), 4)  # one progress line (the second came within a minute) + three step lines
-        head, detail, tasks = printed[1:]
+        # one progress line (the second came within a minute), three step lines, and a warning: mcqa could
+        # not grade 1 of its 4 groups (over 1%)
+        self.assertEqual(len(printed), 5)
+        head, detail, tasks = printed[1:4]
+        self.assertEqual(printed[4], 'WARNING task mcqa: 1 of 4 groups could not be graded and were dropped this step (over 1%)')
         for part in ('step   1/400', 'step time: 20m02s', 'ETA: 5d13h', 'reward: 0.429', 'loss: -5.6100E-02',
                      'grad norm: 0.154', 'lr: 5.00E-08', 'logprob diff: 0.0050', 'IS masked: 1%'):
             self.assertIn(part, head)
@@ -113,6 +116,16 @@ class ConsoleTests(unittest.TestCase):
             'WARNING reward service request failed, retrying: attempt 3/12: ServiceHTTPError: HTTP 503 (and 2 more like it)',
             'ERROR error: TRAIN_GPUS lists 1 GPUs | train.log line 109',
             "Job 'raysubmit_x' failed"])
+
+    def test_a_response_the_judge_cannot_judge_is_named_as_such(self):
+        c, out, _, _ = make()
+        record = {'task': 'cascade_chat', 'row': 'r1', 'ungradable': True,
+                  'error': 'ServiceHTTPError: HTTP 422: Judge did not finish'}
+        c.feed('MIXRL_GRADE_FAILED ' + json.dumps(record) + '\n')
+        c.feed('MIXRL_GRADE_FAILED ' + json.dumps(dict(record, task='apps', ungradable=False)) + '\n')
+        self.assertEqual([l.split(' | ')[0] for l in lines(out)],
+                         ['WARNING judge could not judge a response (not retried), its group dropped',
+                          'WARNING grading failed, its group dropped'])
 
     def test_full_mode_passes_every_line_and_a_lost_terminal_does_not_stop_it(self):
         c, out, metrics, _ = make(full=True)

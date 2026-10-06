@@ -81,7 +81,9 @@ variable that is no setting at all gets a warning, so a typo does not pass silen
 terminal shows a `settings` line with what its processes actually use (from the resolved config
 and the train command).
 
-Defaults are set for 6 training H200s (`TRAIN_GPUS=0,1,2,3,4,5`) and a judge on GPUs 6,7.
+Defaults are set for 8 H200s split 4 + 4: training and generation on `TRAIN_GPUS=0,1,2,3`, four judge
+replicas on GPUs 4-7. The dense judge is compute-bound, so in the 16-task mix it needs as many GPUs as the policy.
+A response the judge cannot judge (cut off on every attempt) drops its group at once, without retries.
 Training won't start, and says why, when a task needs a judge that is down, the reward
 service can't grade a task, the data doesn't match `tasks.json`, or GPUs and paths
 don't line up.
@@ -92,7 +94,7 @@ don't line up.
 |---|---|---|
 | `MIXRL_TRUNCATION` | `zero` | A response with no finished answer (cut off at its cap, or `<think>` never closed) scores 0 and counts in its group like any wrong answer. `mask` leaves it out of the loss instead. Capped responses are never sent to the reward service. |
 | `MIXRL_LENGTH_PENALTY` | `1` | MiMo's group-relative length penalty: in groups where most answers pass, a correct answer more than 30% longer than the median correct one loses up to 0.1 (full at twice the median). Advantages only; logged scores stay raw. |
-| `MIXRL_REFILL_ROUNDS` | `2` | Replace groups without reward spread by new prompts of the same task, up to (1 + N) x `prompts_per_step` per task per step, then continue with what there is. `0` = off. |
+| `MIXRL_REFILL_ROUNDS` | `1` | Replace groups without reward spread by new prompts of the same task, up to (1 + N) x `prompts_per_step` per task per step, then continue with what there is. `0` = off. |
 | `ROLLOUT_TEMPERATURE`, `ROLLOUT_TOP_P`, `ROLLOUT_TOP_K` | `1.0`, `0.95`, `20` | Rollout and eval sampling (MiMo's code recipe; top-k 20 is also Qwen3's default). Top-p < 1 replays each token's candidate set in the loss (MiMo); top-k caps that set at 20 ids and needs top-p < 1. |
 | `LR_WARMUP_STEPS` | `10` | Linear LR warmup, then constant (DAPO's recipe at LR 1e-6). Adam starts without optimizer state; the first step only initializes its moments (LR 0). |
 
@@ -174,7 +176,7 @@ left. Resume and retried starts append to the same files. The MIXRL_* lines in
 | `MIXRL_STEP` | each step | wall-clock seconds of the step and of its phases: `rollout`, `train`, `sync` (weights to SGLang), `save`, `eval` |
 | `MIXRL_PIPELINE` | every 30 s of a rollout | responses waiting to generate, generating, waiting to grade, grading, done; tokens/s; SGLang and judge running requests and KV use |
 | `MIXRL_READY` | once | startup finished (models loaded, first weights in SGLang) |
-| `MIXRL_GRADE_FAILED` / `MIXRL_REWARD_RETRY` / `MIXRL_HEALTH_WAIT` | when they happen | a response dropped as ungradable / a reward-service request retried / waiting for a service before a step |
+| `MIXRL_GRADE_FAILED` / `MIXRL_REWARD_RETRY` / `MIXRL_HEALTH_WAIT` | when they happen | a response that could not be graded, its group dropped (`ungradable: true`: the judge could not judge it, never retried) / a reward-service request retried after a 5xx or network error / waiting for a service before a step |
 | `MIXRL_PASS` / `MIXRL_FAILURE` / `MIXRL_STOP` | when they happen | a task reshuffled its pool / a rollout failed (with the error) / a clean stop |
 
 Slime also prints `rollout N: {...}`, `eval N: {...}` and `perf N: {...}` summaries;
