@@ -171,7 +171,7 @@
       }
     },
     "cascade_chat": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 128,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
@@ -191,7 +191,7 @@
       }
     },
     "cascade_lists": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 16,
       "eval_prompts": "all",
       "max_response_tokens": 4096,
@@ -211,7 +211,7 @@
       }
     },
     "cascade_plans": {
-      "enabled": true,
+      "enabled": false,
       "prompts_per_step": 8,
       "eval_prompts": "all",
       "max_response_tokens": 4096,

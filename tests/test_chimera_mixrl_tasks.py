@@ -41,11 +41,14 @@ class TaskFileTests(unittest.TestCase):
                     task['prompts_per_step'] = prompts
         return change
 
-    def test_default_file_is_the_sixteen_task_production_mix(self):
+    def test_default_file_is_the_production_mix(self):
         spec = tasks.load()
         self.assertEqual((len(spec['tasks']), len(spec['domains'])), (16, 9))
+        # The cascade quality tasks are off: no reference answers, so the judge works their answers out itself.
+        self.assertEqual({n for n, t in spec['tasks'].items() if not t['enabled']},
+                         {'cascade_chat', 'cascade_lists', 'cascade_plans'})
         resolved = tasks.resolved(spec)
-        self.assertEqual(resolved['rollout_batch_size'], 873)
+        self.assertEqual(resolved['rollout_batch_size'], 721)
         # Every task uses its pool at most 3 times in the default 100 steps with 1 refill round.
         self.assertTrue(all(tasks.max_passes(t, 100, 1) <= tasks.MAX_PASSES for t in spec['tasks'].values()))
         table = tasks.table(spec, 16, 100, 1)
@@ -55,8 +58,8 @@ class TaskFileTests(unittest.TestCase):
         more['tasks']['calendar']['prompts_per_step'] = 72
         self.assertIn('note: calendar can use its 2974 prompts up to 4.8 times in 100 steps', tasks.table(more, 16, 100, 1))
         self.assertEqual({n for n, t in spec['tasks'].items() if t['about']['judge'] == 'none'}, JUDGE_FREE)
-        # "all": every validation prompt; 506 in total (v5), 52-57 per domain.
-        self.assertEqual(sum(resolved['eval_quotas'].values()), 506)
+        # "all": every validation prompt of the enabled tasks; 449 of v5's 506 (52-57 per domain).
+        self.assertEqual(sum(resolved['eval_quotas'].values()), 449)
         self.assertEqual(resolved['eval_quotas']['mcqa'], 19)
         self.assertLessEqual(tasks.eval_cost(spec, 8)['steps'], 1)
 

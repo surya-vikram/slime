@@ -720,7 +720,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             capped = [unfinished(s) for s in group]
             skip = masked(group)
             if len(group) - sum(skip) < 2:
-                return False, [0.] * len(group), capped, True
+                return False, [0.] * len(group), capped, True, skip
             scores, _, _, usable = group_rewards([s.metadata['grade'] for s in group], capped, c['truncation'],
                                                  masked=skip)
             return usable, scores, capped, False, skip

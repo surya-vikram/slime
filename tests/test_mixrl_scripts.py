@@ -98,7 +98,7 @@ class ScriptTests(unittest.TestCase):
     def test_tasks_preview_needs_no_docker(self):
         result = self.run_script('run.sh', 'tasks')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('16 of 16 tasks enabled; 873 prompts per step x 16 responses = 13968 samples', result.stdout)
+        self.assertIn('13 of 16 tasks enabled; 721 prompts per step x 16 responses = 11536 samples', result.stdout)
         self.assertIn('max passes in 100 steps', result.stdout)
         self.assertNotIn('may memorise', result.stdout)  # the default quotas keep every task at or below 3 passes
         self.assertEqual(self.calls('docker'), [])
@@ -123,7 +123,7 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script('run.sh', 'start', 'gsm8k-01')
         self.assertEqual(result.returncode, 0, result.stderr)
         # Both services answer, so start reuses them, then runs the preflight (no GPUs) and the training.
-        for line in ('tasks: 16 of 16 tasks enabled', 'judge: already running', 'reward service: already running',
+        for line in ('tasks: 13 of 16 tasks enabled', 'judge: already running', 'reward service: already running',
                      'preflight: ok', 'training: start run gsm8k-01'):
             self.assertIn(line, result.stdout)
         calls = self.calls('docker')

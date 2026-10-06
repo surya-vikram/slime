@@ -110,6 +110,13 @@ class CollectTests(unittest.IsolatedAsyncioTestCase):
         _, m, _ = await self.run_collect(['failed', 'informative'], 2, 0)
         self.assertEqual((m['responses'], m['score_sum'], m['attempted']), (2, 1., 2))
 
+    async def test_masked_responses_of_a_padding_group_are_counted(self):
+        async def run(assess_failed):
+            return await core.collect({'t': 1}, lambda r: 'g', lambda k: asyncio.sleep(0, k), lambda k: assess_failed,
+                                      inflight=1, refill_rounds=0, timeout=10)
+        _, metrics = await run((False, [0.] * 4, [False] * 4, True, [True, True, True, False]))
+        self.assertEqual((metrics['t']['grade_failed'], metrics['t']['masked']), (1, 3))
+
     async def test_a_masked_response_is_counted_but_not_scored(self):
         batch, m, _ = await self.run_collect(['masked'], 1, 0)
         self.assertEqual(batch, ['masked'])

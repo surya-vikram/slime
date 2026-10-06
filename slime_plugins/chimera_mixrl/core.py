@@ -335,6 +335,7 @@ async def collect(quotas, propose, execute, assess, *, inflight=4, refill_rounds
                 # Replace it like a constant group; use it only as zero-loss padding.
                 failed[route].append((index, group))
                 m['grade_failed'] += 1
+                m['masked'] += sum(outcome[4]) if len(outcome) > 4 else 0
                 decision = 'grade_failed'
                 if short(route):
                     dispatch(route)

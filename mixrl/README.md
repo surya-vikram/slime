@@ -82,7 +82,9 @@ terminal shows a `settings` line with what its processes actually use (from the 
 and the train command).
 
 Defaults are set for 8 H200s split 4 + 4: training and generation on `TRAIN_GPUS=0,1,2,3`, four judge
-replicas on GPUs 4-7. The dense judge is compute-bound, so in the 16-task mix it needs as many GPUs as the policy.
+replicas on GPUs 4-7. The dense judge is compute-bound, so with the judge tasks on it needs as many GPUs as the policy.
+The cascade quality tasks are off by default: they have no reference answers, so the judge has to work each answer
+out itself (long, noisy verdicts that can reward confident wrong answers) until references are added.
 The judge gets one attempt per verdict (4,096 tokens, brief reasoning). A response it cannot judge (cut off or
 unreadable) is masked at once, without retries: left out of its group's statistics and the loss while the rest of
 the group trains. Each task's prompts_per_step keeps it at or below 3 passes over its pool in the default 100 steps.

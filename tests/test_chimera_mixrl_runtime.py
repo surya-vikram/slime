@@ -79,7 +79,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime._rollout(self.args, 0, self.source)
         self.assertEqual(self.generated, 0)
 
-    async def test_full_nine_domain_collection_and_evaluation(self):
+    async def test_every_enabled_task_collects_and_evaluates(self):
         from slime_plugins.chimera_mixrl import tasks
         routes = tasks.resolved(tasks.load())['routes']
         self.c.update(quotas={t: 1 for t in routes}, caps={t: 8 for t in routes}, routes=routes,
@@ -100,7 +100,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         output = await runtime._rollout(self.args, 0, source)
         self.assertEqual({g[0].metadata['mixrl']['task'] for g in output.samples}, set(routes))
         raw, normalized = runtime.post_process_rewards(self.args, [s for g in output.samples for s in g])
-        self.assertEqual(len(raw), 48)
+        self.assertEqual(len(raw), 3 * len(routes))  # 3 samples per enabled task
         evaluation = await runtime._rollout(self.args, 0, source, evaluation=True)
         self.assertEqual(evaluation.data['equal_domain_mean']['rewards'], [.5])
 
