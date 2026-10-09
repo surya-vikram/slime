@@ -1,5 +1,5 @@
 """Multi-teacher on-policy distillation inputs: read and check a distillation folder, plan the batch and
-where the teachers run. Layout and rules: mixrl/distill/README.md. Preview with `mixrl/run.sh domains`, or:
+where the teachers run. Layout and rules: mixrl/mopd/README.md. Preview with `mixrl/run.sh domains`, or:
 
     python3 -m slime_plugins.chimera_mixrl.distill ROOT [--steps N] [--samples-per-prompt N]
         [--policy-gpus N] [--teacher-gpus 6,7] [--teacher-port 8100]
