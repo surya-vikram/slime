@@ -12,6 +12,7 @@ from .core import MIMO_LENGTH_PENALTY, digest, load_split, write_json
 from .runtime import request
 from .routes import validate_route
 from . import tasks as task_file
+from . import distill
 from .code_admission import code_exclusions
 
 
@@ -41,14 +42,103 @@ def checkpoint_identity(root):
     return {'path': str(root), 'files': files}
 
 
+def mixrl_data_and_scorer(env, c, spec):
+    """MixRL: the frozen data release against the task file, and the reward service that grades it."""
+    quotas = c['quotas']
+    rows, manifest = load_split(c['data_dir'], 'rl_train')
+    val, _ = load_split(c['data_dir'], 'rl_val')
+    task_file.check_data(spec, rows, val)
+    for row in rows + val:
+        if row['task'] in quotas:
+            validate_route(row, c['routes'])
+    if {r['family_id'] for r in rows} & {r['family_id'] for r in val}:
+        raise ValueError('Train/validation overlap')
+    urls = scorer_urls(env)
+    if len(urls) > 1:
+        c['scorer_urls'] = urls  # several reward-service processes; one URL keeps the old config
+    health = request(urls[0] + '/health', timeout=30)
+    task_file.check_scorer(spec, health)
+    c['scorer_protocol'] = health['protocol_id']
+    c['judge'] = health['judge']['model']
+    admission = request(urls[0] + '/admission', timeout=30)
+    for url in urls[1:]:
+        # Every process must grade identically: same data, settings and judge.
+        other = request(url + '/health', timeout=30)
+        if other['protocol_id'] != c['scorer_protocol'] or request(url + '/admission', timeout=30) != admission:
+            raise ValueError(f'Reward service {url} differs from {urls[0]}; restart them together with mixrl/reward.sh')
+    if admission['protocol_id'] != c['scorer_protocol']:
+        raise ValueError('Scoring service changed during preflight')
+    c['excluded_row_ids'] = sorted(admission['excluded_rows'])
+    if 'apps' in quotas:
+        excluded, audit_hash = code_exclusions(rows + val, env.get('MIXRL_CODE_AUDIT_DIR'))
+        c['code_audit_hash'] = audit_hash
+        c['code_exclusion_reasons'] = excluded
+        c['excluded_row_ids'] = sorted(set(c['excluded_row_ids']) | excluded.keys())
+    c['data_hash'] = digest(manifest)
+    return health
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def distill_inputs(env):
+    """MIXRL_MODE=distill: the distillation folder and its teacher servers (mixrl/mopd/README.md), in the
+    shape the trainer reads in place of the task file, data release and reward service."""
+    if float(env.get('ROLLOUT_TEMPERATURE', '1.0')) != 1:
+        raise ValueError('Distillation needs ROLLOUT_TEMPERATURE=1: SGLang returns the teachers\' log-probs at '
+                         'temperature 1, so the student must sample at 1 for the two to compare')
+    clip = float(env.get('DISTILL_ADV_CLIP', '5'))
+    if not math.isfinite(clip) or clip <= 0:
+        raise ValueError('DISTILL_ADV_CLIP must be a positive number')
+    root = Path(env['MIXRL_DISTILL_DIR'])
+    # The teachers were checked on the host (mixrl/run.sh domains); here they are known by what they serve.
+    spec = distill.load(root, check_teachers=False)
+    chosen = distill.enabled(spec)
+    teachers = {}
+    for name, server in distill.parse_urls(env.get('MIXRL_TEACHER_URLS', '')).items():
+        models = request(server['url'] + '/v1/models', timeout=30).get('data') or [{}]
+        if [m.get('id') for m in models] != [name]:
+            raise ValueError(f'Teacher server {server["url"]} serves {[m.get("id") for m in models]}, expected {name}; '
+                             'restart the teachers with mixrl/teachers.sh')
+        checkpoint = request(server['url'] + '/get_model_info', timeout=30).get('model_path')
+        for domain in server['domains']:
+            teachers[domain] = {'url': server['url'], 'server': name, 'checkpoint': checkpoint}
+    missing = sorted(set(chosen) - set(teachers))
+    if missing:
+        raise ValueError(f'No teacher server for domain(s) {", ".join(missing)}; start them with mixrl/teachers.sh')
+    c = {'mode': 'distill', 'distill_root': str(root), 'adv_clip': clip,
+         'domains': {n: {'prompts': str(d['prompts']), 'eval': str(d['eval']), 'prompts_hash': file_hash(d['prompts']),
+                         'eval_hash': file_hash(d['eval']), 'prompts_per_step': d['prompts_per_step'],
+                         'max_response_tokens': d['max_response_tokens'], 'eval_prompts': d['eval_prompts']}
+                     for n, d in chosen.items()},
+         'teachers': {n: teachers[n] for n in chosen},
+         'quotas': {n: d['prompts_per_step'] for n, d in chosen.items()},
+         # A row's own max_response_tokens overrides its domain's cap (runtime.DataSource).
+         'caps': {n: d['max_response_tokens'] for n, d in chosen.items()},
+         'eval_quotas': {n: d['eval_pool'] if d['eval_prompts'] == 'all' else d['eval_prompts'] for n, d in chosen.items()},
+         'eval_samples': 1, 'routes': {}, 'rollout_batch_size': distill.batch_prompts(spec)}
+    return c, spec
+
+
 def resolve():
     env = os.environ
-    tasks_path = Path(env.get('MIXRL_TASKS_CONFIG', str(task_file.DEFAULT_PATH))).resolve()
-    spec = task_file.load(tasks_path)
-    c = {'tasks_file': str(tasks_path), **task_file.resolved(spec)}
+    distilling = env.get('MIXRL_MODE', 'mixrl') == 'distill'
+    if distilling:
+        c, spec = distill_inputs(env)
+    else:
+        tasks_path = Path(env.get('MIXRL_TASKS_CONFIG', str(task_file.DEFAULT_PATH))).resolve()
+        spec = task_file.load(tasks_path)
+        c = {'tasks_file': str(tasks_path), **task_file.resolved(spec)}
     quotas, caps = c['quotas'], c['caps']
-    c.update({'data_dir': env['MIXRL_DATA_DIR'],
-        'run_dir': env['RUN_DIR'], 'scorer_url': scorer_urls(env)[0],
+    if not distilling:
+        c.update({'data_dir': env['MIXRL_DATA_DIR'], 'scorer_url': scorer_urls(env)[0]})
+    c.update({
+        'run_dir': env['RUN_DIR'],
         'truncation': env['MIXRL_TRUNCATION'], 'seed': int(env['MIXRL_SEED']),
         'context': int(env['MODEL_CONTEXT_LENGTH']),
         'inflight_groups': int(env['MIXRL_INFLIGHT_GROUPS']),
@@ -129,7 +219,8 @@ def resolve():
     if (c['expert_model_parallel_size'] < 1 or
             c['policy_gpus'] % c['expert_model_parallel_size']):
         raise ValueError('EXPERT_MODEL_PARALLEL_SIZE must positively divide POLICY_GPUS')
-    if c['samples_per_prompt'] < 2 or c['truncation'] not in ('mask', 'zero'):
+    # Distillation compares no responses within a group: its signal is per token, from the teacher.
+    if c['samples_per_prompt'] < (1 if distilling else 2) or c['truncation'] not in ('mask', 'zero'):
         raise ValueError('Invalid group size or truncation policy')
     oversample = float(env.get('MIXRL_OVERSAMPLE', '0'))
     if not 0 <= oversample <= 2:
@@ -206,36 +297,13 @@ def resolve():
         validate_mcore_geometry(yaml.safe_load(metadata_path.read_text())['model'], c['chimera_model_size'])
     if c['context'] > c['max_tokens_per_gpu']:
         raise ValueError('DP-only sequence cap exceeds MAX_TOKENS_PER_GPU; packing does not split long samples')
-    rows, manifest = load_split(c['data_dir'], 'rl_train')
-    val, _ = load_split(c['data_dir'], 'rl_val')
-    task_file.check_data(spec, rows, val)
-    for row in rows + val:
-        if row['task'] in quotas:
-            validate_route(row, c['routes'])
-    if {r['family_id'] for r in rows} & {r['family_id'] for r in val}:
-        raise ValueError('Train/validation overlap')
-    urls = scorer_urls(env)
-    if len(urls) > 1:
-        c['scorer_urls'] = urls  # several reward-service processes; one URL keeps the old config
-    health = request(urls[0] + '/health', timeout=30)
-    task_file.check_scorer(spec, health)
-    c['scorer_protocol'] = health['protocol_id']
-    c['judge'] = health['judge']['model']
-    admission = request(urls[0] + '/admission', timeout=30)
-    for url in urls[1:]:
-        # Every process must grade identically: same data, settings and judge.
-        other = request(url + '/health', timeout=30)
-        if other['protocol_id'] != c['scorer_protocol'] or request(url + '/admission', timeout=30) != admission:
-            raise ValueError(f'Reward service {url} differs from {urls[0]}; restart them together with mixrl/reward.sh')
-    if admission['protocol_id'] != c['scorer_protocol']:
-        raise ValueError('Scoring service changed during preflight')
-    c['excluded_row_ids'] = sorted(admission['excluded_rows'])
-    if 'apps' in quotas:
-        excluded, audit_hash = code_exclusions(rows + val, env.get('MIXRL_CODE_AUDIT_DIR'))
-        c['code_audit_hash'] = audit_hash
-        c['code_exclusion_reasons'] = excluded
-        c['excluded_row_ids'] = sorted(set(c['excluded_row_ids']) | excluded.keys())
-    c['data_hash'] = digest(manifest)
+    if distilling:
+        if c['objective'] != 'mimo':
+            raise ValueError('Distillation uses the MiMo objective\'s importance weights (MIXRL_OBJECTIVE=mimo)')
+        c['data_hash'] = digest({n: [d['prompts_hash'], d['eval_hash']] for n, d in c['domains'].items()})
+        health = None
+    else:
+        health = mixrl_data_and_scorer(env, c, spec)
     c['implementation_hash'] = digest({p.name: p.read_text() for p in sorted(Path(__file__).parent.glob('*.py'))})
     repo = Path(__file__).resolve().parents[2]
     c['launcher_hash'] = digest((repo / 'mixrl/internal/launch.sh').read_text())
@@ -280,8 +348,16 @@ def resolve():
         raise ValueError(f'Existing resolved config differs in {", ".join(changed[:10])}; '
                          'resume with the settings the run started with, or choose a fresh run name')
     write_json(path, c)
-    print(f'MixRL tasks ({tasks_path})\n' + task_file.table(spec, c['samples_per_prompt'],
-                                                     int(os.environ.get('NUM_ROLLOUT', 0)) or None, c['refill_rounds']))
+    if distilling:
+        gpus = [int(g) for g in env.get('TEACHER_GPUS', '6,7').split(',') if g.strip()]
+        print(f'Distillation folder ({c["distill_root"]})\n' + distill.table(
+            spec, int(env.get('NUM_ROLLOUT', 0)) or 1, c['samples_per_prompt'], c['policy_gpus'], gpus,
+            int(env.get('TEACHER_PORT', '8100'))))
+        print('Teachers: ' + '; '.join(f'{d} -> {t["server"]} at {t["url"]} ({t["checkpoint"]})'
+                                        for d, t in c['teachers'].items()) + f'; resolved config: {path}')
+        return
+    print(f'MixRL tasks ({c["tasks_file"]})\n' + task_file.table(spec, c['samples_per_prompt'],
+                                                         int(os.environ.get('NUM_ROLLOUT', 0)) or None, c['refill_rounds']))
     print(f'Reward service judge: {c["judge"]} ({"reachable" if health["judge"]["ready"] else "not reachable"}); '
           f'{len(c["excluded_row_ids"])} quarantined rows; resolved config: {path}')
 

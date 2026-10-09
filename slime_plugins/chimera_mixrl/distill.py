@@ -2,13 +2,17 @@
 where the teachers run. Layout and rules: mixrl/mopd/README.md. Preview with `mixrl/run.sh domains`, or:
 
     python3 -m slime_plugins.chimera_mixrl.distill ROOT [--steps N] [--samples-per-prompt N]
-        [--policy-gpus N] [--teacher-gpus 6,7] [--teacher-port 8100]
+        [--policy-gpus N] [--teacher-gpus 6,7] [--teacher-port 8100] [--plan]
 
-Standard library only: the preview runs on the host before any container starts.
+--plan prints the teacher servers instead (mixrl/teachers.sh and mixrl/run.sh read it). Standard library
+only: the preview runs on the host before any container starts. The trainer reads the prompts with read_rows()
+and summarizes evaluations with eval_summary().
 """
 import argparse
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 
 DOMAIN_FIELDS = {'enabled', 'prompts_per_step', 'max_response_tokens', 'eval_prompts'}
@@ -23,6 +27,8 @@ TOKENIZER_FILES = ('tokenizer.json', 'tokenizer.model', 'tokenizer_config.json',
                    'added_tokens.json', 'chat_template.jinja', 'chat_template.json')
 # config.json keys that may differ between checkpoints of one architecture.
 CONFIG_VOLATILE = {'transformers_version', '_name_or_path', 'torch_dtype', 'dtype', 'use_cache'}
+# Domain names become teacher server names ('a+b' for a shared teacher) and MIXRL_TEACHER_URLS entries.
+NAME = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
 def _positive(value):
@@ -116,8 +122,10 @@ def compare_checkpoints(student, teacher):
     return problems
 
 
-def load(root):
-    """Read and check a distillation folder. Returns {'root', 'student', 'domains'}; raises with every problem."""
+def load(root, check_teachers=True):
+    """Read and check a distillation folder. Returns {'root', 'student', 'domains'}; raises with every problem.
+    check_teachers=False skips reading the teacher folders: the trainer container mounts only DISTILL_ROOT, and a
+    teacher/ symlink may point outside it (the host checked the teachers, and the servers prove what they serve)."""
     root = Path(root)
     problems = []
     student = {'hf': root / 'student' / 'hf', 'mcore': root / 'student' / 'mcore'}
@@ -132,8 +140,11 @@ def load(root):
         problems.append(f'{folder}: no domain folders')
     for name in names:
         base = folder / name
+        if not NAME.match(name):
+            problems.append(f'domain {name}: use letters, digits, . _ - only in domain folder names')
+            continue
         missing = [f for f in ('prompts.jsonl', 'eval.jsonl', 'domain.json') if not (base / f).is_file()]
-        if not (base / 'teacher').is_dir():
+        if check_teachers and not (base / 'teacher').is_dir():
             missing.append('teacher/')
         if missing:
             problems.append(f'domain {name}: missing {", ".join(missing)}')
@@ -152,7 +163,7 @@ def load(root):
         if settings['eval_prompts'] != 'all' and settings['eval_prompts'] > len(eval_ids):
             problems.append(f'domain {name}: eval_prompts {settings["eval_prompts"]} > {len(eval_ids)} eval prompts')
         teacher = (base / 'teacher').resolve()
-        if settings['enabled'] and (student['hf'] / 'config.json').is_file():
+        if check_teachers and settings['enabled'] and (student['hf'] / 'config.json').is_file():
             problems += [f'domain {name}: teacher {problem}' for problem in compare_checkpoints(student['hf'], teacher)]
         domains[name] = {**settings, 'prompts': base / 'prompts.jsonl', 'eval': base / 'eval.jsonl',
                          'teacher': teacher, 'pool': len(train_ids), 'eval_pool': len(eval_ids),
@@ -207,6 +218,73 @@ def placement(spec, gpus, port, per_gpu=TEACHERS_PER_GPU):
     return plan
 
 
+def servers(spec, gpus, port, memory=0.85, host='127.0.0.1'):
+    """The teacher servers to run, in start order: placement() plus each server's URL and memory setting.
+    SGLang sizes its cache from what is left on the GPU (KV = mem_fraction_static x GPU memory - memory in use),
+    so servers sharing a GPU start one after another, the k-th of n with k/n of `memory`: an equal share each."""
+    plan = placement(spec, gpus, port)
+    for p in plan:
+        mates = [q for q in plan if q['gpu'] == p['gpu']]
+        p['memory'] = round(memory * (mates.index(p) + 1) / len(mates), 3)
+        p['url'] = f'http://{host}:{p["port"]}'
+    return plan
+
+
+def parse_urls(text):
+    """MIXRL_TEACHER_URLS: 'name=url,name=url', a server name being its domains joined by '+'.
+    Returns {server name: {'url', 'domains'}}."""
+    out = {}
+    for item in filter(None, (part.strip() for part in text.split(','))):
+        name, sep, url = item.partition('=')
+        if not sep or not url.startswith('http') or not all(NAME.match(d) for d in name.split('+')):
+            raise ValueError(f'MIXRL_TEACHER_URLS: expected name=http://host:port, got {item!r}')
+        out[name] = {'url': url.rstrip('/'), 'domains': name.split('+')}
+    return out
+
+
+def read_rows(path):
+    """The prompts of a checked prompts.jsonl or eval.jsonl, in file order."""
+    with open(path, encoding='utf-8') as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def percentile(values, q):
+    """numpy.percentile's default (linear) rule; values need not be sorted."""
+    ordered = sorted(values)
+    position = q / 100 * (len(ordered) - 1)
+    low = math.floor(position)
+    return ordered[low] + (ordered[min(low + 1, len(ordered) - 1)] - ordered[low]) * (position - low)
+
+
+def answer_stats(answers):
+    """answers: [{'tokens': response length, 'stopped': ended its turn before the cap}] -> length and stop rate."""
+    lengths = [a['tokens'] for a in answers]
+    return {'answers': len(answers), 'length_mean': sum(lengths) / len(lengths),
+            'length_p99': percentile(lengths, 99), 'stop_rate': sum(a['stopped'] for a in answers) / len(answers)}
+
+
+def eval_summary(answers, teacher=None, clip=5.):
+    """One evaluation, per domain and overall. answers: {domain: [{'tokens', 'stopped', 'gaps'}]}, gaps being the
+    per-token student - teacher log-probs (both full vocabulary, temperature 1). KL is the mean over answers of
+    each answer's mean gap (the loss weighs answers the same way); clipped is the share of tokens at the clip.
+    teacher: {domain: answer_stats of the teacher's own answers}, shown next to the student's."""
+    domains = {}
+    for name, items in answers.items():
+        if not items:
+            continue
+        tokens = sum(len(a['gaps']) for a in items)
+        domains[name] = {**answer_stats(items),
+                         'kl': sum(sum(a['gaps']) / len(a['gaps']) for a in items) / len(items),
+                         'clipped': sum(abs(g) >= clip for a in items for g in a['gaps']) / max(1, tokens)}
+        for key, value in ((teacher or {}).get(name) or {}).items():
+            if key != 'answers':
+                domains[name]['teacher_' + key] = value
+    return {'mode': 'distill', 'domains': domains,
+            'kl': sum(d['kl'] for d in domains.values()) / len(domains) if domains else None,
+            'aggregation': 'per domain: mean over answers of the per-token student - teacher log-prob; '
+                           'overall: equal mean over domains'}
+
+
 def check_batch(spec, samples_per_prompt, policy_gpus):
     total = batch_prompts(spec) * samples_per_prompt
     if total % policy_gpus:
@@ -256,10 +334,18 @@ def main():
     parser.add_argument('--policy-gpus', type=int, default=6)
     parser.add_argument('--teacher-gpus', default='6,7')
     parser.add_argument('--teacher-port', type=int, default=8100)
+    parser.add_argument('--teacher-memory', type=float, default=0.85)
+    parser.add_argument('--teacher-host', default='127.0.0.1')
+    parser.add_argument('--plan', action='store_true',
+                        help='print one line per teacher server: port, GPU, memory share, name, checkpoint, URL')
     args = parser.parse_args()
     gpus = [int(g) for g in args.teacher_gpus.split(',') if g.strip()]
     try:
         spec = load(args.root)
+        if args.plan:
+            for p in servers(spec, gpus, args.teacher_port, args.teacher_memory, args.teacher_host):
+                print('\t'.join(str(p[k]) for k in ('port', 'gpu', 'memory', 'name', 'path', 'url')))
+            return
         text = table(spec, args.steps, args.samples_per_prompt, args.policy_gpus, gpus, args.teacher_port)
     except ValueError as error:
         raise SystemExit(f'{args.root}:\n{error}')

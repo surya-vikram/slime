@@ -19,6 +19,29 @@ for removed in MIXRL_QUOTAS MIXRL_CAPS MIXRL_EVAL_QUOTAS MIXRL_MAIN_EVAL_QUOTAS 
 done
 source "$MIXRL_DIR/config.env"
 
+# mixrl: RL with the judge and reward service (tasks.json). distill: multi-teacher on-policy distillation
+# of the folder MIXRL_DISTILL_DIR (mixrl/mopd/README.md); mixrl/run.sh distill sets it.
+MIXRL_MODE=${MIXRL_MODE:-mixrl}
+if [[ "$MIXRL_MODE" != mixrl && "$MIXRL_MODE" != distill ]]; then
+    echo "MIXRL_MODE must be mixrl or distill" >&2; exit 1
+fi
+if [[ "$MIXRL_MODE" == distill ]]; then
+    MIXRL_DISTILL_DIR=${MIXRL_DISTILL_DIR:-$DISTILL_ROOT}
+    HF_CHECKPOINT=${HF_CHECKPOINT:-$MIXRL_DISTILL_DIR/student/hf}
+    MCORE_CHECKPOINT=${MCORE_CHECKPOINT:-$MIXRL_DISTILL_DIR/student/mcore}
+    POLICY_GPUS=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
+    N_SAMPLES_PER_PROMPT=$DISTILL_SAMPLES_PER_PROMPT
+    LR_WARMUP_STEPS=$DISTILL_LR_WARMUP_STEPS
+    if [[ -z "${MIXRL_TEACHER_URLS:-}" ]]; then
+        # mixrl/run.sh passes the servers it started; run by hand (inside a container), plan them here.
+        MIXRL_TEACHER_URLS=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill \
+            "$MIXRL_DISTILL_DIR" --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
+            | awk -F'\t' '{printf "%s%s=%s", (NR > 1 ? "," : ""), $4, $6}')
+    fi
+    export MIXRL_DISTILL_DIR MIXRL_TEACHER_URLS DISTILL_ADV_CLIP
+fi
+export MIXRL_MODE
+
 # Internal switches (not in config.env): model profile, precision matching, scheduling.
 MODEL_PROFILE=${MODEL_PROFILE:-chimera} # qwen3-0.6B: CPU/reference validation only.
 export CHIMERA_MODEL_SIZE=${CHIMERA_MODEL_SIZE:-full} # tiny: canonical 8-layer local mechanics only.
@@ -126,7 +149,7 @@ if [[ "$COLOCATE" == 0 ]]; then
 elif [[ "$ROLLOUT_GPUS" != "$POLICY_GPUS" ]]; then
     echo "Colocated runs require equal actor and rollout GPU counts" >&2; exit 1
 fi
-RUNS_ROOT=${MIXRL_RUNS_ROOT:-$DATA_ROOT/runs/chimera/mixrl}
+RUNS_ROOT=${MIXRL_RUNS_ROOT:-$DATA_ROOT/runs/chimera/$MIXRL_MODE}
 RUN_DIR=$RUNS_ROOT/$RUN_NAME
 SAVE_PATH=$RUN_DIR/checkpoints
 TENSORBOARD_DIR=$RUN_DIR/tensorboard
@@ -196,6 +219,11 @@ PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m slime_plugins.chim
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then exit 0; fi
 read -r ROLLOUT_BATCH_SIZE MIXRL_EVAL_SAMPLES < <(python3 -c 'import json, os
 c = json.load(open(os.environ["CHIMERA_MIXRL_CONFIG"])); print(c["rollout_batch_size"], c["eval_samples"])')
+if [[ "$MIXRL_MODE" == distill ]]; then
+    # Slime requires prompt files; the MixRL data source reads the domains itself.
+    read -r TRAIN_DATA EVAL_DATA < <(python3 -c 'import json, os
+c = json.load(open(os.environ["CHIMERA_MIXRL_CONFIG"])); d = next(iter(c["domains"].values())); print(d["prompts"], d["eval"])')
+fi
 
 for required_file in "$HF_CHECKPOINT/config.json" "$TRAIN_DATA" "$EVAL_DATA"; do
     if [[ ! -f "$required_file" ]]; then
@@ -356,7 +384,12 @@ EVAL_ARGS=(--eval-interval "$EVAL_INTERVAL" --eval-prompt-data mixrl "$EVAL_DATA
     --n-samples-per-eval-prompt "$MIXRL_EVAL_SAMPLES")
 if [[ "$EVAL_BEFORE_TRAIN" == 0 ]]; then EVAL_ARGS+=(--skip-eval-before-train); fi
 
-if [[ "$MIXRL_OBJECTIVE" == mimo ]]; then
+if [[ "$MIXRL_MODE" == distill ]]; then
+    # The per-token advantage comes from the teacher, inside the loss (objective.distill_loss).
+    OBJECTIVE_ARGS=(--advantage-estimator grpo --disable-grpo-std-normalization
+        --kl-coef 0.0 --entropy-coef 0.0 --loss-type custom_loss
+        --custom-loss-function-path slime_plugins.chimera_mixrl.objective.distill_loss)
+elif [[ "$MIXRL_OBJECTIVE" == mimo ]]; then
     OBJECTIVE_ARGS=(--advantage-estimator grpo --disable-grpo-std-normalization
         --kl-coef 0.0 --entropy-coef 0.0 --loss-type custom_loss
         --custom-loss-function-path slime_plugins.chimera_mixrl.objective.loss)
@@ -470,8 +503,9 @@ TRAIN_COMMAND=(
     "${MISC_ARGS[@]}"
 )
 
-# Everything needed to reproduce this run, next to its checkpoints.
-cp "$MIXRL_TASKS_CONFIG" "$MANIFEST_DIR/tasks.json"
+# Everything needed to reproduce this run, next to its checkpoints (the distillation folder and teacher plan
+# are in mixrl_config.json).
+if [[ "$MIXRL_MODE" == mixrl ]]; then cp "$MIXRL_TASKS_CONFIG" "$MANIFEST_DIR/tasks.json"; fi
 while IFS= read -r name; do
     printf '%s=%q\n' "$name" "${!name}"
 done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$MANIFEST_DIR/config.env"
@@ -492,6 +526,7 @@ fi
 commit_of "$MEGATRON_ROOT" > "$MANIFEST_DIR/megatron_image_commit.txt"
 {
     printf 'DATA_ROOT=%q\n' "$DATA_ROOT"
+    printf 'MIXRL_MODE=%q\n' "$MIXRL_MODE"
     printf 'RUN_NAME=%q\n' "$RUN_NAME"
     printf 'RUN_DIR=%q\n' "$RUN_DIR"
     printf 'HF_CHECKPOINT=%q\n' "$HF_CHECKPOINT"
@@ -511,7 +546,9 @@ echo "Checkpoint context: $RESOLVED_CONTEXT_PHASE maximum=$MODEL_MAX_CONTEXT; ru
 echo "Megatron actor: dense-DP=$POLICY_GPUS, expert-DP=$((POLICY_GPUS / EXPERT_MODEL_PARALLEL_SIZE)), TP=PP=CP=ETP=1, EP=$EXPERT_MODEL_PARALLEL_SIZE, distributed optimizer"
 echo "SGLang rollout: $ROLLOUT_GPUS independent TP=1 engines, mode=$EXECUTION_MODE colocate=$COLOCATE"
 echo "Batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT responses = $GLOBAL_BATCH_SIZE samples"
-say "MixRL run $RUN_NAME ($([[ "$RESUME" == 1 ]] && echo resume || echo new)) | model: $MODEL_NAME |" \
+say "$([[ "$MIXRL_MODE" == distill ]] && echo "MixRL distillation run" || echo "MixRL run") $RUN_NAME" \
+    "($([[ "$RESUME" == 1 ]] && echo resume || echo new)) |" \
+    "$([[ "$MIXRL_MODE" == distill ]] && echo "student: $MIXRL_DISTILL_DIR/student" || echo "model: $MODEL_NAME") |" \
     "training GPUs: $POLICY_GPUS (EP $EXPERT_MODEL_PARALLEL_SIZE) | SGLang engines: $ROLLOUT_GPUS |" \
     "batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT = $GLOBAL_BATCH_SIZE samples | steps: $NUM_ROLLOUT |" \
     "eval every $EVAL_INTERVAL | save every $SAVE_INTERVAL"

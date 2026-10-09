@@ -6,14 +6,22 @@ No adaptive controller, quality redistribution or token-level shaping.
 
 def active_diagnostics(metrics, prefix='train/'):
     """Apply only after native global DP/microbatch reduction, never rank-locally."""
+    out = {}
+    # Distillation: per-domain means over answers, from distill_loss's per-domain sums and answer counts.
+    head = prefix + 'distill_answers/'
+    for key, answers in metrics.items():
+        if key.startswith(head) and answers > 0:
+            domain = key[len(head):]
+            for name in ('kl', 'clipped'):
+                out[f'{prefix}distill/{domain}/{name}'] = metrics[f'{prefix}distill_{name}/{domain}'] / answers
     fraction = metrics.get(prefix + 'effective_response_fraction', 0.)
     if fraction <= 0:
-        return {}
-    return {prefix + 'active/' + name: metrics[prefix + name] / fraction
-            for name in ('entropy', 'importance_ratio', 'importance_masked_fraction',
-                         'importance_positive_low_fraction', 'importance_positive_high_fraction',
-                         'importance_negative_low_fraction', 'importance_negative_high_fraction',
-                         'train_rollout_logprob_abs_diff') if prefix + name in metrics}
+        return out
+    return out | {prefix + 'active/' + name: metrics[prefix + name] / fraction
+                  for name in ('entropy', 'importance_ratio', 'importance_masked_fraction',
+                               'importance_positive_low_fraction', 'importance_positive_high_fraction',
+                               'importance_negative_low_fraction', 'importance_negative_high_fraction',
+                               'train_rollout_logprob_abs_diff') if prefix + name in metrics}
 
 
 # Train/rollout log-prob gap over loss-active response tokens, accumulated across this
@@ -105,7 +113,37 @@ def masked_terms(current, behavior, advantages, positive=(.2, 5.), negative=(.2,
     return terms, ratio, keep
 
 
+def full_vocab_log_probs(logits, unconcat_tokens, total_lengths, response_lengths, chunk=4096):
+    """lp_full of mixrl/mopd/README.md: each answer token's log-prob over the whole vocabulary, from the training
+    logits, without gradient. CP = TP = 1 (MixRL's layout): every position and the whole vocabulary are local.
+    Sequences are packed back to back as in get_log_probs_and_entropy; row j predicts token j + 1."""
+    import torch
+    with torch.no_grad():
+        flat, out, offset = logits.squeeze(0), [], 0
+        for tokens, total, response in zip(unconcat_tokens, total_lengths, response_lengths, strict=True):
+            rows = flat[offset + total - response - 1:offset + total - 1]
+            target = torch.as_tensor(tokens[total - response:total], device=flat.device).long()
+            values = []
+            for i in range(0, response, chunk):
+                part = rows[i:i + chunk].float()
+                values.append(part.gather(-1, target[i:i + chunk, None]).squeeze(-1) - torch.logsumexp(part, -1))
+            out.append(torch.cat(values) if values else flat.new_zeros(0))
+            offset += total
+    return out
+
+
 def loss(args, batch, logits, sum_of_sample_mean):
+    return _loss(args, batch, logits, sum_of_sample_mean)
+
+
+def distill_loss(args, batch, logits, sum_of_sample_mean):
+    """Multi-teacher on-policy distillation (mixrl/mopd/README.md): this loss with the teacher's per-token
+    advantage A = clip(q - lp_full, -clip, clip) in place of the group-relative one; the importance weight, its
+    mask, candidate-set replay and routing replay are unchanged."""
+    return _loss(args, batch, logits, sum_of_sample_mean, distill=True)
+
+
+def _loss(args, batch, logits, sum_of_sample_mean, distill=False):
     import torch
 
     from slime.backends.megatron_utils.loss import get_log_probs_and_entropy, get_rollout_top_p_logprob_kwargs
@@ -116,6 +154,13 @@ def loss(args, batch, logits, sum_of_sample_mean):
         raise ValueError('MiMo fixed objective requires per-response reduction, zero KL/entropy loss')
     if args.context_parallel_size != 1:
         raise ValueError('CP objective qualification is not yet complete')
+    if distill and (c.get('mode') != 'distill' or getattr(args, 'tensor_model_parallel_size', 1) != 1
+                    or args.rollout_temperature != 1):
+        raise ValueError('distill_loss needs a distillation config, TP=1 and temperature 1')
+    if distill:
+        # Before the log-prob pass below, which may reuse buffers: lp_full reads the untouched logits.
+        full = torch.cat(full_vocab_log_probs(logits, batch['unconcat_tokens'], batch['total_lengths'],
+                                              batch['response_lengths']))
     # With top-p < 1, renormalize each token's log-prob over the candidate set recorded at
     # rollout, as SGLang did for the behaviour log-prob (MiMo's top-p candidate-set replay).
     _, values = get_log_probs_and_entropy(
@@ -125,6 +170,11 @@ def loss(args, batch, logits, sum_of_sample_mean):
     current = torch.cat(values['log_probs'])
     behavior = torch.cat(batch['rollout_log_probs'])
     advantages = torch.cat(batch['advantages'])
+    if distill:
+        # The advantage slot carries each answer's domain index (runtime.distill_rewards), for the metrics only.
+        domains = advantages.detach()
+        gap = torch.cat(batch['teacher_log_probs']).to(full) - full  # q - lp_full
+        advantages = gap.clamp(-c['adv_clip'], c['adv_clip'])
     record_gap(current, behavior, batch['loss_masks'], batch['response_lengths'],
                batch['total_lengths'], batch['unconcat_tokens'])
     terms, ratio, keep = masked_terms(current, behavior, advantages,
@@ -147,4 +197,15 @@ def loss(args, batch, logits, sum_of_sample_mean):
         for tail, condition in (('low', ratio < bounds[0]), ('high', ratio > bounds[1])):
             metrics[f'importance_{sign}_{tail}_fraction'] = sum_of_sample_mean(
                 (selected & condition).float()).detach()
+    if distill:
+        # KL: per answer the mean of lp_full - q (a reverse-KL estimate), averaged over answers like the loss.
+        # Per domain: sums and answer counts here, divided after the global reduction (active_diagnostics).
+        clipped = (gap.abs() >= c['adv_clip']).float()
+        metrics['distill_kl'] = sum_of_sample_mean(-gap).detach()
+        metrics['distill_clipped'] = sum_of_sample_mean(clipped).detach()
+        for i, name in enumerate(c['domains']):
+            mine = (domains == i).float()
+            metrics[f'distill_answers/{name}'] = sum_of_sample_mean(mine).detach()
+            metrics[f'distill_kl/{name}'] = sum_of_sample_mean(-gap * mine).detach()
+            metrics[f'distill_clipped/{name}'] = sum_of_sample_mean(clipped * mine).detach()
     return value, metrics

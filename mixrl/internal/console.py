@@ -7,7 +7,7 @@ so train.log keeps every line. The terminal gets, Megatron-LM style (`key: value
   startup lines from the launcher, then `ready` with the startup time
   a progress line during each rollout (every MIXRL_CONSOLE_PROGRESS_SECONDS, default 60)
   three lines per training step: training metrics with the step time and ETA, timing and rollout
-  statistics, and reward per task
+  statistics, and reward per task (distillation: KL to the teachers, overall and per domain)
   evaluations, task passes, warnings (grading retries/failures, waiting for services) and errors
   (the exception line of each traceback, with its line number in train.log)
 
@@ -169,6 +169,8 @@ class Console:
                 self.say(f'{kind.lower()} {payload}')
             elif kind == 'REWARD_RETRY':
                 self.warn(f'reward service request failed, retrying: {payload}', key='reward_retry')
+            elif kind == 'TEACHER_RETRY':
+                self.warn(f'teacher request failed, retrying: {payload}', key='teacher_retry')
         elif kind == 'READY':
             self.say(f'ready | startup: {duration(self.clock() - self.started)} | models loaded, weights in SGLang')
         elif kind == 'PIPELINE':
@@ -183,6 +185,10 @@ class Console:
             self.step(value)
         elif kind == 'EVAL':
             self.evaluation(value)
+        elif kind == 'TEACHER_EVAL':
+            self.say(' | '.join(['teachers answered the eval prompts (once per run)'] + [
+                f'{d} len {v["length_mean"]:.0f}/{v["length_p99"]:.0f} stop {pct(v["stop_rate"])}'
+                for d, v in value.get('domains', {}).items()]))
         elif kind == 'PASS':
             self.say(f'task {value["task"]} | started pass {value["pass"]} over its {value["pool"]} prompts')
         elif kind == 'GRADE_FAILED':
@@ -212,12 +218,13 @@ class Console:
             return
         self.last_progress, gen_rate, self.rates = now, statistics.mean(self.rates), []
         what = self.eval_label(rid) if evaluating else f'step {rid + 1} rollout'
+        grade = 'score' if p.get('mode') == 'distill' else 'grade'  # distillation: the teachers score
         parts = [what, duration(p.get('seconds')), f'done: {p.get("done", 0)}', f'generating: {p.get("generating", 0)}',
-                 f'grading: {p.get("grading", 0)}']
+                 f'{grade[:-1]}ing: {p.get("grading", 0)}']
         if p.get('gen_queued'):
             parts.append(f'waiting to generate: {p["gen_queued"]}')
         if p.get('grade_queued'):
-            parts.append(f'waiting to grade: {p["grade_queued"]}')
+            parts.append(f'waiting to {grade}: {p["grade_queued"]}')
         parts.append(f'gen: {rate(gen_rate)} tok/s')
         for service in ('sglang', 'judge'):
             load = p.get(service)
@@ -244,6 +251,9 @@ class Console:
         train = info.get('train') or {}
         router, consistency = info.get('router') or {}, info.get('consistency') or {}
         lr = next((v for k, v in train.items() if k.startswith('lr-')), None)
+        if (info.get('collection') or {}).get('mode') == 'distill':
+            self.distill_step(head, s, eta, info, routes, train, router, consistency, lr)
+            return
         if s.get('skipped'):
             self.say(f'{head} | step time: {duration(s["seconds"])} | ETA: {eta} | skipped: no informative groups, '
                      f'optimizer unchanged | reward: {num(reward)}')
@@ -294,12 +304,54 @@ class Console:
                 self.warn(f'task {task}: {lost} of {r.get("responses", 0) + lost} responses could not be graded '
                           f'and were masked this step (over 1%)', key=f'masked_share:{task}')
 
+    def distill_step(self, head, s, eta, info, routes, train, router, consistency, lr):
+        """The three step lines of a distillation run: KL to the teachers instead of reward."""
+        self.say(' | '.join([head, f'step time: {duration(s["seconds"])}', f'ETA: {eta}',
+                             f'KL: {num(train.get("distill_kl"))}', f'loss: {num(train.get("loss"), ".4E")}',
+                             f'grad norm: {num(train.get("grad_norm"))}', f'entropy: {num(train.get("entropy"))}',
+                             f'lr: {num(lr, ".2E")}',
+                             f'logprob diff: {num(train.get("train_rollout_logprob_abs_diff"), ".4f")}',
+                             f'rollout KL: {num(consistency.get("kl_k3"), ".2E")}',
+                             f'IS masked: {pct(train.get("importance_masked_fraction"))}',
+                             f'clipped: {num(None if train.get("distill_clipped") is None else 100 * train["distill_clipped"], ".1f")}%',
+                             f'router cv: {num(router.get("cv_mean"), ".2f")}']))
+        timing, perf, peaks = info.get('timing') or {}, info.get('perf') or {}, info.get('peaks') or {}
+        responses = sum(r.get('responses', 0) for r in routes.values())
+        capped = sum(r.get('capped', 0) for r in routes.values())
+        parts = [' ' * len(head), f'rollout: {duration(s.get("rollout"))}']
+        train_part = f'train: {duration(s.get("train"))}'
+        if perf.get('actor_train_tok_per_s'):
+            train_part += f' ({rate(perf["actor_train_tok_per_s"])} tok/s)'
+        parts += [train_part, f'sync: {duration(s.get("sync"))}']
+        for phase in ('save', 'eval'):
+            if s.get(phase):
+                parts.append(f'{phase}: {duration(s[phase])}')
+        parts += [f'answers: {responses}', f'resp len: {timing.get("generated_tokens", 0) / max(1, responses):.0f}',
+                  f'capped: {pct(capped / max(1, responses))}',
+                  f'gen: {rate(timing.get("generated_tokens_per_second", 0))} tok/s']
+        if peaks:
+            parts.append('peak KV: ' + ', '.join(f'{k} {pct(v)}' for k, v in peaks.items()))
+        self.say(' | '.join(parts))
+        self.say(' | '.join([' ' * len(head) + ' KL by domain (resp len, capped)'] + [
+            f'{d} {num(train.get(f"distill/{d}/kl"))} ({r.get("length_mean", 0):.0f}, {pct(r.get("cap_rate"))})'
+            for d, r in routes.items()]))
+
     def eval_label(self, rid):
         """An evaluation tagged rollout_id runs before that step's rollout (the baseline) or after the step."""
         return f'eval after step {rid + 1}' if rid in self.collected else f'eval before step {rid + 1}'
 
     def evaluation(self, e):
         domains = e.get('domains') or {}
+        if e.get('mode') == 'distill':
+            parts = [self.eval_label(e.get('rollout_id', 0)), f'KL: {num(e.get("kl"))}']
+            for d, v in domains.items():
+                teacher = (f' (teacher {v["teacher_length_mean"]:.0f}/{v["teacher_length_p99"]:.0f})'
+                           if 'teacher_length_mean' in v else '')
+                stop = f' (teacher {pct(v["teacher_stop_rate"])})' if 'teacher_stop_rate' in v else ''
+                parts.append(f'{d} KL {v["kl"]:.3f} len {v["length_mean"]:.0f}/{v["length_p99"]:.0f}{teacher} '
+                             f'stop {pct(v["stop_rate"])}{stop} clipped {100 * v["clipped"]:.1f}%')
+            self.say(' | '.join(parts))
+            return
         parts = [self.eval_label(e.get('rollout_id', 0)), f'score: {num(e.get("equal_domain_mean"))}']
         parts += [f'{d} {v.get("mean_score", 0):.3f}' for d, v in domains.items() if isinstance(v, dict)]
         if e.get('ungraded_prompts'):
@@ -315,6 +367,20 @@ def settings_line(config, command, env):
             return absent
         value = command[command.index(name) + 1] if command.index(name) + 1 < len(command) else ''
         return 'on' if not value or value.startswith('--') else value
+    if config.get('mode') == 'distill':
+        servers = sorted({t['server'] for t in config.get('teachers', {}).values()})
+        return ' | '.join([
+            'settings', f'distillation: {config.get("distill_root")}',
+            f'domains: {", ".join(config.get("domains", {}))}', f'teacher servers: {len(servers)}',
+            f'rollout: temperature {config.get("rollout_temperature")}, top-p {config.get("rollout_top_p")}, '
+            f'top-k {config.get("rollout_top_k")}',
+            f'R3 replay: {"on" if config.get("routing_replay") else "OFF"}',
+            f'advantage clip: {config.get("adv_clip")}', f'answers per prompt: {config.get("samples_per_prompt")}',
+            f'in flight: {config.get("response_concurrency")} responses, {config.get("reward_concurrency")} scoring',
+            f'SGLang per engine: {flag("--sglang-max-running-requests", "auto")} running, request cap '
+            f'{flag("--sglang-server-concurrency")}, memory {flag("--sglang-mem-fraction-static")}',
+            f'lr: {config.get("lr")} (warm-up {config.get("lr_warmup_steps")} steps)',
+            f'max tokens/GPU: {config.get("max_tokens_per_gpu")}'])
     urls = config.get('scorer_urls') or [config.get('scorer_url')]
     return ' | '.join([
         'settings', f'tasks: {config.get("tasks_file")}',

@@ -153,6 +153,64 @@ class DistillFolderTests(unittest.TestCase):
         self.assertEqual(broken.returncode, 1)
         self.assertIn('domain teacher_y: missing teacher/', broken.stderr)
 
+    def test_servers_split_memory_and_name_their_domains(self):
+        for i in range(2):
+            self.domain(f'teacher_{i}', 9000, {'prompts_per_step': 12})
+        plan = distill.servers(distill.load(self.root), [6, 7], 8100, memory=0.9, host='10.0.0.1')
+        by_gpu = {}
+        for p in plan:
+            by_gpu.setdefault(p['gpu'], []).append(p['memory'])
+        # SGLang sizes its cache from the memory left: the k-th of n servers on a GPU asks for k/n of the share.
+        self.assertEqual(by_gpu, {6: [0.9], 7: [0.3, 0.6, 0.9]})
+        self.assertEqual(plan[0]['url'], 'http://10.0.0.1:8100')
+        urls = distill.parse_urls(','.join(f'{p["name"]}={p["url"]}' for p in plan) + ',')
+        self.assertEqual(sorted(urls), sorted(p['name'] for p in plan))
+        shared = distill.parse_urls('a+b=http://127.0.0.1:8100/')
+        self.assertEqual(shared, {'a+b': {'url': 'http://127.0.0.1:8100', 'domains': ['a', 'b']}})
+        for bad in ('a=8100', 'a b=http://x:1', 'http://x:1'):
+            with self.assertRaisesRegex(ValueError, 'MIXRL_TEACHER_URLS'):
+                distill.parse_urls(bad)
+
+    def test_the_trainer_reads_the_folder_without_the_teachers(self):
+        # In the trainer container a teacher/ symlink may point outside the mounted folder.
+        teacher = self.root / 'domains' / 'teacher_x' / 'teacher'
+        shutil.rmtree(teacher)
+        os.symlink(self.root / 'elsewhere', teacher)
+        with self.assertRaisesRegex(ValueError, 'missing teacher/'):
+            distill.load(self.root)
+        spec = distill.load(self.root, check_teachers=False)
+        self.assertEqual(spec['domains']['teacher_x']['teacher'], self.root / 'elsewhere')
+        rows = distill.read_rows(spec['domains']['teacher_x']['eval'])
+        self.assertEqual((len(rows), rows[0]['id']), (32, 'teacher_x-eval-0'))
+        self.domain('bad+name', 10)
+        with self.assertRaisesRegex(ValueError, 'domain bad\\+name: use letters'):
+            distill.load(self.root)
+
+    def test_eval_summary_weighs_answers_equally_and_shows_the_teacher(self):
+        answers = {'teacher_x': [{'tokens': 2, 'stopped': True, 'gaps': [0.1, 0.3]},
+                                 {'tokens': 4, 'stopped': False, 'gaps': [0., 0., 0., 6.]}],
+                   'teacher_y': [{'tokens': 1, 'stopped': True, 'gaps': [-0.2]}]}
+        teacher = {'teacher_x': distill.answer_stats([{'tokens': 3, 'stopped': True}, {'tokens': 5, 'stopped': True}])}
+        summary = distill.eval_summary(answers, teacher, clip=5.)
+        x = summary['domains']['teacher_x']
+        self.assertAlmostEqual(x['kl'], (0.2 + 1.5) / 2)  # mean of each answer's mean, not of all tokens
+        self.assertAlmostEqual(x['clipped'], 1 / 6)
+        self.assertEqual((x['answers'], x['length_mean'], x['stop_rate']), (2, 3, 0.5))
+        self.assertAlmostEqual(x['length_p99'], 2 + 2 * 0.99)
+        self.assertEqual((x['teacher_length_mean'], x['teacher_stop_rate']), (4, 1.))
+        self.assertNotIn('teacher_answers', x)
+        self.assertNotIn('teacher_length_mean', summary['domains']['teacher_y'])
+        self.assertAlmostEqual(summary['kl'], (0.85 - 0.2) / 2)  # domains weigh equally
+
+    def test_plan_lines_for_the_teacher_script(self):
+        result = subprocess.run([sys.executable, '-m', 'slime_plugins.chimera_mixrl.distill', str(self.root), '--plan',
+                                 '--teacher-gpus', '3', '--teacher-port', '9000', '--teacher-memory', '0.8'],
+                                capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.split('\t') for line in result.stdout.splitlines()]
+        self.assertEqual([line[:4] for line in lines], [['9000', '3', '0.4', 'teacher_y'], ['9001', '3', '0.8', 'teacher_x']])
+        self.assertEqual(lines[1][4:], [str(self.root / 'domains' / 'teacher_x' / 'teacher'), 'http://127.0.0.1:9001'])
+
 
 if __name__ == '__main__':
     unittest.main()

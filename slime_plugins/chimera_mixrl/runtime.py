@@ -15,6 +15,7 @@ import time
 from .core import PriorityGate, RouteSampler, collect, digest, group_rewards, length_penalties, load_split, write_json
 from .routes import THINK_TAG, evaluation_summary, validate_route
 from .tasks import blocked
+from . import distill
 from .objective import group_length_scales
 from .records import load_sample, save_sample
 
@@ -123,14 +124,33 @@ def persist_pool():
     return _persist_pool
 
 
+def distill_rows(c):
+    """Distillation prompts as MixRL rows: the domain is the task, ids are prefixed with it (ids are unique only
+    within a domain), and every prompt is its own family. Returns (training rows, eval rows)."""
+    out = []
+    for split in ('prompts', 'eval'):
+        rows = []
+        for domain, d in c['domains'].items():
+            for row in distill.read_rows(d[split]):
+                key = f'{domain}:{row["id"]}'
+                rows.append({**row, 'id': key, 'family_id': key, 'task': domain, 'domain': domain, 'binary': False})
+        out.append(rows)
+    return tuple(out)
+
+
 class DataSource:
     def __init__(self, args):
         from slime.utils.processing_utils import load_tokenizer
         self.args = args
         self.c = config()
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-        rows, self.manifest = load_split(self.c['data_dir'], 'rl_train')
-        val, _ = load_split(self.c['data_dir'], 'rl_val')
+        self.distilling = self.c.get('mode') == 'distill'
+        if self.distilling:
+            rows, val = distill_rows(self.c)
+            self.manifest = {name: [d['prompts_hash'], d['eval_hash']] for name, d in self.c['domains'].items()}
+        else:
+            rows, self.manifest = load_split(self.c['data_dir'], 'rl_train')
+            val, _ = load_split(self.c['data_dir'], 'rl_val')
         if {r['family_id'] for r in rows} & {r['family_id'] for r in val}:
             raise ValueError('Train/validation family overlap')
         self.prompts = {}
@@ -143,8 +163,9 @@ class DataSource:
                 reason = self.c.get('code_exclusion_reasons', {}).get(row['id'], 'scorer_metadata_quarantine')
                 self.excluded.append({'id': row['id'], 'task': row['task'], 'reason': reason})
                 return False
-            validate_route(row, self.c['routes'])
-            cap = self.c['caps'][row['task']]
+            if not self.distilling:  # distillation prompts were checked with their folder
+                validate_route(row, self.c['routes'])
+            cap = self.cap(row)
             prompt = self.tokenizer.apply_chat_template(
                 row['messages'], tokenize=False, add_generation_prompt=True,
                 **self.c.get('chat_template_kwargs', {}))
@@ -185,6 +206,10 @@ class DataSource:
     def __len__(self):
         return sum(map(len, self.sampler.pools.values()))
 
+    def cap(self, row):
+        """The answer cap: the task's, or in distillation a prompt's own max_response_tokens over its domain's."""
+        return row.get('max_response_tokens', self.c['caps'][row['task']]) if self.distilling else self.c['caps'][row['task']]
+
     def get_samples(self, num_samples):
         raise RuntimeError('MixRL uses route-aware proposals, not the default datasource iterator')
 
@@ -218,7 +243,7 @@ class DataSource:
                        metadata={'mixrl': {'row_id': row['id'], 'row_hash': digest(row),
                                            'task': row['task'], 'binary': row['binary'], 'split': split, 'sample': i,
                                            'policy_version': rollout_id, 'group_id': group_id,
-                                           'cap': self.c['caps'][row['task']],
+                                           'cap': self.cap(row),
                                            'identity': self.identity}})
                 for i in range(count)]
 
@@ -284,6 +309,60 @@ async def reward(args, sample, **kwargs):
     return float(score)
 
 
+def prefill_logprobs(url, tokens, response_length, timeout):
+    """Full-vocabulary log-probs at temperature 1 of the last response_length tokens, from one SGLang prefill
+    of prompt + answer (no generation). SGLang applies no temperature or top-p to these input log-probs."""
+    start = len(tokens) - response_length
+    payload = {'input_ids': [int(t) for t in tokens], 'return_logprob': True,
+               # One position before the answer: the first returned entry (the last prompt token) is dropped.
+               'logprob_start_len': max(0, start - 1),
+               'sampling_params': {'temperature': 1.0, 'max_new_tokens': 0}}
+    entries = request(url + '/generate', payload, timeout)['meta_info']['input_token_logprobs'][-response_length:]
+    if len(entries) != response_length or [int(e[1]) for e in entries] != [int(t) for t in tokens[start:]]:
+        raise RuntimeError(f'{url} returned log-probs that do not line up with the answer tokens')
+    values = [e[0] for e in entries]
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        raise RuntimeError(f'{url} returned missing or nonfinite log-probs')
+    return [float(v) for v in values]
+
+
+async def prefill(c, url, sample, what):
+    """prefill_logprobs with the reward service's retry rules: network errors and 5xx retry with backoff, any
+    other error stops the step (the teachers are our own servers: a failure is a fault to fix, not noise)."""
+    error = None
+    for attempt in range(c['reward_attempts']):
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                scoring_pool(c.get('reward_concurrency', 8)), prefill_logprobs, url, sample.tokens,
+                sample.response_length, c['reward_timeout'])
+        except ServiceHTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            error = exc
+        except (OSError, TimeoutError) as exc:
+            error = exc
+        print(f'MIXRL_TEACHER_RETRY {what} attempt {attempt + 1}/{c["reward_attempts"]}: {type(error).__name__}: {error}',
+              flush=True)
+        if attempt + 1 < c['reward_attempts']:
+            await asyncio.sleep(min(2 ** attempt, int(os.environ.get('MIXRL_REWARD_BACKOFF_MAX', '8'))))
+    raise RuntimeError(f'{what} at {url} failed {c["reward_attempts"]} times: {type(error).__name__}: {error}')
+
+
+async def teacher_score(args, sample, evaluation=False):
+    """Distillation's grading: the domain's teacher scores every answer token (sample.teacher_log_probs, the q of
+    mixrl/mopd/README.md). For evaluation the student's own engines score the answer the same way, so eval KL
+    compares two full-vocabulary log-probs from one kind of engine. The reward itself is a 0 placeholder."""
+    c = config()
+    teacher = c['teachers'][sample.metadata['mixrl']['task']]
+    sample.metadata['reward_started_at'] = time.time()
+    sample.teacher_log_probs = await prefill(c, teacher['url'], sample, f'teacher {teacher["server"]}')
+    if evaluation:
+        router = f'http://{args.sglang_router_ip}:{args.sglang_router_port}'
+        sample.metadata['student_log_probs'] = await prefill(c, router, sample, 'student')
+    sample.metadata['reward_finished_at'] = time.time()
+    return 0.
+
+
 def unfinished(sample):
     """No finished answer: cut off at the cap, or reasoning tags that never reached an answer.
     Both follow the truncation policy: 'zero' (default) scores them 0 in their group like any
@@ -293,9 +372,24 @@ def unfinished(sample):
     return sample.status == Sample.Status.TRUNCATED or grade.get('components', {}).get('incomplete') is True
 
 
+def distill_rewards(args, samples, c):
+    """Distillation: no rewards to normalize; the per-token advantage is computed in the loss from the teacher's
+    log-probs. Each sample's advantage slot carries its domain's index instead (grpo broadcasts it over the
+    answer's tokens), so objective.distill_loss can report KL per domain; the loss never multiplies by it."""
+    if len(samples) != args.n_samples_per_prompt * args.rollout_batch_size:
+        raise ValueError('Incomplete accepted batch')
+    index = {name: i for i, name in enumerate(c['domains'])}
+    for sample in samples:
+        if sample.teacher_log_probs is None or len(sample.teacher_log_probs) != sample.response_length:
+            raise ValueError('Every distilled answer needs one teacher log-prob per answer token')
+    return [0.] * len(samples), [float(index[s.metadata['mixrl']['task']]) for s in samples]
+
+
 def post_process_rewards(args, samples):
     from slime.utils.types import Sample
     c = config()
+    if c.get('mode') == 'distill':
+        return distill_rewards(args, samples, c)
     raw, normalized = [], []
     n = args.n_samples_per_prompt
     if len(samples) != n * args.rollout_batch_size:
@@ -502,6 +596,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             or top_k != c.get('rollout_top_k', -1) or (top_k > 0 and args.rollout_top_p == 1)):
         raise ValueError('Rollout sampling differs from the resolved MixRL config (top-k needs top-p < 1 for replay)')
     replay_top_p = args.rollout_top_p < 1 and not evaluation
+    distilling = c.get('mode') == 'distill'
     state = GenerateState(args)
     snapshot = source.sampler.snapshot()
     phase = 'eval' if evaluation else 'train'
@@ -523,7 +618,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     # training before generation, never turn judge-graded answers into zeros.
     # A judge or reward service that is restarting gets MIXRL_HEALTH_WAIT_SECONDS to return.
     deadline = time.monotonic() + float(os.environ.get('MIXRL_HEALTH_WAIT_SECONDS', '0'))
-    urls = c.get('scorer_urls') or [c['scorer_url']]
+    urls = [] if distilling else c.get('scorer_urls') or [c['scorer_url']]
+    servers = {t['url']: t['server'] for t in c['teachers'].values()} if distilling else {}
     while True:
         reasons, protocols = {}, set()
         for url in urls:
@@ -534,14 +630,22 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                                 for task, reason in blocked(c['routes'], health).items()})
             except (OSError, ServiceHTTPError, ValueError, KeyError) as exc:
                 reasons[f'reward service {url}'] = f'{type(exc).__name__}: {exc}'
+        for url, name in servers.items():
+            # The teacher on this port must still be the one the run started with.
+            try:
+                served = [m.get('id') for m in (await asyncio.to_thread(request, url + '/v1/models')).get('data') or []]
+                if served != [name]:
+                    reasons[f'teacher {name}'] = f'{url} now serves {served}'
+            except (OSError, ServiceHTTPError, ValueError, KeyError) as exc:
+                reasons[f'teacher {name}'] = f'{type(exc).__name__}: {exc}'
         if not reasons or time.monotonic() >= deadline:
             break
         print('MIXRL_HEALTH_WAIT ' + json.dumps(reasons), flush=True)
         await asyncio.sleep(30)
     if reasons:
-        raise RuntimeError('Reward service cannot grade enabled tasks: '
+        raise RuntimeError(('Teachers cannot score: ' if distilling else 'Reward service cannot grade enabled tasks: ')
                            + '; '.join(f'{task}: {reason}' for task, reason in reasons.items()))
-    if protocols != {c['scorer_protocol']}:
+    if not distilling and protocols != {c['scorer_protocol']}:
         raise RuntimeError('Scorer protocol mismatch before rollout')
     # Earlier-proposed groups are generated and graded first (lower priority value), so groups
     # finish one after another and keep-or-refill decisions arrive throughout the step.
@@ -552,6 +656,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
     priority = lambda sample: sample.metadata.get('mixrl_priority', 0)
     # Where every response is right now, for the MIXRL_PIPELINE line.
     flow = {'gen_queued': 0, 'generating': 0, 'grade_queued': 0, 'grading': 0, 'done': 0, 'gen_tokens': 0}
+    if distilling:
+        flow['mode'] = 'distill'  # 'grading' is teacher scoring
 
     async def score(sample):
         # Slime retains the stop marker in decoded response text for token/logprob
@@ -573,6 +679,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         async with gate.slot(priority(sample), waiting=(flow, 'grade_queued')):
             flow['grading'] += 1
             try:
+                if distilling:
+                    return await teacher_score(args, sample, evaluation)
                 return await reward(args, sample)
             finally:
                 flow['grading'] -= 1
@@ -683,6 +791,20 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             for i, group in enumerate(groups):
                 for sample in group:
                     sample.metadata['mixrl_priority'] = i
+            if distilling:
+                # The teachers' own answers to the same prompts, once per run (lengths and stop rate to compare).
+                reference = teacher_reference(args, c, source, panel)
+                completed, reference = await asyncio.wait_for(asyncio.gather(
+                    gather_cancel(evaluate_group(g) for g in groups), reference), c['collection_timeout'])
+                summary = distill_evaluation(c, panel, completed, reference)
+                write_json(directory / 'evaluation.json', summary)
+                print('MIXRL_EVAL ' + json.dumps({'rollout_id': rollout_id, **summary}), flush=True)
+                data['kl'] = {'rewards': [summary['kl']]}
+                for domain, metrics in summary['domains'].items():
+                    for key, value in metrics.items():
+                        data[f'domain/{domain}/{key}'] = {'rewards': [value]}
+                write_json(eval_counter_path, counter + 1)
+                return RolloutFnEvalOutput(data=data)
             completed = await asyncio.wait_for(
                 gather_cancel(evaluate_group(g) for g in groups), c['collection_timeout'])
             for row, group in zip(panel, completed):
@@ -718,6 +840,9 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         def assess(group):
             validate_group(group, args.n_samples_per_prompt)
             capped = [unfinished(s) for s in group]
+            if distilling:
+                # Every answer trains: the teacher scores each token, capped answers included.
+                return True, [0.] * len(group), capped, False, [False] * len(group)
             skip = masked(group)
             if len(group) - sum(skip) < 2:
                 return False, [0.] * len(group), capped, True, skip
@@ -733,9 +858,11 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             with (directory / 'collection.jsonl').open('a') as stream:
                 stream.write(json.dumps({'route': route, 'group': group[0].group_index,
                                          'row': group[0].metadata['mixrl']['row_id'], 'decision': decision}) + '\n')
-        spares = {r: math.ceil(q * c.get('oversample', 0)) for r, q in c['quotas'].items()}
+        # Distillation keeps every prompt it draws: no refills, no spares.
+        spares = {r: 0 if distilling else math.ceil(q * c.get('oversample', 0)) for r, q in c['quotas'].items()}
         groups, metrics = await collect(c['quotas'], propose, execute, assess,
-                                        inflight=c['inflight_groups'], refill_rounds=c.get('refill_rounds', 0),
+                                        inflight=c['inflight_groups'],
+                                        refill_rounds=0 if distilling else c.get('refill_rounds', 0),
                                         timeout=c['collection_timeout'], event=event, spares=spares)
         if any(m.get('cancelled') for m in metrics.values()):
             # Cancelled spares and surplus refills can still be generating in SGLang (with distributed post their
@@ -744,7 +871,7 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             await asyncio.wait_for(stop_generation(args), 120)
         # Length penalties and loss masks are fixed here, before conversion and logging,
         # so reward normalization reads exactly what the logs report.
-        for group in groups:
+        for group in [] if distilling else groups:
             usable, scores = assess(group)[:2]
             skip = masked(group)
             deltas = [0.] * len(group)
@@ -761,13 +888,21 @@ async def _rollout(args, rollout_id, source, evaluation=False):
                     sample.loss_mask = [0] * sample.response_length
         for route in metrics:
             position = source.sampler.position(route)
+            if distilling:
+                # Rewards, groups and refills mean nothing here: keep the answer counts and lengths.
+                metrics[route] = {k: metrics[route][k] for k in ('accepted', 'responses', 'capped', 'cap_rate',
+                                                                 'collection_seconds')}
             metrics[route].update(position)
             batch = [s for g in groups for s in g if s.metadata['mixrl']['task'] == route]
+            if distilling:
+                lengths = [s.response_length for s in batch]
+                metrics[route].update(length_mean=sum(lengths) / len(lengths), length_p99=distill.percentile(lengths, 99))
             texts = [s.metadata['grading_text'] for s in batch]
             metrics[route]['think_rate'] = sum(THINK_TAG in t for t in texts) / max(1, len(texts))
-            penalized = [s.metadata['length_penalty'] for s in batch if s.metadata['length_penalty'] < 0]
-            metrics[route]['length_penalized'] = len(penalized)
-            metrics[route]['length_penalty_mean'] = sum(penalized) / len(penalized) if penalized else 0.
+            if not distilling:
+                penalized = [s.metadata['length_penalty'] for s in batch if s.metadata['length_penalty'] < 0]
+                metrics[route]['length_penalized'] = len(penalized)
+                metrics[route]['length_penalty_mean'] = sum(penalized) / len(penalized) if penalized else 0.
             if replay_top_p:
                 # Mean top-p candidate-set size per generated token (MiMo reports < 5 at top-p 0.97).
                 metrics[route]['top_p_set_mean'] = (sum(int(s.rollout_top_p_token_offsets[-1]) for s in batch)
@@ -782,7 +917,8 @@ async def _rollout(args, rollout_id, source, evaluation=False):
             max(m['collection_seconds'] for m in metrics.values()), sum(m['accepted'] for m in metrics.values()))
         write_json(directory / 'timing.json', timing)
         print('MIXRL_TIMING ' + json.dumps({'rollout_id': rollout_id, **timing}), flush=True)
-        print('MIXRL_COLLECTION ' + json.dumps({'rollout_id': rollout_id, 'routes': metrics}), flush=True)
+        print('MIXRL_COLLECTION ' + json.dumps({'rollout_id': rollout_id, 'routes': metrics,
+                                                **({'mode': 'distill'} if distilling else {})}), flush=True)
         flattened = {f'mixrl/{route}/{k}': v for route, m in metrics.items() for k, v in m.items()}
         flattened['mixrl/skip_optimizer'] = int(not any(m['accepted'] for m in metrics.values()))
         flattened['mixrl/informative_groups'] = sum(m['accepted'] for m in metrics.values())
@@ -802,6 +938,53 @@ async def _rollout(args, rollout_id, source, evaluation=False):
         if heartbeat is not None:
             heartbeat.cancel()
         state.reset()
+
+
+def distill_evaluation(c, panel, completed, reference):
+    """One distillation evaluation from scored eval answers (student and teacher log-probs per token)."""
+    from slime.utils.types import Sample
+    answers = {}
+    for row, group in zip(panel, completed):
+        for s in group:
+            gaps = [p - q for p, q in zip(s.metadata['student_log_probs'], s.teacher_log_probs)]
+            answers.setdefault(row['task'], []).append(
+                {'tokens': s.response_length, 'stopped': s.status == Sample.Status.COMPLETED, 'gaps': gaps})
+    return distill.eval_summary(answers, reference, c['adv_clip'])
+
+
+async def teacher_reference(args, c, source, panel):
+    """Each domain's teacher answers the eval prompts once, sampled like the student (temperature 1, the run's
+    top-p and top-k, the same caps and stop marker): its answer length and stop rate sit next to the student's
+    in every evaluation. Kept in rollouts/teacher-eval.json and reused for the rest of the run and on resume."""
+    path = source.run_dir / 'rollouts' / 'teacher-eval.json'
+    panel_id = digest([[r['id'], source.cap(r)] for r in panel] + [{d: t['server'] for d, t in c['teachers'].items()}])
+    if path.exists():
+        saved = json.loads(path.read_text())
+        if saved.get('panel') == panel_id:
+            return saved['domains']
+    params = {'temperature': 1.0, 'top_p': args.rollout_top_p, 'top_k': getattr(args, 'rollout_top_k', -1),
+              'stop': getattr(args, 'rollout_stop', None), 'stop_token_ids': getattr(args, 'rollout_stop_token_ids', None),
+              'no_stop_trim': True}
+
+    def answer(row):
+        payload = {'input_ids': source.prompts[row['id']][1],
+                   'sampling_params': {**params, 'max_new_tokens': source.cap(row),
+                                       'sampling_seed': (c['seed'] + int(digest(['teacher-eval', row['id']])[:8], 16)) % (2**31)}}
+        meta = request(c['teachers'][row['task']]['url'] + '/generate', payload, c['reward_timeout'])['meta_info']
+        reason = meta.get('finish_reason') or {}
+        return row['task'], {'tokens': meta['completion_tokens'],
+                             'stopped': (reason.get('type') if isinstance(reason, dict) else reason) == 'stop'}
+
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(*(loop.run_in_executor(scoring_pool(c.get('reward_concurrency', 8)), answer, row)
+                                     for row in panel))
+    domains = {}
+    for domain, item in results:
+        domains.setdefault(domain, []).append(item)
+    stats = {domain: distill.answer_stats(items) for domain, items in domains.items()}
+    write_json(path, {'panel': panel_id, 'domains': stats})
+    print('MIXRL_TEACHER_EVAL ' + json.dumps({'domains': stats}), flush=True)
+    return stats
 
 
 def generate_rollout(args, rollout_id, data_source, evaluation=False):

@@ -117,6 +117,45 @@ class ConsoleTests(unittest.TestCase):
             'ERROR error: TRAIN_GPUS lists 1 GPUs | train.log line 109',
             "Job 'raysubmit_x' failed"])
 
+    def test_distillation_step_eval_and_settings_lines(self):
+        c, out, _, clock = make()
+        c.feed(pipeline(15, mode='distill', grade_queued=3) + '\n')
+        self.assertIn('scoring: 5 | waiting to score: 3', lines(out)[0])
+        c.feed('MIXRL_TIMING ' + json.dumps({'rollout_id': 0, 'generated_tokens': 2400, 'generated_tokens_per_second': 800}) + '\n')
+        c.feed('MIXRL_COLLECTION ' + json.dumps({'rollout_id': 0, 'mode': 'distill', 'routes': {
+            'teacher_x': {'accepted': 2, 'responses': 2, 'capped': 0, 'cap_rate': 0., 'length_mean': 900.},
+            'teacher_y': {'accepted': 1, 'responses': 1, 'capped': 1, 'cap_rate': 1., 'length_mean': 600.}}}) + '\n')
+        c.feed('MIXRL_TRAIN ' + json.dumps({'rollout_id': 0, 'step_id': 0, 'loss': 0.01, 'grad_norm': 0.2, 'entropy': 0.5,
+                                            'lr-pg_0': 1e-7, 'distill_kl': 0.214, 'distill_clipped': 0.003,
+                                            'distill/teacher_x/kl': 0.18, 'distill/teacher_y/kl': 0.262,
+                                            'importance_masked_fraction': 0.}) + '\n')
+        c.feed('MIXRL_STEP ' + json.dumps({'rollout_id': 0, 'num_rollout': 100, 'seconds': 370.0, 'rollout': 200.0,
+                                           'train': 150.0, 'sync': 20.0}) + '\n')
+        head, detail, domains = lines(out)[1:4]
+        for part in ('step   1/100', 'KL: 0.214', 'clipped: 0.3%', 'lr: 1.00E-07', 'IS masked: 0%'):
+            self.assertIn(part, head)
+        self.assertNotIn('reward', head)
+        for part in ('answers: 3', 'resp len: 800', 'capped: 33%', 'gen: 800 tok/s'):
+            self.assertIn(part, detail)
+        self.assertTrue(domains.endswith('KL by domain (resp len, capped) | teacher_x 0.180 (900, 0%) | teacher_y 0.262 (600, 100%)'))
+        c.feed('MIXRL_TEACHER_EVAL ' + json.dumps({'domains': {'teacher_x': {'length_mean': 790, 'length_p99': 1580,
+                                                                             'stop_rate': 1.}}}) + '\n')
+        self.assertEqual(lines(out)[-1], 'teachers answered the eval prompts (once per run) | teacher_x len 790/1580 stop 100%')
+        c.feed('MIXRL_EVAL ' + json.dumps({'rollout_id': 0, 'mode': 'distill', 'kl': 0.17, 'domains': {'teacher_x': {
+            'kl': 0.15, 'length_mean': 812, 'length_p99': 1650, 'stop_rate': 0.99, 'clipped': 0.002,
+            'teacher_length_mean': 790, 'teacher_length_p99': 1580, 'teacher_stop_rate': 1.}}}) + '\n')
+        self.assertEqual(lines(out)[-1], 'eval after step 1 | KL: 0.170 | teacher_x KL 0.150 len 812/1650 (teacher 790/1580) '
+                                         'stop 99% (teacher 100%) clipped 0.2%')
+        c.feed('MIXRL_TEACHER_RETRY teacher teacher_x attempt 1/12: URLError: refused\n')
+        self.assertEqual(lines(out)[-1], 'WARNING teacher request failed, retrying: teacher teacher_x attempt 1/12: URLError: refused')
+        settings = console.settings_line({'mode': 'distill', 'distill_root': '/data/distill', 'domains': {'teacher_x': {}},
+                                          'teachers': {'teacher_x': {'server': 'teacher_x'}}, 'adv_clip': 5.,
+                                          'lr': 1e-6, 'lr_warmup_steps': 10, 'rollout_temperature': 1.},
+                                         ['--sglang-mem-fraction-static', '0.8'], {})
+        for part in ('distillation: /data/distill', 'domains: teacher_x', 'teacher servers: 1', 'advantage clip: 5.0',
+                     'lr: 1e-06 (warm-up 10 steps)', 'memory 0.8'):
+            self.assertIn(part, settings)
+
     def test_a_response_the_judge_cannot_judge_is_named_as_such(self):
         c, out, _, _ = make()
         record = {'task': 'cascade_chat', 'row': 'r1', 'ungradable': True,

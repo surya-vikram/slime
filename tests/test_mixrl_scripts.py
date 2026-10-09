@@ -27,6 +27,7 @@ if [[ "$(basename "$0")" == docker ]]; then
     # `docker ps --format {{.Names}}` lists the running reward-service containers; other `ps` calls only test for
     # a match. STUB_NO_CONTAINERS=1: every started container has already died.
     if [[ "$1" == ps && -n "${STUB_NO_CONTAINERS:-}" ]]; then :
+    elif [[ "$1" == ps && " $* " == *"{{.Names}}"* && " $* " == *mixrl-teacher* ]]; then printf '%s\n' ${STUB_TEACHERS:-}
     elif [[ "$1" == ps && " $* " == *"{{.Names}}"* ]]; then echo mixrl-reward-service
     elif [[ "$1" == ps ]]; then echo running; fi
     if [[ "$1" == inspect ]]; then echo "${STUB_RESTARTS:-0}"; fi
@@ -54,6 +55,21 @@ class Services(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def teacher_server(name):
+    """A stand-in SGLang teacher server announcing `name`; returns (server, port)."""
+    class Teacher(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == '/v1/models' else 404)
+            self.end_headers()
+            self.wfile.write(json.dumps({'data': [{'id': name}]}).encode())
+
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Teacher)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_port
 
 
 class ScriptTests(unittest.TestCase):
@@ -339,6 +355,95 @@ class ScriptTests(unittest.TestCase):
         commands = [c[:2] for c in self.calls('docker')]
         self.assertIn(['logs', '--tail'], commands)
         self.assertEqual(commands[-1], ['rm', '-f'])
+
+    def distill_folder(self):
+        """base/distill with two domains sharing one teacher folder: one teacher server, 'teacher_x+teacher_y'."""
+        from tests.test_chimera_mixrl_distill import checkpoint, prompts
+        root = self.base / 'distill'
+        checkpoint(root / 'student' / 'hf')
+        (root / 'student' / 'mcore').mkdir(parents=True)
+        (root / 'student' / 'mcore' / 'latest_checkpointed_iteration.txt').write_text('1')
+        for name in ('teacher_x', 'teacher_y'):
+            domain = root / 'domains' / name
+            domain.mkdir(parents=True)
+            prompts(domain / 'prompts.jsonl', 900, f'{name}-train')
+            prompts(domain / 'eval.jsonl', 16, f'{name}-eval')
+            (domain / 'domain.json').write_text(json.dumps({'prompts_per_step': 264}))
+        checkpoint(root / 'domains' / 'teacher_x' / 'teacher')
+        (root / 'domains' / 'teacher_y' / 'teacher').symlink_to(root / 'domains' / 'teacher_x' / 'teacher')
+        return root
+
+    def test_distill_reuses_running_teachers_and_trains_on_the_student_gpus(self):
+        root = self.distill_folder()
+        server, port = teacher_server('teacher_x+teacher_y')
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env = dict(TEACHER_PORT=str(port), DISTILL_TRAIN_GPUS='0,1,2', TEACHER_GPUS='3', NUM_ROLLOUT='10')
+        result = self.run_script('run.sh', 'distill', 'd1', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in ('domains: 2 of 2 domains enabled; 528 prompts per step', 'teachers: Teachers ready (0 started)',
+                     'preflight: ok', 'training: distill run d1 on GPUs 0,1,2'):
+            self.assertIn(line, result.stdout)
+        self.assertNotIn('judge:', result.stdout)  # no judge or reward service while distilling
+        preflight, call = [c for c in self.calls('docker') if c[0] == 'run']
+        for run in (preflight, call):
+            self.assertIn(f'{root}:/data/distill:ro', run)
+            self.assertFalse(any('/data/models/' in arg or '/data/datasets/' in arg for arg in run))
+        self.assertIn('DRY_RUN=1', preflight)
+        self.assertIn('"device=0,1,2"', call)
+        settings = self.env_file()
+        self.assertEqual((settings['MIXRL_MODE'], settings['POLICY_GPUS'], settings['TRAIN_GPUS'],
+                          settings['MIXRL_DISTILL_DIR'], settings['MIXRL_TEACHER_URLS'], settings['RESUME']),
+                         ('distill', '3', '0,1,2', '/data/distill', f'teacher_x+teacher_y=http://127.0.0.1:{port}', '0'))
+        run_dir = self.base / 'runs/chimera/distill/d1'
+        self.assertIn('teacher_x+teacher_y', (run_dir / 'logs/domains.txt').read_text())
+        # resume finds the run under runs/chimera/distill and resumes it as a distillation run, without a preflight.
+        (run_dir / 'checkpoints').mkdir(parents=True)
+        (run_dir / 'checkpoints/latest_checkpointed_iteration.txt').write_text('5')
+        before = len([c for c in self.calls('docker') if c[0] == 'run'])
+        result = self.run_script('run.sh', 'resume', 'd1', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.env_file()['MIXRL_MODE'], self.env_file()['RESUME']), ('distill', '1'))
+        self.assertEqual(len([c for c in self.calls('docker') if c[0] == 'run']), before + 1)
+        # A teacher GPU that is also a student GPU, or a folder problem, stops before any container.
+        result = self.run_script('run.sh', 'distill', 'd2', **dict(env, TEACHER_GPUS='2'))
+        self.assertIn('GPU 2 is in both DISTILL_TRAIN_GPUS and TEACHER_GPUS', result.stderr)
+        result = self.run_script('run.sh', 'distill', 'd2', **dict(env, DISTILL_TRAIN_GPUS='0,1,2,4,5'))
+        self.assertIn('528 answers do not divide by the 5 student GPUs', result.stderr)
+        self.assertEqual(len([c for c in self.calls('docker') if c[0] == 'run']), before + 1)
+
+    def test_teachers_script_starts_servers_reports_crashes_and_wrong_servers(self):
+        root = self.distill_folder()
+        port = free_port()
+        env = dict(TEACHER_PORT=str(port), TEACHER_GPUS='3', TEACHER_START_SECONDS='5')
+        # Nothing on the port: a container is started, dies at once, and its log is shown.
+        result = self.run_script('teachers.sh', **env, STUB_NO_CONTAINERS='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('teacher teacher_x+teacher_y exited during startup', result.stderr)
+        run = next(c for c in self.calls('docker') if c[0] == 'run')
+        teacher = str(root / 'domains' / 'teacher_x' / 'teacher')
+        self.assertEqual(run[run.index('--gpus') + 1], '"device=3"')
+        self.assertIn(f'{teacher}:{teacher}:ro', run)
+        launch = run[run.index('sglang.launch_server') + 1:]
+        for flag, value in (('--model-path', teacher), ('--served-model-name', 'teacher_x+teacher_y'),
+                            ('--port', str(port)), ('--mem-fraction-static', '0.85'), ('--model-impl', 'transformers'),
+                            ('--context-length', '16384')):
+            self.assertEqual(launch[launch.index(flag) + 1], value)
+        for flag in ('--enable-fp32-lm-head', '--disable-cuda-graph', '--skip-server-warmup'):
+            self.assertIn(flag, launch)
+        self.assertIn('CHIMERA_MATCH_RMSNORM=1', run)
+        self.assertEqual([c[:2] for c in self.calls('docker')][-1], ['rm', '-f'])
+        # The port answers with another model: refused, nothing started.
+        server, port = teacher_server('some-other-model')
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        result = self.run_script('teachers.sh', 'start', str(root), **dict(env, TEACHER_PORT=str(port)))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"port {port} serves 'some-other-model', not teacher teacher_x+teacher_y", result.stderr)
+        result = self.run_script('teachers.sh', 'status', **dict(env, TEACHER_PORT=str(port)))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('WRONG', result.stdout)
+        self.assertEqual(self.run_script('teachers.sh', 'stop').returncode, 0)
 
 
 if __name__ == '__main__':

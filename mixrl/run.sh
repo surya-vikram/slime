@@ -4,10 +4,14 @@
 #   mixrl/run.sh start [RUN_NAME]      everything for a new run: start the judge and reward service if they
 #                                      are not up, check the tasks, preflight, train (name: mixrl-<date>-<time>)
 #   mixrl/run.sh resume RUN_NAME       the same without the preflight, from the run's latest checkpoint
+#                                      (MixRL and distillation runs alike)
 #   mixrl/run.sh preflight [RUN_NAME]  checks only: tasks, data, reward service, judge and model; no GPUs
 #   mixrl/run.sh tasks                 preview the task table (no Docker, no GPUs)
 #   mixrl/run.sh domains [ROOT]        preview a distillation folder (default DISTILL_ROOT): domains, batch,
 #                                      teacher placement, passes; checks every input (no Docker, no GPUs)
+#   mixrl/run.sh distill [RUN_NAME]    distil DISTILL_ROOT's teachers into its student (mixrl/mopd/README.md):
+#                                      start the teacher servers if they are not up, preflight, train
+#                                      (name: distill-<date>-<time>)
 #
 # Any config.env value can be overridden for one command: LR=2e-6 mixrl/run.sh start my-run
 # Running services are reused; mixrl/judge.sh or mixrl/reward.sh restarts one with new settings.
@@ -18,7 +22,7 @@ REPO_ROOT=$(dirname "$MIXRL_DIR")
 source "$MIXRL_DIR/config.env"
 
 usage() {
-    sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 fail() { echo "error: $*" >&2; exit 1; }
@@ -26,6 +30,7 @@ note() { echo "[$(date '+%F %T')] $*"; }
 
 command=${1:-}
 [[ $# -gt 0 ]] && shift
+MODE=mixrl
 case "$command" in
     tasks)
         [[ $# -eq 0 ]] || usage
@@ -47,32 +52,57 @@ case "$command" in
         RUN_NAME=${1:-mixrl-$(date +%Y%m%d-%H%M%S)}
         RESUME=0
         ;;
+    distill)
+        [[ $# -le 1 ]] || usage
+        RUN_NAME=${1:-distill-$(date +%Y%m%d-%H%M%S)}
+        RESUME=0
+        MODE=distill
+        ;;
     resume)
         [[ $# -eq 1 ]] || usage
         RUN_NAME=$1
         RESUME=1
+        # A distillation run lives under runs/chimera/distill, a MixRL run under runs/chimera/mixrl.
+        if [[ -d "$BASE_DIR/runs/chimera/distill/$RUN_NAME" ]]; then
+            [[ ! -d "$BASE_DIR/runs/chimera/mixrl/$RUN_NAME" ]] \
+                || fail "both runs/chimera/mixrl/$RUN_NAME and runs/chimera/distill/$RUN_NAME exist; rename one"
+            MODE=distill
+        fi
         ;;
     *) usage ;;
 esac
 
 # Host-side checks with plain messages, before any container starts.
 [[ "$RUN_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fail "run name '$RUN_NAME': use letters, digits, . _ - only"
+if [[ "$MODE" == distill ]]; then
+    # The student trains and generates on DISTILL_TRAIN_GPUS; the teachers have TEACHER_GPUS.
+    TRAIN_GPUS=$DISTILL_TRAIN_GPUS
+    POLICY_GPUS=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
+    for gpu in ${DISTILL_TRAIN_GPUS//,/ }; do
+        [[ ",$TEACHER_GPUS," != *",$gpu,"* ]] || fail "GPU $gpu is in both DISTILL_TRAIN_GPUS and TEACHER_GPUS"
+    done
+    domains_text=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$DISTILL_ROOT" \
+        --steps "$NUM_ROLLOUT" --samples-per-prompt "$DISTILL_SAMPLES_PER_PROMPT" --policy-gpus "$POLICY_GPUS" \
+        --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" 2>&1) || { echo "$domains_text" >&2; fail "$DISTILL_ROOT is not ready"; }
+    required=("$DISTILL_ROOT/student/hf/config.json" "$DISTILL_ROOT/student/mcore/latest_checkpointed_iteration.txt")
+else
+    required=("$BASE_DIR/models/$MODEL_NAME/hf/config.json" "$BASE_DIR/models/$MODEL_NAME/mcore/latest_checkpointed_iteration.txt"
+              "$BASE_DIR/datasets/$DATASET_NAME/manifest.json")
+fi
 IFS=, read -ra gpu_ids <<< "$TRAIN_GPUS"
 [[ ${#gpu_ids[@]} -eq $POLICY_GPUS ]] || fail "TRAIN_GPUS=$TRAIN_GPUS lists ${#gpu_ids[@]} GPUs but POLICY_GPUS=$POLICY_GPUS"
-for path in "$BASE_DIR/models/$MODEL_NAME/hf/config.json" \
-            "$BASE_DIR/models/$MODEL_NAME/mcore/latest_checkpointed_iteration.txt" \
-            "$BASE_DIR/datasets/$DATASET_NAME/manifest.json" \
-            "$TRANSFORMERS_DIR/src/transformers/models/chimera/__init__.py"; do
-    [[ -f "$path" ]] || fail "missing $path (check BASE_DIR, MODEL_NAME, DATASET_NAME, TRANSFORMERS_DIR in mixrl/config.env)"
+for path in "${required[@]}" "$TRANSFORMERS_DIR/src/transformers/models/chimera/__init__.py"; do
+    [[ -f "$path" ]] || fail "missing $path (check BASE_DIR, MODEL_NAME, DATASET_NAME, DISTILL_ROOT, TRANSFORMERS_DIR in mixrl/config.env)"
 done
 reward_up() { curl -sf --connect-timeout 5 "http://127.0.0.1:$REWARD_PORT/health" >/dev/null; }
 judge_up() { curl -sf --connect-timeout 5 "http://$JUDGE_HOST:$JUDGE_PORT/v1/models" >/dev/null 2>&1; }
 if [[ "$command" == preflight ]]; then
     reward_up || fail "reward service not reachable on port $REWARD_PORT; start it with mixrl/reward.sh"
 fi
-run_dir=$BASE_DIR/runs/chimera/mixrl/$RUN_NAME
+run_dir=$BASE_DIR/runs/chimera/$MODE/$RUN_NAME
 # A start that failed before any rollout or checkpoint (only logs/manifests) may be retried.
-if [[ "$command" == start && -n "$(find "$run_dir/checkpoints" "$run_dir/rollouts" -type f -print -quit 2>/dev/null)" ]]; then
+if [[ "$command" == start || "$command" == distill ]] \
+        && [[ -n "$(find "$run_dir/checkpoints" "$run_dir/rollouts" -type f -print -quit 2>/dev/null)" ]]; then
     fail "run $RUN_NAME already exists at $run_dir; pick a new name or: mixrl/run.sh resume $RUN_NAME"
 fi
 if [[ "$command" == resume && ! -f "$run_dir/checkpoints/latest_checkpointed_iteration.txt" ]]; then
@@ -90,6 +120,20 @@ if [[ "$command" != preflight ]]; then
     # A run folder made by an earlier container may be root-owned; then service logs go to a temp folder.
     logs=$run_dir/logs
     { mkdir -p "$logs" 2>/dev/null && [[ -w "$logs" ]]; } || { logs=$(mktemp -d); note "note: $run_dir/logs is not writable; service logs: $logs"; }
+fi
+if [[ "$MODE" == distill ]]; then
+    # No judge or reward service: the teachers score. They stay up between runs, like the judge.
+    printf '%s\n' "$domains_text" > "$logs/domains.txt"
+    note "domains: $(grep -m1 'domains enabled' <<< "$domains_text") (table: $logs/domains.txt)"
+    note "teachers: checking (log: $logs/teachers_start.log; starting one takes minutes)"
+    "$MIXRL_DIR/teachers.sh" start "$DISTILL_ROOT" > "$logs/teachers_start.log" 2>&1 \
+        || { tail -40 "$logs/teachers_start.log" >&2; fail "the teacher servers did not start"; }
+    note "teachers: $(tail -1 "$logs/teachers_start.log")"
+    # Which server scores which domains, for the container: name=url,... (a name is its domains joined by +).
+    MIXRL_TEACHER_URLS=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill \
+        "$DISTILL_ROOT" --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
+        | awk -F'\t' '{printf "%s%s=%s", (NR > 1 ? "," : ""), $4, $6}')
+elif [[ "$command" != preflight ]]; then
     tasks_text=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.tasks \
         "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
         --steps "$NUM_ROLLOUT" --refill-rounds "$MIXRL_REFILL_ROUNDS") || fail "mixrl/tasks.json: $tasks_text"
@@ -131,13 +175,18 @@ trap 'rm -f "$env_file"; for pid in "${followers[@]}"; do kill "$pid" 2>/dev/nul
 while IFS= read -r name; do
     printf '%s=%s\n' "$name" "${!name}"
 done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$env_file"
-printf 'RUN_NAME=%s\nRESUME=%s\nDATA_ROOT=/data\nCHIMERA_TRANSFORMERS_ROOT=/workspace/transformers\n' \
-    "$RUN_NAME" "$RESUME" >> "$env_file"
+printf 'RUN_NAME=%s\nRESUME=%s\nDATA_ROOT=/data\nCHIMERA_TRANSFORMERS_ROOT=/workspace/transformers\nMIXRL_MODE=%s\n' \
+    "$RUN_NAME" "$RESUME" "$MODE" >> "$env_file"
+if [[ "$MODE" == distill ]]; then
+    printf 'POLICY_GPUS=%s\nTRAIN_GPUS=%s\nMIXRL_DISTILL_DIR=/data/distill\nMIXRL_TEACHER_URLS=%s\n' \
+        "$POLICY_GPUS" "$TRAIN_GPUS" "$MIXRL_TEACHER_URLS" >> "$env_file"
+fi
 # Launcher switches with no config.env entry (defaults in mixrl/internal/launch.sh) reach the container too
 # when set for this command, e.g. MIXRL_PIPELINE_SECONDS=15 mixrl/run.sh start. Container paths and the
 # run's identity are set above, never taken from the host.
 container_owned=" DATA_ROOT CHIMERA_TRANSFORMERS_ROOT HF_CHECKPOINT MCORE_CHECKPOINT MEGATRON_ROOT MIXRL_DATA_DIR "
 container_owned+="MIXRL_CODE_AUDIT_DIR MIXRL_TASKS_CONFIG MIXRL_RUNS_ROOT RUN_NAME RESUME DRY_RUN PREFLIGHT_ONLY "
+container_owned+="MIXRL_MODE MIXRL_DISTILL_DIR MIXRL_TEACHER_URLS "
 known=" $(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d = | tr '\n' ' ') "
 for name in $(sed -nE 's/^(export )?([A-Z_][A-Z0-9_]*)=\$\{\2:-.*/\2/p' "$MIXRL_DIR/internal/launch.sh" | sort -u); do
     [[ "$container_owned" == *" $name "* || "$known" == *" $name "* ]] && continue
@@ -149,10 +198,14 @@ for name in $(compgen -e | grep -E '^(MIXRL|CHIMERA|SGLANG|JUDGE|REWARD)_' || tr
     [[ "$known$container_owned" == *" $name "* ]] || echo "warning: $name is set but is not a MixRL setting; it has no effect" >&2
 done
 
-docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576
-    -v "$BASE_DIR/models/$MODEL_NAME:/data/models/$MODEL_NAME:ro"
-    -v "$BASE_DIR/datasets/$DATASET_NAME:/data/datasets/$DATASET_NAME:ro"
-    -v "$TRANSFORMERS_DIR:/workspace/transformers:ro"
+docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576)
+if [[ "$MODE" == distill ]]; then
+    docker_args+=(-v "$DISTILL_ROOT:/data/distill:ro")
+else
+    docker_args+=(-v "$BASE_DIR/models/$MODEL_NAME:/data/models/$MODEL_NAME:ro"
+        -v "$BASE_DIR/datasets/$DATASET_NAME:/data/datasets/$DATASET_NAME:ro")
+fi
+docker_args+=(-v "$TRANSFORMERS_DIR:/workspace/transformers:ro"
     -v "$REPO_ROOT:/workspace/slime"
     -w /workspace/slime --env-file "$env_file")
 # Full checks in the real image, written to a throwaway folder inside the container.
@@ -161,8 +214,8 @@ if [[ "$command" == preflight ]]; then
     echo "Preflight for $RUN_NAME (no GPUs are used)"
     exec docker run "${docker_args[@]}" "${preflight_args[@]}" "$SLIME_IMAGE" bash mixrl/internal/launch.sh
 fi
-if [[ "$command" == start ]]; then
-    note "preflight: checking tasks, data, services and model (log: $logs/preflight.log)"
+if [[ "$command" == start || "$command" == distill ]]; then
+    note "preflight: checking $([[ "$MODE" == distill ]] && echo 'domains, teachers' || echo 'tasks, data, services') and model (log: $logs/preflight.log)"
     docker run "${docker_args[@]}" "${preflight_args[@]}" "$SLIME_IMAGE" bash mixrl/internal/launch.sh \
         > "$logs/preflight.log" 2>&1 < /dev/null \
         || { tail -40 "$logs/preflight.log" >&2; fail "preflight failed; nothing was started"; }
@@ -180,6 +233,9 @@ for container in $(docker ps --format '{{.Names}}' --filter 'name=^mixrl-reward-
     services+=("$container:reward_service${container#mixrl-reward-service}")
 done
 services+=(mixrl-judge-server:judge)
+for container in $(docker ps --format '{{.Names}}' --filter 'name=^mixrl-teacher-[0-9]+$' | sort); do
+    services+=("$container:${container#mixrl-}")
+done
 for service in "${services[@]}"; do
     container=${service%%:*}
     if ! docker ps -q --filter "name=^$container$" | grep -q .; then continue; fi
