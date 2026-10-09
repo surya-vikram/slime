@@ -124,18 +124,17 @@ def persist_pool():
     return _persist_pool
 
 
-def distill_rows(c):
-    """Distillation prompts as MixRL rows: the domain is the task, ids are prefixed with it (ids are unique only
-    within a domain), and every prompt is its own family. Returns (training rows, eval rows)."""
-    out = []
-    for split in ('prompts', 'eval'):
-        rows = []
-        for domain, d in c['domains'].items():
-            for row in distill.read_rows(d[split]):
-                key = f'{domain}:{row["id"]}'
-                rows.append({**row, 'id': key, 'family_id': key, 'task': domain, 'domain': domain, 'binary': False})
-        out.append(rows)
-    return tuple(out)
+def distill_split(c, split):
+    """Distillation prompts: the config's splits folder, checked against the release manifest next to it when
+    there is one (the HF release has it), like MixRL's data."""
+    splits = Path(c['splits'])
+    if (splits.parent / 'manifest.json').is_file():
+        return load_split(splits.parent, split)
+    with (splits / f'{split}.jsonl').open() as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
+    if len({r['id'] for r in rows}) != len(rows):
+        raise ValueError('Duplicate record identity')
+    return rows, {'splits': str(splits)}
 
 
 class DataSource:
@@ -146,8 +145,8 @@ class DataSource:
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.distilling = self.c.get('mode') == 'distill'
         if self.distilling:
-            rows, val = distill_rows(self.c)
-            self.manifest = {name: [d['prompts_hash'], d['eval_hash']] for name, d in self.c['domains'].items()}
+            rows, self.manifest = distill_split(self.c, 'rl_train')
+            val, _ = distill_split(self.c, 'rl_val')
         else:
             rows, self.manifest = load_split(self.c['data_dir'], 'rl_train')
             val, _ = load_split(self.c['data_dir'], 'rl_val')
@@ -163,9 +162,9 @@ class DataSource:
                 reason = self.c.get('code_exclusion_reasons', {}).get(row['id'], 'scorer_metadata_quarantine')
                 self.excluded.append({'id': row['id'], 'task': row['task'], 'reason': reason})
                 return False
-            if not self.distilling:  # distillation prompts were checked with their folder
+            if not self.distilling:  # distillation tasks were checked with their config
                 validate_route(row, self.c['routes'])
-            cap = self.cap(row)
+            cap = self.c['caps'][row['task']]
             prompt = self.tokenizer.apply_chat_template(
                 row['messages'], tokenize=False, add_generation_prompt=True,
                 **self.c.get('chat_template_kwargs', {}))
@@ -206,10 +205,6 @@ class DataSource:
     def __len__(self):
         return sum(map(len, self.sampler.pools.values()))
 
-    def cap(self, row):
-        """The answer cap: the task's, or in distillation a prompt's own max_response_tokens over its domain's."""
-        return row.get('max_response_tokens', self.c['caps'][row['task']]) if self.distilling else self.c['caps'][row['task']]
-
     def get_samples(self, num_samples):
         raise RuntimeError('MixRL uses route-aware proposals, not the default datasource iterator')
 
@@ -243,7 +238,7 @@ class DataSource:
                        metadata={'mixrl': {'row_id': row['id'], 'row_hash': digest(row),
                                            'task': row['task'], 'binary': row['binary'], 'split': split, 'sample': i,
                                            'policy_version': rollout_id, 'group_id': group_id,
-                                           'cap': self.cap(row),
+                                           'cap': self.c['caps'][row['task']],
                                            'identity': self.identity}})
                 for i in range(count)]
 
@@ -374,11 +369,11 @@ def unfinished(sample):
 
 def distill_rewards(args, samples, c):
     """Distillation: no rewards to normalize; the per-token advantage is computed in the loss from the teacher's
-    log-probs. Each sample's advantage slot carries its domain's index instead (grpo broadcasts it over the
-    answer's tokens), so objective.distill_loss can report KL per domain; the loss never multiplies by it."""
+    log-probs. Each sample's advantage slot carries its task's index instead (grpo broadcasts it over the
+    answer's tokens), so objective.distill_loss can report KL per task; the loss never multiplies by it."""
     if len(samples) != args.n_samples_per_prompt * args.rollout_batch_size:
         raise ValueError('Incomplete accepted batch')
-    index = {name: i for i, name in enumerate(c['domains'])}
+    index = {name: i for i, name in enumerate(c['quotas'])}
     for sample in samples:
         if sample.teacher_log_probs is None or len(sample.teacher_log_probs) != sample.response_length:
             raise ValueError('Every distilled answer needs one teacher log-prob per answer token')
@@ -957,7 +952,7 @@ async def teacher_reference(args, c, source, panel):
     top-p and top-k, the same caps and stop marker): its answer length and stop rate sit next to the student's
     in every evaluation. Kept in rollouts/teacher-eval.json and reused for the rest of the run and on resume."""
     path = source.run_dir / 'rollouts' / 'teacher-eval.json'
-    panel_id = digest([[r['id'], source.cap(r)] for r in panel] + [{d: t['server'] for d, t in c['teachers'].items()}])
+    panel_id = digest([[r['id'], c['caps'][r['task']]] for r in panel] + [{d: t['server'] for d, t in c['teachers'].items()}])
     if path.exists():
         saved = json.loads(path.read_text())
         if saved.get('panel') == panel_id:
@@ -968,7 +963,7 @@ async def teacher_reference(args, c, source, panel):
 
     def answer(row):
         payload = {'input_ids': source.prompts[row['id']][1],
-                   'sampling_params': {**params, 'max_new_tokens': source.cap(row),
+                   'sampling_params': {**params, 'max_new_tokens': c['caps'][row['task']],
                                        'sampling_seed': (c['seed'] + int(digest(['teacher-eval', row['id']])[:8], 16)) % (2**31)}}
         meta = request(c['teachers'][row['task']]['url'] + '/generate', payload, c['reward_timeout'])['meta_info']
         reason = meta.get('finish_reason') or {}

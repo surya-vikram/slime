@@ -137,7 +137,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertNotIn('reward', head)
         for part in ('answers: 3', 'resp len: 800', 'capped: 33%', 'gen: 800 tok/s'):
             self.assertIn(part, detail)
-        self.assertTrue(domains.endswith('KL by domain (resp len, capped) | teacher_x 0.180 (900, 0%) | teacher_y 0.262 (600, 100%)'))
+        self.assertTrue(domains.endswith('KL by task (resp len, capped) | teacher_x 0.180 (900, 0%) | teacher_y 0.262 (600, 100%)'))
         c.feed('MIXRL_TEACHER_EVAL ' + json.dumps({'domains': {'teacher_x': {'length_mean': 790, 'length_p99': 1580,
                                                                              'stop_rate': 1.}}}) + '\n')
         self.assertEqual(lines(out)[-1], 'teachers answered the eval prompts (once per run) | teacher_x len 790/1580 stop 100%')
@@ -148,11 +148,11 @@ class ConsoleTests(unittest.TestCase):
                                          'stop 99% (teacher 100%) clipped 0.2%')
         c.feed('MIXRL_TEACHER_RETRY teacher teacher_x attempt 1/12: URLError: refused\n')
         self.assertEqual(lines(out)[-1], 'WARNING teacher request failed, retrying: teacher teacher_x attempt 1/12: URLError: refused')
-        settings = console.settings_line({'mode': 'distill', 'distill_root': '/data/distill', 'domains': {'teacher_x': {}},
-                                          'teachers': {'teacher_x': {'server': 'teacher_x'}}, 'adv_clip': 5.,
+        settings = console.settings_line({'mode': 'distill', 'quotas': {'teacher_x': 4},
+                                          'teachers': {'teacher_x': {'server': 'four_tasks'}}, 'adv_clip': 5.,
                                           'lr': 1e-6, 'lr_warmup_steps': 10, 'rollout_temperature': 1.},
                                          ['--sglang-mem-fraction-static', '0.8'], {})
-        for part in ('distillation: /data/distill', 'domains: teacher_x', 'teacher servers: 1', 'advantage clip: 5.0',
+        for part in ('distillation tasks: teacher_x', 'teacher servers: 1', 'advantage clip: 5.0',
                      'lr: 1e-06 (warm-up 10 steps)', 'memory 0.8'):
             self.assertIn(part, settings)
 

@@ -8,10 +8,11 @@ mixrl/
 ├── tasks.json        which tasks train, prompts per step, eval size, and what each task is
 ├── judge.sh          start the judge (vLLM)
 ├── reward.sh         start the reward service
-├── run.sh            start | resume (starts judge and reward service as needed) | preflight | tasks | domains | distill
+├── run.sh            start | resume (starts judge and reward service as needed) | preflight | tasks | distill-plan | distill
 ├── teachers.sh       start | status | stop the teacher servers for distillation
 ├── internal/launch.sh   runs inside the training container; never run by hand
-├── mopd/             multi-teacher on-policy distillation (MOPD): process, inputs, running (README.md)
+├── distill.json      distillation: student, splits, teachers and tasks, as full paths
+├── mopd/             multi-teacher on-policy distillation (MOPD): design (README.md), how to run (RUN.md)
 └── docs/             AIRGAPPED.md (setup and transfer), RUNBOOK.md (how it works), TASK_AUDIT.md, GSM8K.md (GSM8K-only run on 8×H200)
 ```
 
@@ -24,7 +25,7 @@ mixrl/run.sh start gsm8k-01     # new run named gsm8k-01 (name optional): see be
 mixrl/run.sh resume gsm8k-01    # continue it from its latest checkpoint (no preflight)
 mixrl/run.sh tasks              # preview only: tasks, prompts per step, eval size, judge use
 mixrl/run.sh preflight          # checks only, no GPUs (start runs them too)
-mixrl/run.sh domains            # distillation: preview and check DISTILL_ROOT (mopd/README.md)
+mixrl/run.sh distill-plan       # distillation: check and preview mixrl/distill.json (mopd/RUN.md)
 mixrl/run.sh distill d-01       # distillation run: teacher servers instead of judge and reward service
 ```
 

@@ -1,0 +1,19 @@
+{
+  "_readme": "Distillation inputs (mixrl/mopd/README.md, how to run: mixrl/mopd/RUN.md). Full paths only. Per task: teacher and prompts_per_step required; max_response_tokens (default: the task's cap in mixrl/tasks.json) and eval_prompts (\"all\" of its rl_val prompts, or a number) optional. Check: mixrl/run.sh distill-plan",
+  "student": {
+    "hf": "/nvme_zone3/home/ekamai1/chimera/mixrl/models/zoro3/hf",
+    "mcore": "/nvme_zone3/home/ekamai1/chimera/mixrl/models/zoro3/mcore"
+  },
+  "splits": "/nvme_zone3/home/ekamai1/chimera/mixrl/datasets/chimera-eval-data/splits",
+  "teachers": {
+    "four_tasks": "/full/path/to/four_tasks/hf",
+    "multiturn": "/full/path/to/multiturn/hf"
+  },
+  "tasks": {
+    "gsm8k_train": {"teacher": "four_tasks", "prompts_per_step": 150, "max_response_tokens": 1024, "eval_prompts": "all"},
+    "mcqa": {"teacher": "four_tasks", "prompts_per_step": 280, "max_response_tokens": 2048, "eval_prompts": "all"},
+    "nemotron_if": {"teacher": "four_tasks", "prompts_per_step": 299, "max_response_tokens": 2048, "eval_prompts": "all"},
+    "calendar": {"teacher": "four_tasks", "prompts_per_step": 89, "max_response_tokens": 2048, "eval_prompts": "all"},
+    "nvidia_multichallenge": {"teacher": "multiturn", "prompts_per_step": 22, "max_response_tokens": 2048, "eval_prompts": "all"}
+  }
+}

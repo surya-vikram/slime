@@ -171,7 +171,7 @@ def _loss(args, batch, logits, sum_of_sample_mean, distill=False):
     behavior = torch.cat(batch['rollout_log_probs'])
     advantages = torch.cat(batch['advantages'])
     if distill:
-        # The advantage slot carries each answer's domain index (runtime.distill_rewards), for the metrics only.
+        # The advantage slot carries each answer's task index (runtime.distill_rewards), for the metrics only.
         domains = advantages.detach()
         gap = torch.cat(batch['teacher_log_probs']).to(full) - full  # q - lp_full
         advantages = gap.clamp(-c['adv_clip'], c['adv_clip'])
@@ -199,11 +199,11 @@ def _loss(args, batch, logits, sum_of_sample_mean, distill=False):
                 (selected & condition).float()).detach()
     if distill:
         # KL: per answer the mean of lp_full - q (a reverse-KL estimate), averaged over answers like the loss.
-        # Per domain: sums and answer counts here, divided after the global reduction (active_diagnostics).
+        # Per task: sums and answer counts here, divided after the global reduction (active_diagnostics).
         clipped = (gap.abs() >= c['adv_clip']).float()
         metrics['distill_kl'] = sum_of_sample_mean(-gap).detach()
         metrics['distill_clipped'] = sum_of_sample_mean(clipped).detach()
-        for i, name in enumerate(c['domains']):
+        for i, name in enumerate(c['quotas']):
             mine = (domains == i).float()
             metrics[f'distill_answers/{name}'] = sum_of_sample_mean(mine).detach()
             metrics[f'distill_kl/{name}'] = sum_of_sample_mean(-gap * mine).detach()

@@ -7,9 +7,9 @@
 #                                      (MixRL and distillation runs alike)
 #   mixrl/run.sh preflight [RUN_NAME]  checks only: tasks, data, reward service, judge and model; no GPUs
 #   mixrl/run.sh tasks                 preview the task table (no Docker, no GPUs)
-#   mixrl/run.sh domains [ROOT]        preview a distillation folder (default DISTILL_ROOT): domains, batch,
-#                                      teacher placement, passes; checks every input (no Docker, no GPUs)
-#   mixrl/run.sh distill [RUN_NAME]    distil DISTILL_ROOT's teachers into its student (mixrl/mopd/README.md):
+#   mixrl/run.sh distill-plan          preview the distillation config (DISTILL_CONFIG, mixrl/distill.json): tasks,
+#                                      teachers, GPUs, batch, passes; checks every path and input (no Docker, no GPUs)
+#   mixrl/run.sh distill [RUN_NAME]    distil the config's teachers into its student (mixrl/mopd/README.md):
 #                                      start the teacher servers if they are not up, preflight, train
 #                                      (name: distill-<date>-<time>)
 #
@@ -39,13 +39,14 @@ case "$command" in
             "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
             --steps "$NUM_ROLLOUT" --refill-rounds "$MIXRL_REFILL_ROUNDS"
         ;;
-    domains)
-        [[ $# -le 1 ]] || usage
+    distill-plan)
+        [[ $# -eq 0 ]] || usage
         policy_gpus=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
+        [[ "$DISTILL_CONFIG" == /* ]] || DISTILL_CONFIG=$REPO_ROOT/$DISTILL_CONFIG
         cd "$REPO_ROOT"
-        exec env PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "${1:-$DISTILL_ROOT}" \
+        exec env PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$DISTILL_CONFIG" \
             --steps "$NUM_ROLLOUT" --samples-per-prompt "$DISTILL_SAMPLES_PER_PROMPT" --policy-gpus "$policy_gpus" \
-            --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT"
+            --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" --teacher-memory "$TEACHER_GPU_MEMORY"
         ;;
     preflight|start)
         [[ $# -le 1 ]] || usage
@@ -75,16 +76,21 @@ esac
 # Host-side checks with plain messages, before any container starts.
 [[ "$RUN_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fail "run name '$RUN_NAME': use letters, digits, . _ - only"
 if [[ "$MODE" == distill ]]; then
+    [[ "$DISTILL_CONFIG" == /* ]] || DISTILL_CONFIG=$REPO_ROOT/$DISTILL_CONFIG
+    [[ -f "$DISTILL_CONFIG" ]] || fail "DISTILL_CONFIG=$DISTILL_CONFIG not found"
+    distill_py() { (cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$DISTILL_CONFIG" "$@"); }
     # The student trains and generates on DISTILL_TRAIN_GPUS; the teachers have TEACHER_GPUS.
     TRAIN_GPUS=$DISTILL_TRAIN_GPUS
     POLICY_GPUS=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
     for gpu in ${DISTILL_TRAIN_GPUS//,/ }; do
         [[ ",$TEACHER_GPUS," != *",$gpu,"* ]] || fail "GPU $gpu is in both DISTILL_TRAIN_GPUS and TEACHER_GPUS"
     done
-    domains_text=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$DISTILL_ROOT" \
-        --steps "$NUM_ROLLOUT" --samples-per-prompt "$DISTILL_SAMPLES_PER_PROMPT" --policy-gpus "$POLICY_GPUS" \
-        --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" 2>&1) || { echo "$domains_text" >&2; fail "$DISTILL_ROOT is not ready"; }
-    required=("$DISTILL_ROOT/student/hf/config.json" "$DISTILL_ROOT/student/mcore/latest_checkpointed_iteration.txt")
+    plan_text=$(distill_py --steps "$NUM_ROLLOUT" --samples-per-prompt "$DISTILL_SAMPLES_PER_PROMPT" --policy-gpus "$POLICY_GPUS" \
+        --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" --teacher-memory "$TEACHER_GPU_MEMORY" 2>&1) \
+        || { echo "$plan_text" >&2; fail "$DISTILL_CONFIG is not ready"; }
+    # Student HF, student Megatron and splits folders, mounted at their own paths in the training container.
+    mapfile -t distill_paths < <(distill_py --paths)
+    required=("${distill_paths[0]}/config.json" "${distill_paths[1]}/latest_checkpointed_iteration.txt")
 else
     required=("$BASE_DIR/models/$MODEL_NAME/hf/config.json" "$BASE_DIR/models/$MODEL_NAME/mcore/latest_checkpointed_iteration.txt"
               "$BASE_DIR/datasets/$DATASET_NAME/manifest.json")
@@ -92,7 +98,7 @@ fi
 IFS=, read -ra gpu_ids <<< "$TRAIN_GPUS"
 [[ ${#gpu_ids[@]} -eq $POLICY_GPUS ]] || fail "TRAIN_GPUS=$TRAIN_GPUS lists ${#gpu_ids[@]} GPUs but POLICY_GPUS=$POLICY_GPUS"
 for path in "${required[@]}" "$TRANSFORMERS_DIR/src/transformers/models/chimera/__init__.py"; do
-    [[ -f "$path" ]] || fail "missing $path (check BASE_DIR, MODEL_NAME, DATASET_NAME, DISTILL_ROOT, TRANSFORMERS_DIR in mixrl/config.env)"
+    [[ -f "$path" ]] || fail "missing $path (check BASE_DIR, MODEL_NAME, DATASET_NAME, TRANSFORMERS_DIR in mixrl/config.env, and DISTILL_CONFIG)"
 done
 reward_up() { curl -sf --connect-timeout 5 "http://127.0.0.1:$REWARD_PORT/health" >/dev/null; }
 judge_up() { curl -sf --connect-timeout 5 "http://$JUDGE_HOST:$JUDGE_PORT/v1/models" >/dev/null 2>&1; }
@@ -123,15 +129,14 @@ if [[ "$command" != preflight ]]; then
 fi
 if [[ "$MODE" == distill ]]; then
     # No judge or reward service: the teachers score. They stay up between runs, like the judge.
-    printf '%s\n' "$domains_text" > "$logs/domains.txt"
-    note "domains: $(grep -m1 'domains enabled' <<< "$domains_text") (table: $logs/domains.txt)"
+    printf '%s\n' "$plan_text" > "$logs/distill_plan.txt"
+    note "distillation: $(grep -m1 ' tasks; ' <<< "$plan_text") (table: $logs/distill_plan.txt)"
     note "teachers: checking (log: $logs/teachers_start.log; starting one takes minutes)"
-    "$MIXRL_DIR/teachers.sh" start "$DISTILL_ROOT" > "$logs/teachers_start.log" 2>&1 \
+    "$MIXRL_DIR/teachers.sh" start "$DISTILL_CONFIG" > "$logs/teachers_start.log" 2>&1 \
         || { tail -40 "$logs/teachers_start.log" >&2; fail "the teacher servers did not start"; }
     note "teachers: $(tail -1 "$logs/teachers_start.log")"
-    # Which server scores which domains, for the container: name=url,... (a name is its domains joined by +).
-    MIXRL_TEACHER_URLS=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill \
-        "$DISTILL_ROOT" --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
+    # Where each teacher's server is, for the container: name=url,...
+    MIXRL_TEACHER_URLS=$(distill_py --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
         | awk -F'\t' '{printf "%s%s=%s", (NR > 1 ? "," : ""), $4, $6}')
 elif [[ "$command" != preflight ]]; then
     tasks_text=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.tasks \
@@ -178,15 +183,15 @@ done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$en
 printf 'RUN_NAME=%s\nRESUME=%s\nDATA_ROOT=/data\nCHIMERA_TRANSFORMERS_ROOT=/workspace/transformers\nMIXRL_MODE=%s\n' \
     "$RUN_NAME" "$RESUME" "$MODE" >> "$env_file"
 if [[ "$MODE" == distill ]]; then
-    printf 'POLICY_GPUS=%s\nTRAIN_GPUS=%s\nMIXRL_DISTILL_DIR=/data/distill\nMIXRL_TEACHER_URLS=%s\n' \
-        "$POLICY_GPUS" "$TRAIN_GPUS" "$MIXRL_TEACHER_URLS" >> "$env_file"
+    printf 'POLICY_GPUS=%s\nTRAIN_GPUS=%s\nDISTILL_CONFIG=%s\nMIXRL_TEACHER_URLS=%s\n' \
+        "$POLICY_GPUS" "$TRAIN_GPUS" "$DISTILL_CONFIG" "$MIXRL_TEACHER_URLS" >> "$env_file"
 fi
 # Launcher switches with no config.env entry (defaults in mixrl/internal/launch.sh) reach the container too
 # when set for this command, e.g. MIXRL_PIPELINE_SECONDS=15 mixrl/run.sh start. Container paths and the
 # run's identity are set above, never taken from the host.
 container_owned=" DATA_ROOT CHIMERA_TRANSFORMERS_ROOT HF_CHECKPOINT MCORE_CHECKPOINT MEGATRON_ROOT MIXRL_DATA_DIR "
 container_owned+="MIXRL_CODE_AUDIT_DIR MIXRL_TASKS_CONFIG MIXRL_RUNS_ROOT RUN_NAME RESUME DRY_RUN PREFLIGHT_ONLY "
-container_owned+="MIXRL_MODE MIXRL_DISTILL_DIR MIXRL_TEACHER_URLS "
+container_owned+="MIXRL_MODE MIXRL_TEACHER_URLS "
 known=" $(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d = | tr '\n' ' ') "
 for name in $(sed -nE 's/^(export )?([A-Z_][A-Z0-9_]*)=\$\{\2:-.*/\2/p' "$MIXRL_DIR/internal/launch.sh" | sort -u); do
     [[ "$container_owned" == *" $name "* || "$known" == *" $name "* ]] && continue
@@ -200,7 +205,8 @@ done
 
 docker_args=(--rm --ipc=host --net=host --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576)
 if [[ "$MODE" == distill ]]; then
-    docker_args+=(-v "$DISTILL_ROOT:/data/distill:ro")
+    # The config's own paths, unchanged inside the container: the config file, the student and the splits.
+    for path in "$DISTILL_CONFIG" "${distill_paths[@]}"; do docker_args+=(-v "$path:$path:ro"); done
 else
     docker_args+=(-v "$BASE_DIR/models/$MODEL_NAME:/data/models/$MODEL_NAME:ro"
         -v "$BASE_DIR/datasets/$DATASET_NAME:/data/datasets/$DATASET_NAME:ro")
@@ -215,7 +221,7 @@ if [[ "$command" == preflight ]]; then
     exec docker run "${docker_args[@]}" "${preflight_args[@]}" "$SLIME_IMAGE" bash mixrl/internal/launch.sh
 fi
 if [[ "$command" == start || "$command" == distill ]]; then
-    note "preflight: checking $([[ "$MODE" == distill ]] && echo 'domains, teachers' || echo 'tasks, data, services') and model (log: $logs/preflight.log)"
+    note "preflight: checking $([[ "$MODE" == distill ]] && echo 'distillation config, teachers' || echo 'tasks, data, services') and model (log: $logs/preflight.log)"
     docker run "${docker_args[@]}" "${preflight_args[@]}" "$SLIME_IMAGE" bash mixrl/internal/launch.sh \
         > "$logs/preflight.log" 2>&1 < /dev/null \
         || { tail -40 "$logs/preflight.log" >&2; fail "preflight failed; nothing was started"; }

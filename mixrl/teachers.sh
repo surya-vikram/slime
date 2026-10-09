@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Teacher servers for distillation (SGLang, one per teacher folder). Settings: mixrl/config.env, distillation
-# section; placement: mixrl/run.sh domains. mixrl/run.sh distill starts them when they are not running.
+# Teacher servers for distillation (SGLang, one per teacher in the distillation config). Settings: mixrl/config.env,
+# distillation section; placement: mixrl/run.sh distill-plan. mixrl/run.sh distill starts them when they are not running.
 #
-#   mixrl/teachers.sh [start] [ROOT]   start the teachers of ROOT (default DISTILL_ROOT) that are not running
-#   mixrl/teachers.sh status [ROOT]    which teachers answer
-#   mixrl/teachers.sh stop             stop every teacher server
+#   mixrl/teachers.sh [start] [CONFIG]   start the teachers of CONFIG (default DISTILL_CONFIG) that are not running
+#   mixrl/teachers.sh status [CONFIG]    which teachers answer
+#   mixrl/teachers.sh stop               stop every teacher server
 set -Eeuo pipefail
 
 MIXRL_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -37,24 +37,32 @@ case "$command" in
         ;;
     *) usage ;;
 esac
-ROOT=${1:-$DISTILL_ROOT}
+CONFIG=${1:-$DISTILL_CONFIG}
+[[ "$CONFIG" == /* ]] || CONFIG=$REPO_ROOT/$CONFIG
 
-# One line per server, in start order: port, GPU, memory setting, name (its domains joined by +), checkpoint, URL.
-plan=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$ROOT" --plan \
+# One line per server, in start order: port, GPU, memory setting, teacher name, checkpoint, URL.
+plan=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$CONFIG" --plan \
     --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" --teacher-memory "$TEACHER_GPU_MEMORY") \
-    || fail "$ROOT: the distillation folder has problems (mixrl/run.sh domains $ROOT shows them)"
+    || fail "$CONFIG has problems (mixrl/run.sh distill-plan shows them)"
 
 # The name a server announces (SGLang's --served-model-name), empty when nothing answers on the port.
 served() {
     curl -sf --connect-timeout 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null \
         | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true
 }
+# The checkpoint it serves: a server left from another config can carry the same name with other weights.
+serving() {
+    curl -sf --connect-timeout 5 "http://127.0.0.1:$1/get_model_info" 2>/dev/null \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["model_path"])' 2>/dev/null || true
+}
 
 if [[ "$command" == status ]]; then
     missing=0
     while IFS=$'\t' read -r port gpu memory name path url; do
         now=$(served "$port")
-        if [[ "$now" == "$name" ]]; then echo "ready    $name on GPU $gpu at $url ($path)"
+        if [[ "$now" == "$name" && "$(serving "$port")" != "$path" ]]; then
+            echo "WRONG    port $port serves $name from $(serving "$port"), the config says $path"; missing=1
+        elif [[ "$now" == "$name" ]]; then echo "ready    $name on GPU $gpu at $url ($path)"
         elif [[ -n "$now" ]]; then echo "WRONG    port $port serves '$now', expected $name"; missing=1
         else echo "down     $name (GPU $gpu, port $port)"; missing=1; fi
     done <<< "$plan"
@@ -93,7 +101,9 @@ started=0
 # Servers sharing a GPU start one after another (see distill.servers), so every start waits for the previous.
 while IFS=$'\t' read -r port gpu memory name path url; do
     now=$(served "$port")
-    if [[ "$now" == "$name" ]]; then
+    if [[ "$now" == "$name" && "$(serving "$port")" != "$path" ]]; then
+        fail "port $port serves teacher $name from $(serving "$port"), but the config says $path; stop it first: mixrl/teachers.sh stop"
+    elif [[ "$now" == "$name" ]]; then
         echo "teacher $name: already running on port $port"
         continue
     elif [[ -n "$now" ]]; then

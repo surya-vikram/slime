@@ -20,25 +20,27 @@ done
 source "$MIXRL_DIR/config.env"
 
 # mixrl: RL with the judge and reward service (tasks.json). distill: multi-teacher on-policy distillation
-# of the folder MIXRL_DISTILL_DIR (mixrl/mopd/README.md); mixrl/run.sh distill sets it.
+# as DISTILL_CONFIG describes it (mixrl/distill.json, mixrl/mopd/README.md); mixrl/run.sh distill sets it.
 MIXRL_MODE=${MIXRL_MODE:-mixrl}
 if [[ "$MIXRL_MODE" != mixrl && "$MIXRL_MODE" != distill ]]; then
     echo "MIXRL_MODE must be mixrl or distill" >&2; exit 1
 fi
 if [[ "$MIXRL_MODE" == distill ]]; then
-    MIXRL_DISTILL_DIR=${MIXRL_DISTILL_DIR:-$DISTILL_ROOT}
-    HF_CHECKPOINT=${HF_CHECKPOINT:-$MIXRL_DISTILL_DIR/student/hf}
-    MCORE_CHECKPOINT=${MCORE_CHECKPOINT:-$MIXRL_DISTILL_DIR/student/mcore}
+    [[ "$DISTILL_CONFIG" == /* ]] || DISTILL_CONFIG=$REPO_ROOT/$DISTILL_CONFIG
+    # The student and the prompt splits come from the config (full paths; the teachers are checked on the host).
+    { read -r HF_CHECKPOINT; read -r MCORE_CHECKPOINT; read -r DISTILL_SPLITS; } < <(cd "$REPO_ROOT" \
+        && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "$DISTILL_CONFIG" --paths) \
+        || { echo "DISTILL_CONFIG=$DISTILL_CONFIG has problems (mixrl/run.sh distill-plan shows them)" >&2; exit 1; }
     POLICY_GPUS=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
     N_SAMPLES_PER_PROMPT=$DISTILL_SAMPLES_PER_PROMPT
     LR_WARMUP_STEPS=$DISTILL_LR_WARMUP_STEPS
     if [[ -z "${MIXRL_TEACHER_URLS:-}" ]]; then
         # mixrl/run.sh passes the servers it started; run by hand (inside a container), plan them here.
         MIXRL_TEACHER_URLS=$(cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill \
-            "$MIXRL_DISTILL_DIR" --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
+            "$DISTILL_CONFIG" --plan --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT" \
             | awk -F'\t' '{printf "%s%s=%s", (NR > 1 ? "," : ""), $4, $6}')
     fi
-    export MIXRL_DISTILL_DIR MIXRL_TEACHER_URLS DISTILL_ADV_CLIP
+    export DISTILL_CONFIG MIXRL_TEACHER_URLS DISTILL_ADV_CLIP
 fi
 export MIXRL_MODE
 
@@ -220,9 +222,8 @@ if [[ "$PREFLIGHT_ONLY" == 1 ]]; then exit 0; fi
 read -r ROLLOUT_BATCH_SIZE MIXRL_EVAL_SAMPLES < <(python3 -c 'import json, os
 c = json.load(open(os.environ["CHIMERA_MIXRL_CONFIG"])); print(c["rollout_batch_size"], c["eval_samples"])')
 if [[ "$MIXRL_MODE" == distill ]]; then
-    # Slime requires prompt files; the MixRL data source reads the domains itself.
-    read -r TRAIN_DATA EVAL_DATA < <(python3 -c 'import json, os
-c = json.load(open(os.environ["CHIMERA_MIXRL_CONFIG"])); d = next(iter(c["domains"].values())); print(d["prompts"], d["eval"])')
+    TRAIN_DATA=$DISTILL_SPLITS/rl_train.jsonl
+    EVAL_DATA=$DISTILL_SPLITS/rl_val.jsonl
 fi
 
 for required_file in "$HF_CHECKPOINT/config.json" "$TRAIN_DATA" "$EVAL_DATA"; do
@@ -503,9 +504,9 @@ TRAIN_COMMAND=(
     "${MISC_ARGS[@]}"
 )
 
-# Everything needed to reproduce this run, next to its checkpoints (the distillation folder and teacher plan
-# are in mixrl_config.json).
-if [[ "$MIXRL_MODE" == mixrl ]]; then cp "$MIXRL_TASKS_CONFIG" "$MANIFEST_DIR/tasks.json"; fi
+# Everything needed to reproduce this run, next to its checkpoints.
+if [[ "$MIXRL_MODE" == distill ]]; then cp "$DISTILL_CONFIG" "$MANIFEST_DIR/distill.json"
+else cp "$MIXRL_TASKS_CONFIG" "$MANIFEST_DIR/tasks.json"; fi
 while IFS= read -r name; do
     printf '%s=%q\n' "$name" "${!name}"
 done < <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$MIXRL_DIR/config.env" | tr -d =) > "$MANIFEST_DIR/config.env"
@@ -548,7 +549,7 @@ echo "SGLang rollout: $ROLLOUT_GPUS independent TP=1 engines, mode=$EXECUTION_MO
 echo "Batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT responses = $GLOBAL_BATCH_SIZE samples"
 say "$([[ "$MIXRL_MODE" == distill ]] && echo "MixRL distillation run" || echo "MixRL run") $RUN_NAME" \
     "($([[ "$RESUME" == 1 ]] && echo resume || echo new)) |" \
-    "$([[ "$MIXRL_MODE" == distill ]] && echo "student: $MIXRL_DISTILL_DIR/student" || echo "model: $MODEL_NAME") |" \
+    "$([[ "$MIXRL_MODE" == distill ]] && echo "student: $HF_CHECKPOINT" || echo "model: $MODEL_NAME") |" \
     "training GPUs: $POLICY_GPUS (EP $EXPERT_MODEL_PARALLEL_SIZE) | SGLang engines: $ROLLOUT_GPUS |" \
     "batch: $ROLLOUT_BATCH_SIZE prompts x $N_SAMPLES_PER_PROMPT = $GLOBAL_BATCH_SIZE samples | steps: $NUM_ROLLOUT |" \
     "eval every $EVAL_INTERVAL | save every $SAVE_INTERVAL"

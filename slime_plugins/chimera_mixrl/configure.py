@@ -87,40 +87,38 @@ def file_hash(path):
 
 
 def distill_inputs(env):
-    """MIXRL_MODE=distill: the distillation folder and its teacher servers (mixrl/mopd/README.md), in the
-    shape the trainer reads in place of the task file, data release and reward service."""
+    """MIXRL_MODE=distill: the distillation config (mixrl/distill.json, mixrl/mopd/README.md) and its teacher
+    servers, in the shape the trainer reads in place of the task file and reward service."""
     if float(env.get('ROLLOUT_TEMPERATURE', '1.0')) != 1:
         raise ValueError('Distillation needs ROLLOUT_TEMPERATURE=1: SGLang returns the teachers\' log-probs at '
                          'temperature 1, so the student must sample at 1 for the two to compare')
     clip = float(env.get('DISTILL_ADV_CLIP', '5'))
     if not math.isfinite(clip) or clip <= 0:
         raise ValueError('DISTILL_ADV_CLIP must be a positive number')
-    root = Path(env['MIXRL_DISTILL_DIR'])
-    # The teachers were checked on the host (mixrl/run.sh domains); here they are known by what they serve.
-    spec = distill.load(root, check_teachers=False)
-    chosen = distill.enabled(spec)
-    teachers = {}
-    for name, server in distill.parse_urls(env.get('MIXRL_TEACHER_URLS', '')).items():
-        models = request(server['url'] + '/v1/models', timeout=30).get('data') or [{}]
-        if [m.get('id') for m in models] != [name]:
-            raise ValueError(f'Teacher server {server["url"]} serves {[m.get("id") for m in models]}, expected {name}; '
-                             'restart the teachers with mixrl/teachers.sh')
-        checkpoint = request(server['url'] + '/get_model_info', timeout=30).get('model_path')
-        for domain in server['domains']:
-            teachers[domain] = {'url': server['url'], 'server': name, 'checkpoint': checkpoint}
-    missing = sorted(set(chosen) - set(teachers))
+    # The teachers were checked on the host (mixrl/run.sh); here they are known by what their servers serve.
+    spec = distill.load(env['DISTILL_CONFIG'], check_teachers=False)
+    urls = distill.parse_urls(env.get('MIXRL_TEACHER_URLS', ''))
+    missing = sorted(set(spec['teachers']) - set(urls))
     if missing:
-        raise ValueError(f'No teacher server for domain(s) {", ".join(missing)}; start them with mixrl/teachers.sh')
-    c = {'mode': 'distill', 'distill_root': str(root), 'adv_clip': clip,
-         'domains': {n: {'prompts': str(d['prompts']), 'eval': str(d['eval']), 'prompts_hash': file_hash(d['prompts']),
-                         'eval_hash': file_hash(d['eval']), 'prompts_per_step': d['prompts_per_step'],
-                         'max_response_tokens': d['max_response_tokens'], 'eval_prompts': d['eval_prompts']}
-                     for n, d in chosen.items()},
-         'teachers': {n: teachers[n] for n in chosen},
-         'quotas': {n: d['prompts_per_step'] for n, d in chosen.items()},
-         # A row's own max_response_tokens overrides its domain's cap (runtime.DataSource).
-         'caps': {n: d['max_response_tokens'] for n, d in chosen.items()},
-         'eval_quotas': {n: d['eval_pool'] if d['eval_prompts'] == 'all' else d['eval_prompts'] for n, d in chosen.items()},
+        raise ValueError(f'No teacher server for {", ".join(missing)}; start them with mixrl/teachers.sh')
+    servers = {}
+    for name in spec['teachers']:
+        models = request(urls[name] + '/v1/models', timeout=30).get('data') or [{}]
+        if [m.get('id') for m in models] != [name]:
+            raise ValueError(f'Teacher server {urls[name]} serves {[m.get("id") for m in models]}, expected {name}; '
+                             'restart the teachers with mixrl/teachers.sh')
+        checkpoint = request(urls[name] + '/get_model_info', timeout=30).get('model_path')
+        if checkpoint != str(spec['teachers'][name]):
+            raise ValueError(f'Teacher server {urls[name]} serves {name} from {checkpoint}, but the config says '
+                             f'{spec["teachers"][name]}; restart the teachers: mixrl/teachers.sh stop')
+        servers[name] = {'url': urls[name], 'server': name, 'checkpoint': checkpoint}
+    tasks = spec['tasks']
+    c = {'mode': 'distill', 'distill_config': json.loads(Path(env['DISTILL_CONFIG']).read_text()), 'adv_clip': clip,
+         'splits': str(spec['splits']),
+         'teachers': {n: servers[t['teacher']] for n, t in tasks.items()},  # task -> its teacher's server
+         'quotas': {n: t['prompts_per_step'] for n, t in tasks.items()},
+         'caps': {n: t['max_response_tokens'] for n, t in tasks.items()},
+         'eval_quotas': {n: t['eval_pool'] if t['eval_prompts'] == 'all' else t['eval_prompts'] for n, t in tasks.items()},
          'eval_samples': 1, 'routes': {}, 'rollout_batch_size': distill.batch_prompts(spec)}
     return c, spec
 
@@ -300,7 +298,9 @@ def resolve():
     if distilling:
         if c['objective'] != 'mimo':
             raise ValueError('Distillation uses the MiMo objective\'s importance weights (MIXRL_OBJECTIVE=mimo)')
-        c['data_hash'] = digest({n: [d['prompts_hash'], d['eval_hash']] for n, d in c['domains'].items()})
+        manifest = Path(c['splits']).parent / 'manifest.json'  # the HF release's; the data source checks it
+        c['data_hash'] = (digest(json.loads(manifest.read_text())) if manifest.is_file() else
+                          digest({s: file_hash(Path(c['splits']) / f'{s}.jsonl') for s in ('rl_train', 'rl_val')}))
         health = None
     else:
         health = mixrl_data_and_scorer(env, c, spec)
@@ -350,11 +350,11 @@ def resolve():
     write_json(path, c)
     if distilling:
         gpus = [int(g) for g in env.get('TEACHER_GPUS', '6,7').split(',') if g.strip()]
-        print(f'Distillation folder ({c["distill_root"]})\n' + distill.table(
-            spec, int(env.get('NUM_ROLLOUT', 0)) or 1, c['samples_per_prompt'], c['policy_gpus'], gpus,
-            int(env.get('TEACHER_PORT', '8100'))))
-        print('Teachers: ' + '; '.join(f'{d} -> {t["server"]} at {t["url"]} ({t["checkpoint"]})'
-                                        for d, t in c['teachers'].items()) + f'; resolved config: {path}')
+        print('Distillation\n' + distill.table(spec, int(env.get('NUM_ROLLOUT', 0)) or 1, c['samples_per_prompt'],
+                                                 c['policy_gpus'], gpus, int(env.get('TEACHER_PORT', '8100'))))
+        servers = {t['server']: t for t in c['teachers'].values()}
+        print('Teachers: ' + '; '.join(f'{n} at {t["url"]} serves {t["checkpoint"]}' for n, t in servers.items())
+              + f'; resolved config: {path}')
         return
     print(f'MixRL tasks ({c["tasks_file"]})\n' + task_file.table(spec, c['samples_per_prompt'],
                                                          int(os.environ.get('NUM_ROLLOUT', 0)) or None, c['refill_rounds']))

@@ -332,7 +332,7 @@ class Console:
         if peaks:
             parts.append('peak KV: ' + ', '.join(f'{k} {pct(v)}' for k, v in peaks.items()))
         self.say(' | '.join(parts))
-        self.say(' | '.join([' ' * len(head) + ' KL by domain (resp len, capped)'] + [
+        self.say(' | '.join([' ' * len(head) + ' KL by task (resp len, capped)'] + [
             f'{d} {num(train.get(f"distill/{d}/kl"))} ({r.get("length_mean", 0):.0f}, {pct(r.get("cap_rate"))})'
             for d, r in routes.items()]))
 
@@ -370,8 +370,7 @@ def settings_line(config, command, env):
     if config.get('mode') == 'distill':
         servers = sorted({t['server'] for t in config.get('teachers', {}).values()})
         return ' | '.join([
-            'settings', f'distillation: {config.get("distill_root")}',
-            f'domains: {", ".join(config.get("domains", {}))}', f'teacher servers: {len(servers)}',
+            'settings', f'distillation tasks: {", ".join(config.get("quotas", {}))}', f'teacher servers: {len(servers)}',
             f'rollout: temperature {config.get("rollout_temperature")}, top-p {config.get("rollout_top_p")}, '
             f'top-k {config.get("rollout_top_k")}',
             f'R3 replay: {"on" if config.get("routing_replay") else "OFF"}',

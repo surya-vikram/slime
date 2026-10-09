@@ -1,24 +1,24 @@
-"""Multi-teacher on-policy distillation inputs: read and check a distillation folder, plan the batch and
-where the teachers run. Layout and rules: mixrl/mopd/README.md. Preview with `mixrl/run.sh domains`, or:
+"""Multi-teacher on-policy distillation inputs: read and check the distillation config (mixrl/distill.json), plan
+the batch and where the teachers run. Rules: mixrl/mopd/README.md. Preview with `mixrl/run.sh distill-plan`, or:
 
-    python3 -m slime_plugins.chimera_mixrl.distill ROOT [--steps N] [--samples-per-prompt N]
-        [--policy-gpus N] [--teacher-gpus 6,7] [--teacher-port 8100] [--plan]
+    python3 -m slime_plugins.chimera_mixrl.distill CONFIG [--steps N] [--policy-gpus N]
+        [--teacher-gpus 6,7] [--teacher-port 8100] [--teacher-memory 0.85] [--plan | --paths]
 
---plan prints the teacher servers instead (mixrl/teachers.sh and mixrl/run.sh read it). Standard library
-only: the preview runs on the host before any container starts. The trainer reads the prompts with read_rows()
-and summarizes evaluations with eval_summary().
+--plan prints the teacher servers (mixrl/teachers.sh and mixrl/run.sh read it); --paths prints the folders the
+training container mounts. Standard library only: it runs on the host before any container starts. The trainer
+reads the same config (configure.distill_inputs) and summarizes evaluations with eval_summary().
 """
 import argparse
 import hashlib
 import json
 import math
-import re
 from pathlib import Path
+import re
 
-DOMAIN_FIELDS = {'enabled', 'prompts_per_step', 'max_response_tokens', 'eval_prompts'}
-DEFAULTS = {'enabled': True, 'max_response_tokens': 2048, 'eval_prompts': 'all'}
-ROLES = ('system', 'user', 'assistant')
-# Calendar stopped improving on eval around its third pass over its prompts; keep every domain at or below.
+FIELDS = {'student', 'splits', 'teachers', 'tasks'}
+TASK_FIELDS = {'teacher', 'prompts_per_step', 'max_response_tokens', 'eval_prompts'}
+TASK_FILE = Path(__file__).resolve().parents[2] / 'mixrl' / 'tasks.json'  # MixRL's caps are the default caps
+# Calendar stopped improving on eval around its third pass over its prompts; keep every task at or below.
 MAX_PASSES = 3
 TEACHERS_PER_GPU = 3  # ~20 GB of bf16 weights each, with room for prefill KV on an H200
 # Files that must be byte-identical between student and teacher: the per-token log-probs only line up
@@ -27,7 +27,7 @@ TOKENIZER_FILES = ('tokenizer.json', 'tokenizer.model', 'tokenizer_config.json',
                    'added_tokens.json', 'chat_template.jinja', 'chat_template.json')
 # config.json keys that may differ between checkpoints of one architecture.
 CONFIG_VOLATILE = {'transformers_version', '_name_or_path', 'torch_dtype', 'dtype', 'use_cache'}
-# Domain names become teacher server names ('a+b' for a shared teacher) and MIXRL_TEACHER_URLS entries.
+# Teacher names become server names (SGLang --served-model-name) and MIXRL_TEACHER_URLS entries.
 NAME = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
@@ -37,68 +37,6 @@ def _positive(value):
 
 def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def read_prompts(path):
-    """Validate a prompts/eval jsonl file. Returns (ids, mean prompt characters) or raises with every problem."""
-    ids, chars, problems = set(), 0, []
-    with open(path, encoding='utf-8') as stream:
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            where = f'{path.name} line {number}'
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as error:
-                problems.append(f'{where}: not JSON ({error.msg})')
-                continue
-            if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id'].strip():
-                problems.append(f'{where}: needs a nonempty string "id"')
-                continue
-            if row['id'] in ids:
-                problems.append(f'{where}: duplicate id {row["id"]!r}')
-            ids.add(row['id'])
-            messages = row.get('messages')
-            if (not isinstance(messages, list) or not messages
-                    or any(not isinstance(m, dict) or m.get('role') not in ROLES or not isinstance(m.get('content'), str)
-                           for m in messages)):
-                problems.append(f'{where}: "messages" must be a list of {{role: system|user|assistant, content: str}}')
-            elif messages[-1]['role'] != 'user':
-                problems.append(f'{where}: the last message must be from the user (the student answers it)')
-            else:
-                chars += sum(len(m['content']) for m in messages)
-            if 'max_response_tokens' in row and not _positive(row['max_response_tokens']):
-                problems.append(f'{where}: "max_response_tokens" must be a positive integer')
-            unknown = set(row) - {'id', 'messages', 'max_response_tokens'}
-            if unknown:
-                problems.append(f'{where}: unknown fields {sorted(unknown)}')
-            if len(problems) >= 20:
-                problems.append(f'{path.name}: stopping after 20 problems')
-                break
-    if not ids and not problems:
-        problems.append(f'{path.name}: no prompts')
-    if problems:
-        raise ValueError('\n'.join(problems))
-    return ids, chars / len(ids)
-
-
-def read_settings(path):
-    try:
-        settings = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f'{path}: {error}') from None
-    if not isinstance(settings, dict) or set(settings) - DOMAIN_FIELDS:
-        raise ValueError(f'{path}: allowed fields are {sorted(DOMAIN_FIELDS)}')
-    settings = {**DEFAULTS, **settings}
-    if type(settings['enabled']) is not bool:
-        raise ValueError(f'{path}: "enabled" must be true or false')
-    if not _positive(settings.get('prompts_per_step')):
-        raise ValueError(f'{path}: "prompts_per_step" is required, a positive integer (this domain\'s share of each batch)')
-    if not _positive(settings['max_response_tokens']):
-        raise ValueError(f'{path}: "max_response_tokens" must be a positive integer')
-    if settings['eval_prompts'] != 'all' and not _positive(settings['eval_prompts']):
-        raise ValueError(f'{path}: "eval_prompts" must be "all" or a positive integer')
-    return settings
 
 
 def compare_checkpoints(student, teacher):
@@ -122,130 +60,141 @@ def compare_checkpoints(student, teacher):
     return problems
 
 
-def load(root, check_teachers=True):
-    """Read and check a distillation folder. Returns {'root', 'student', 'domains'}; raises with every problem.
-    check_teachers=False skips reading the teacher folders: the trainer container mounts only DISTILL_ROOT, and a
-    teacher/ symlink may point outside it (the host checked the teachers, and the servers prove what they serve)."""
-    root = Path(root)
+def _path(value, what, problems, must=None):
+    """A full path from the config; `must` is a file that has to exist inside it."""
+    if not isinstance(value, str) or not value.startswith('/'):
+        problems.append(f'{what}: give the full path (starting with /), got {value!r}')
+        return None
+    path = Path(value)
+    if must and not (path / must).is_file():
+        problems.append(f'{what}: {path / must} not found')
+    return path
+
+
+def task_counts(splits, tasks):
+    """{(split, task): (prompts, characters)} for the given tasks in rl_train and rl_val."""
+    counts = {}
+    for split in ('rl_train', 'rl_val'):
+        with open(splits / f'{split}.jsonl', encoding='utf-8') as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get('task') in tasks:
+                    n, chars = counts.get((split, row['task']), (0, 0))
+                    counts[(split, row['task'])] = (n + 1, chars + sum(len(m['content']) for m in row['messages']))
+    return counts
+
+
+def load(path, check_teachers=True):
+    """Read and check a distillation config. Returns {'config', 'student', 'splits', 'teachers', 'tasks'};
+    raises with every problem. check_teachers=False skips reading the teacher folders: the trainer container
+    does not mount them (the host checked them, and the servers prove what they serve)."""
+    path = Path(path)
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f'{path}: {error}') from None
+    if not isinstance(config, dict) or set(config) - {'_readme'} != FIELDS:
+        raise ValueError(f'{path}: expected exactly {sorted(FIELDS)} (and an optional "_readme")')
     problems = []
-    student = {'hf': root / 'student' / 'hf', 'mcore': root / 'student' / 'mcore'}
-    if not (student['hf'] / 'config.json').is_file():
-        problems.append(f'{student["hf"]}: the student HF checkpoint (config.json) is missing')
-    if not (student['mcore'] / 'latest_checkpointed_iteration.txt').is_file():
-        problems.append(f'{student["mcore"]}: the student Megatron checkpoint (latest_checkpointed_iteration.txt) is missing')
-    domains = {}
-    folder = root / 'domains'
-    names = sorted(p.name for p in folder.iterdir() if p.is_dir()) if folder.is_dir() else []
-    if not names:
-        problems.append(f'{folder}: no domain folders')
-    for name in names:
-        base = folder / name
-        if not NAME.match(name):
-            problems.append(f'domain {name}: use letters, digits, . _ - only in domain folder names')
-            continue
-        missing = [f for f in ('prompts.jsonl', 'eval.jsonl', 'domain.json') if not (base / f).is_file()]
-        if check_teachers and not (base / 'teacher').is_dir():
-            missing.append('teacher/')
-        if missing:
-            problems.append(f'domain {name}: missing {", ".join(missing)}')
-            continue
-        try:
-            settings = read_settings(base / 'domain.json')
-            train_ids, chars = read_prompts(base / 'prompts.jsonl')
-            eval_ids, _ = read_prompts(base / 'eval.jsonl')
-        except ValueError as error:
-            problems.append(f'domain {name}:\n  ' + str(error).replace('\n', '\n  '))
-            continue
-        shared = train_ids & eval_ids
-        if shared:
-            problems.append(f'domain {name}: {len(shared)} eval.jsonl ids are also training prompts '
-                            f'(e.g. {sorted(shared)[0]!r}); eval must be held out')
-        if settings['eval_prompts'] != 'all' and settings['eval_prompts'] > len(eval_ids):
-            problems.append(f'domain {name}: eval_prompts {settings["eval_prompts"]} > {len(eval_ids)} eval prompts')
-        teacher = (base / 'teacher').resolve()
-        if check_teachers and settings['enabled'] and (student['hf'] / 'config.json').is_file():
-            problems += [f'domain {name}: teacher {problem}' for problem in compare_checkpoints(student['hf'], teacher)]
-        domains[name] = {**settings, 'prompts': base / 'prompts.jsonl', 'eval': base / 'eval.jsonl',
-                         'teacher': teacher, 'pool': len(train_ids), 'eval_pool': len(eval_ids),
-                         'prompt_chars': chars}
-    if names and not any(d['enabled'] for d in domains.values()) and not problems:
-        problems.append('no domain is enabled')
+    student = config['student']
+    if not isinstance(student, dict) or set(student) != {'hf', 'mcore'}:
+        raise ValueError(f'{path}: "student" must be {{"hf": "/full/path", "mcore": "/full/path"}}')
+    hf = _path(student['hf'], 'student.hf', problems, 'config.json')
+    mcore = _path(student['mcore'], 'student.mcore', problems, 'latest_checkpointed_iteration.txt')
+    splits = _path(config['splits'], 'splits', problems)
+    if splits:
+        problems += [f'splits: {splits / f"{s}.jsonl"} not found' for s in ('rl_train', 'rl_val')
+                     if not (splits / f'{s}.jsonl').is_file()]
+    teachers = {}
+    if not isinstance(config['teachers'], dict) or not config['teachers']:
+        problems.append('"teachers" must name at least one teacher: {"name": "/full/path/to/hf"}')
+    else:
+        for name, folder in config['teachers'].items():
+            if not NAME.match(name):
+                problems.append(f'teacher {name}: use letters, digits, . _ - only in teacher names')
+            teachers[name] = _path(folder, f'teacher {name}', problems, 'config.json' if check_teachers else None)
+    defaults = {n: t['max_response_tokens'] for n, t in json.loads(TASK_FILE.read_text())['tasks'].items()}
+    tasks = {}
+    if not isinstance(config['tasks'], dict) or not config['tasks']:
+        problems.append('"tasks" must list at least one task: {"task": {"teacher": "name", "prompts_per_step": N}}')
+    else:
+        for name, task in config['tasks'].items():
+            where = f'task {name}'
+            if not isinstance(task, dict) or not {'teacher', 'prompts_per_step'} <= set(task) <= TASK_FIELDS:
+                problems.append(f'{where}: needs "teacher" and "prompts_per_step"; may have "max_response_tokens", '
+                                f'"eval_prompts"')
+                continue
+            if task['teacher'] not in config['teachers']:
+                problems.append(f'{where}: teacher {task["teacher"]!r} is not in "teachers"')
+            if not _positive(task['prompts_per_step']):
+                problems.append(f'{where}: "prompts_per_step" must be a positive integer')
+            cap = task.get('max_response_tokens', defaults.get(name))
+            if not _positive(cap):
+                problems.append(f'{where}: "max_response_tokens" must be a positive integer '
+                                f'(mixrl/tasks.json has no cap for this task)')
+            evals = task.get('eval_prompts', 'all')
+            if evals != 'all' and not _positive(evals):
+                problems.append(f'{where}: "eval_prompts" must be "all" or a positive integer')
+            tasks[name] = {'teacher': task['teacher'], 'prompts_per_step': task['prompts_per_step'],
+                           'max_response_tokens': cap, 'eval_prompts': evals}
+    unused = sorted(set(teachers) - {t['teacher'] for t in tasks.values()})
+    if unused:
+        problems.append(f'teacher(s) {", ".join(unused)} score no task')
+    if not problems:
+        counts = task_counts(splits, tasks)
+        for name, task in tasks.items():
+            (pool, chars), (held, _) = counts.get(('rl_train', name), (0, 0)), counts.get(('rl_val', name), (0, 0))
+            if not pool or not held:
+                problems.append(f'task {name}: {pool} rl_train and {held} rl_val prompts in {splits}')
+                continue
+            if task['eval_prompts'] != 'all' and task['eval_prompts'] > held:
+                problems.append(f'task {name}: eval_prompts {task["eval_prompts"]} > its {held} rl_val prompts')
+            task.update(pool=pool, eval_pool=held, prompt_chars=chars / pool)
+    if check_teachers and not problems:
+        for name, folder in teachers.items():
+            problems += [f'teacher {name}: {problem}' for problem in compare_checkpoints(hf, folder)]
     if problems:
         raise ValueError('\n'.join(problems))
-    return {'root': root, 'student': student, 'domains': domains}
-
-
-def enabled(spec):
-    return {name: d for name, d in spec['domains'].items() if d['enabled']}
+    return {'config': path, 'student': {'hf': hf, 'mcore': mcore}, 'splits': splits, 'teachers': teachers,
+            'tasks': tasks}
 
 
 def batch_prompts(spec):
-    return sum(d['prompts_per_step'] for d in enabled(spec).values())
+    return sum(t['prompts_per_step'] for t in spec['tasks'].values())
 
 
-def max_passes(domain, steps):
-    """Times a domain uses its prompts in `steps` steps (no refills in distillation)."""
-    return domain['prompts_per_step'] * steps / domain['pool']
-
-
-def teachers(spec):
-    """One server per distinct teacher folder: {path: {'name', 'domains', 'load'}}. Two domains whose
-    teacher/ resolves to the same folder share it. Load ~ tokens to prefill per step."""
-    out = {}
-    for name, d in enabled(spec).items():
-        entry = out.setdefault(d['teacher'], {'name': name, 'domains': [], 'load': 0.})
-        if name not in entry['domains']:
-            entry['domains'].append(name)
-        entry['load'] += d['prompts_per_step'] * (d['prompt_chars'] / 4 + d['max_response_tokens'])
-    for entry in out.values():
-        entry['name'] = '+'.join(entry['domains'])
-    return out
-
-
-def placement(spec, gpus, port, per_gpu=TEACHERS_PER_GPU):
-    """Pack teachers onto GPUs by load: the heaviest first, each onto the least-loaded GPU with room.
-    Returns [{'name', 'path', 'domains', 'gpu', 'port'}] in port order."""
-    servers = sorted(teachers(spec).items(), key=lambda kv: -kv[1]['load'])
-    if len(servers) > len(gpus) * per_gpu:
-        raise ValueError(f'{len(servers)} teachers do not fit {len(gpus)} teacher GPUs at {per_gpu} per GPU: '
-                         f'add teacher GPUs or share a teacher folder between domains')
-    load, count, plan = {g: 0. for g in gpus}, {g: 0 for g in gpus}, []
-    for i, (path, entry) in enumerate(servers):
-        gpu = min((g for g in gpus if count[g] < per_gpu), key=lambda g: (load[g], count[g]))
-        load[gpu] += entry['load']
-        count[gpu] += 1
-        plan.append({'name': entry['name'], 'path': path, 'domains': entry['domains'], 'gpu': gpu, 'port': port + i})
-    return plan
+def max_passes(task, steps):
+    """Times a task uses its prompts in `steps` steps (no refills in distillation)."""
+    return task['prompts_per_step'] * steps / task['pool']
 
 
 def servers(spec, gpus, port, memory=0.85, host='127.0.0.1'):
-    """The teacher servers to run, in start order: placement() plus each server's URL and memory setting.
-    SGLang sizes its cache from what is left on the GPU (KV = mem_fraction_static x GPU memory - memory in use),
-    so servers sharing a GPU start one after another, the k-th of n with k/n of `memory`: an equal share each."""
-    plan = placement(spec, gpus, port)
+    """One server per teacher, in the order listed: GPUs taken in turn, port `port` + i. SGLang sizes its cache
+    from what is left on the GPU (KV = mem_fraction_static x GPU memory - memory in use), so servers sharing a GPU
+    start one after another, the k-th of n with k/n of `memory`: an equal share each."""
+    names = list(spec['teachers'])
+    if len(names) > len(gpus) * TEACHERS_PER_GPU:
+        raise ValueError(f'{len(names)} teachers do not fit {len(gpus)} teacher GPUs at {TEACHERS_PER_GPU} per GPU')
+    plan = [{'name': name, 'path': spec['teachers'][name], 'gpu': gpus[i % len(gpus)], 'port': port + i,
+             'url': f'http://{host}:{port + i}', 'tasks': [t for t, v in spec['tasks'].items() if v['teacher'] == name]}
+            for i, name in enumerate(names)]
     for p in plan:
         mates = [q for q in plan if q['gpu'] == p['gpu']]
         p['memory'] = round(memory * (mates.index(p) + 1) / len(mates), 3)
-        p['url'] = f'http://{host}:{p["port"]}'
     return plan
 
 
 def parse_urls(text):
-    """MIXRL_TEACHER_URLS: 'name=url,name=url', a server name being its domains joined by '+'.
-    Returns {server name: {'url', 'domains'}}."""
+    """MIXRL_TEACHER_URLS: 'name=url,name=url' -> {teacher name: url}."""
     out = {}
     for item in filter(None, (part.strip() for part in text.split(','))):
         name, sep, url = item.partition('=')
-        if not sep or not url.startswith('http') or not all(NAME.match(d) for d in name.split('+')):
+        if not sep or not url.startswith('http') or not NAME.match(name):
             raise ValueError(f'MIXRL_TEACHER_URLS: expected name=http://host:port, got {item!r}')
-        out[name] = {'url': url.rstrip('/'), 'domains': name.split('+')}
+        out[name] = url.rstrip('/')
     return out
-
-
-def read_rows(path):
-    """The prompts of a checked prompts.jsonl or eval.jsonl, in file order."""
-    with open(path, encoding='utf-8') as stream:
-        return [json.loads(line) for line in stream if line.strip()]
 
 
 def percentile(values, q):
@@ -264,32 +213,32 @@ def answer_stats(answers):
 
 
 def eval_summary(answers, teacher=None, clip=5.):
-    """One evaluation, per domain and overall. answers: {domain: [{'tokens', 'stopped', 'gaps'}]}, gaps being the
+    """One evaluation, per task and overall. answers: {task: [{'tokens', 'stopped', 'gaps'}]}, gaps being the
     per-token student - teacher log-probs (both full vocabulary, temperature 1). KL is the mean over answers of
     each answer's mean gap (the loss weighs answers the same way); clipped is the share of tokens at the clip.
-    teacher: {domain: answer_stats of the teacher's own answers}, shown next to the student's."""
-    domains = {}
+    teacher: {task: answer_stats of the teacher's own answers}, shown next to the student's."""
+    tasks = {}
     for name, items in answers.items():
         if not items:
             continue
         tokens = sum(len(a['gaps']) for a in items)
-        domains[name] = {**answer_stats(items),
-                         'kl': sum(sum(a['gaps']) / len(a['gaps']) for a in items) / len(items),
-                         'clipped': sum(abs(g) >= clip for a in items for g in a['gaps']) / max(1, tokens)}
+        tasks[name] = {**answer_stats(items),
+                       'kl': sum(sum(a['gaps']) / len(a['gaps']) for a in items) / len(items),
+                       'clipped': sum(abs(g) >= clip for a in items for g in a['gaps']) / max(1, tokens)}
         for key, value in ((teacher or {}).get(name) or {}).items():
             if key != 'answers':
-                domains[name]['teacher_' + key] = value
-    return {'mode': 'distill', 'domains': domains,
-            'kl': sum(d['kl'] for d in domains.values()) / len(domains) if domains else None,
-            'aggregation': 'per domain: mean over answers of the per-token student - teacher log-prob; '
-                           'overall: equal mean over domains'}
+                tasks[name]['teacher_' + key] = value
+    return {'mode': 'distill', 'domains': tasks,
+            'kl': sum(t['kl'] for t in tasks.values()) / len(tasks) if tasks else None,
+            'aggregation': 'per task: mean over answers of the per-token student - teacher log-prob; '
+                           'overall: equal mean over tasks'}
 
 
 def check_batch(spec, samples_per_prompt, policy_gpus):
     total = batch_prompts(spec) * samples_per_prompt
     if total % policy_gpus:
         raise ValueError(f'the batch ({batch_prompts(spec)} prompts x {samples_per_prompt} = {total} answers) must divide '
-                         f'by the {policy_gpus} student GPUs: change prompts_per_step in some domain.json')
+                         f'by the {policy_gpus} student GPUs: change prompts_per_step of some task')
     return total
 
 
@@ -301,34 +250,32 @@ def _grid(rows, left=(0,)):
     return lines
 
 
-def table(spec, steps, samples_per_prompt=1, policy_gpus=None, teacher_gpus=(6, 7), port=8100):
-    rows = [('domain', 'on', 'prompts/step', 'prompts', 'eval prompts', 'max response', 'teacher', f'max passes in {steps} steps')]
-    names = {d: e['name'] for e in teachers(spec).values() for d in e['domains']}
-    for name, d in spec['domains'].items():
-        evals = d['eval_pool'] if d['eval_prompts'] == 'all' else d['eval_prompts']
-        rows.append((name, 'yes' if d['enabled'] else '-', str(d['prompts_per_step']), str(d['pool']), str(evals),
-                     str(d['max_response_tokens']), names.get(name, '-'), f'{max_passes(d, steps):.1f}'))
-    lines = [f'student: {spec["student"]["hf"].parent}', ''] + _grid(rows) + ['']
-    plan = placement(spec, list(teacher_gpus), port)
-    lines += _grid([('teacher', 'GPU', 'port', 'domains', 'checkpoint')]
-                   + [(p['name'], str(p['gpu']), str(p['port']), ','.join(p['domains']), str(p['path'])) for p in plan],
-                   left=(0, 3, 4))
-    on = enabled(spec)
+def table(spec, steps, samples_per_prompt=1, policy_gpus=None, teacher_gpus=(6, 7), port=8100, memory=0.85):
+    rows = [('task', 'teacher', 'prompts/step', 'prompts', 'eval prompts', 'max response', f'passes in {steps} steps')]
+    for name, t in spec['tasks'].items():
+        evals = t['eval_pool'] if t['eval_prompts'] == 'all' else t['eval_prompts']
+        rows.append((name, t['teacher'], str(t['prompts_per_step']), str(t['pool']), str(evals),
+                     str(t['max_response_tokens']), f'{max_passes(t, steps):.1f}'))
+    lines = [f'config: {spec["config"]}', f'student: {spec["student"]["hf"]} (Megatron: {spec["student"]["mcore"]})',
+             f'prompts: {spec["splits"]} (training: rl_train; eval: rl_val)', ''] + _grid(rows) + ['']
+    plan = servers(spec, list(teacher_gpus), port, memory)
+    lines += _grid([('teacher', 'GPU', 'port', 'memory', 'tasks', 'checkpoint')]
+                   + [(p['name'], str(p['gpu']), str(p['port']), str(p['memory']), ','.join(p['tasks']), str(p['path']))
+                      for p in plan], left=(0, 4, 5))
     total = batch_prompts(spec) * samples_per_prompt
-    lines += ['', f'{len(on)} of {len(spec["domains"])} domains enabled; {batch_prompts(spec)} prompts per step x '
-                  f'{samples_per_prompt} answers = {total} answers; {len(plan)} teacher servers on GPUs '
-                  f'{",".join(str(g) for g in teacher_gpus)}']
+    lines += ['', f'{len(spec["tasks"])} tasks; {batch_prompts(spec)} prompts per step x {samples_per_prompt} answers = '
+                  f'{total} answers; {len(plan)} teacher servers on GPUs {",".join(str(g) for g in teacher_gpus)}']
     if policy_gpus and total % policy_gpus:
         lines.append(f'error: {total} answers do not divide by the {policy_gpus} student GPUs; change prompts_per_step')
-    lines += [f'note: {name} can use its {d["pool"]} prompts up to {max_passes(d, steps):.1f} times in {steps} steps '
+    lines += [f'note: {name} can use its {t["pool"]} prompts up to {max_passes(t, steps):.1f} times in {steps} steps '
               f'(more than {MAX_PASSES}: it may memorise them); lower its prompts_per_step'
-              for name, d in on.items() if max_passes(d, steps) > MAX_PASSES]
+              for name, t in spec['tasks'].items() if max_passes(t, steps) > MAX_PASSES]
     return '\n'.join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Preview and check a multi-teacher distillation folder.')
-    parser.add_argument('root')
+    parser = argparse.ArgumentParser(description='Preview and check a multi-teacher distillation config.')
+    parser.add_argument('config')
     parser.add_argument('--steps', type=int, default=100)
     parser.add_argument('--samples-per-prompt', type=int, default=1)
     parser.add_argument('--policy-gpus', type=int, default=6)
@@ -338,17 +285,23 @@ def main():
     parser.add_argument('--teacher-host', default='127.0.0.1')
     parser.add_argument('--plan', action='store_true',
                         help='print one line per teacher server: port, GPU, memory share, name, checkpoint, URL')
+    parser.add_argument('--paths', action='store_true',
+                        help='print the student HF and Megatron folders and the splits folder, one per line')
     args = parser.parse_args()
     gpus = [int(g) for g in args.teacher_gpus.split(',') if g.strip()]
     try:
-        spec = load(args.root)
+        spec = load(args.config, check_teachers=not args.paths)
+        if args.paths:
+            print('\n'.join(str(p) for p in (spec['student']['hf'], spec['student']['mcore'], spec['splits'])))
+            return
         if args.plan:
             for p in servers(spec, gpus, args.teacher_port, args.teacher_memory, args.teacher_host):
                 print('\t'.join(str(p[k]) for k in ('port', 'gpu', 'memory', 'name', 'path', 'url')))
             return
-        text = table(spec, args.steps, args.samples_per_prompt, args.policy_gpus, gpus, args.teacher_port)
+        text = table(spec, args.steps, args.samples_per_prompt, args.policy_gpus, gpus, args.teacher_port,
+                     args.teacher_memory)
     except ValueError as error:
-        raise SystemExit(f'{args.root}:\n{error}')
+        raise SystemExit(f'{args.config}:\n{error}')
     print(text)
     if 'error:' in text:
         raise SystemExit(1)
