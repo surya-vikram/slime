@@ -10,6 +10,7 @@ mixrl/
 ├── reward.sh         start the reward service
 ├── run.sh            start | resume (starts judge and reward service as needed) | preflight | tasks
 ├── internal/launch.sh   runs inside the training container; never run by hand
+├── distill/          multi-teacher on-policy distillation (MOPD): design and inputs (README.md)
 └── docs/             AIRGAPPED.md (setup and transfer), RUNBOOK.md (how it works), TASK_AUDIT.md, GSM8K.md (GSM8K-only run on 8×H200)
 ```
 
