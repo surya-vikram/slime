@@ -103,6 +103,29 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn('may memorise', result.stdout)  # the default quotas keep every task at or below 3 passes
         self.assertEqual(self.calls('docker'), [])
 
+    def test_domains_preview_checks_a_distillation_folder_without_docker(self):
+        from tests.test_chimera_mixrl_distill import checkpoint, prompts
+        root = self.base / 'distill'
+        checkpoint(root / 'student' / 'hf')
+        (root / 'student' / 'mcore').mkdir(parents=True)
+        (root / 'student' / 'mcore' / 'latest_checkpointed_iteration.txt').write_text('1')
+        for name in ('teacher_x', 'teacher_y'):
+            domain = root / 'domains' / name
+            domain.mkdir(parents=True)
+            prompts(domain / 'prompts.jsonl', 9000, f'{name}-train')
+            prompts(domain / 'eval.jsonl', 16, f'{name}-eval')
+            (domain / 'domain.json').write_text(json.dumps({'prompts_per_step': 264}))
+            checkpoint(domain / 'teacher')
+        result = self.run_script('run.sh', 'domains')  # DISTILL_ROOT defaults to $BASE_DIR/distill
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('2 of 2 domains enabled; 528 prompts per step x 1 answers = 528 answers; 2 teacher servers on GPUs 6,7',
+                      result.stdout)
+        self.assertEqual(self.calls('docker'), [])
+        # 5 student GPUs cannot split 528 answers evenly: refused before anything starts.
+        result = self.run_script('run.sh', 'domains', str(root), DISTILL_TRAIN_GPUS='0,1,2,3,4')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('528 answers do not divide by the 5 student GPUs', result.stdout)
+
     def test_preflight_uses_no_gpus_and_carries_every_setting(self):
         result = self.run_script('run.sh', 'preflight', 'check-1', LR='2e-6')
         self.assertEqual(result.returncode, 0, result.stderr)

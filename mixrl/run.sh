@@ -6,6 +6,8 @@
 #   mixrl/run.sh resume RUN_NAME       the same without the preflight, from the run's latest checkpoint
 #   mixrl/run.sh preflight [RUN_NAME]  checks only: tasks, data, reward service, judge and model; no GPUs
 #   mixrl/run.sh tasks                 preview the task table (no Docker, no GPUs)
+#   mixrl/run.sh domains [ROOT]        preview a distillation folder (default DISTILL_ROOT): domains, batch,
+#                                      teacher placement, passes; checks every input (no Docker, no GPUs)
 #
 # Any config.env value can be overridden for one command: LR=2e-6 mixrl/run.sh start my-run
 # Running services are reused; mixrl/judge.sh or mixrl/reward.sh restarts one with new settings.
@@ -16,7 +18,7 @@ REPO_ROOT=$(dirname "$MIXRL_DIR")
 source "$MIXRL_DIR/config.env"
 
 usage() {
-    sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 fail() { echo "error: $*" >&2; exit 1; }
@@ -31,6 +33,14 @@ case "$command" in
         exec env PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.tasks \
             "$MIXRL_DIR/tasks.json" --samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
             --steps "$NUM_ROLLOUT" --refill-rounds "$MIXRL_REFILL_ROUNDS"
+        ;;
+    domains)
+        [[ $# -le 1 ]] || usage
+        policy_gpus=$(tr ',' '\n' <<< "$DISTILL_TRAIN_GPUS" | grep -c .)
+        cd "$REPO_ROOT"
+        exec env PYTHONPATH="$REPO_ROOT" python3 -m slime_plugins.chimera_mixrl.distill "${1:-$DISTILL_ROOT}" \
+            --steps "$NUM_ROLLOUT" --samples-per-prompt "$DISTILL_SAMPLES_PER_PROMPT" --policy-gpus "$policy_gpus" \
+            --teacher-gpus "$TEACHER_GPUS" --teacher-port "$TEACHER_PORT"
         ;;
     preflight|start)
         [[ $# -le 1 ]] || usage
